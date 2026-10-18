@@ -28,6 +28,7 @@ public:
     void Draw(int width, int height, const MenuSettings& settings,
               const std::string& status);
     bool IsOpen() const { return open_; }
+    void Close(ue::UObject* controller) { SetOpen(false, controller); }
 
 private:
     bool open_ = false;
@@ -39,6 +40,8 @@ private:
     int renderWidth_ = 0, renderHeight_ = 0;
     ue::UObject* blockedController_ = nullptr;
     bool Pressed(int key);
+    bool InputHeld() const;
+    void RestoreInput();
     void SetOpen(bool open, ue::UObject* controller);
 };
 

@@ -27,26 +27,41 @@ void Text(const std::string& text, Color color, float x, float y, float scale) {
 }
 
 WORD GamepadButtons() {
+    static unsigned previousConnections = ~0u;
+    static ULONGLONG nextConnectionPoll = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!previousConnections && now < nextConnectionPoll) return 0;
     using GetState = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
-    static GetState get = [] {
-        const wchar_t* names[] = {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"};
-        for (auto name : names) {
+    static auto providers = [] {
+        const wchar_t* names[] = {L"xinput1_3.dll", L"xinput1_4.dll", L"xinput9_1_0.dll"};
+        std::array<GetState, 3> result{};
+        for (size_t i = 0; i < result.size(); ++i) {
+            auto name = names[i];
             HMODULE module = LoadLibraryW(name);
-            if (module) {
-                auto fn = std::bit_cast<GetState>(GetProcAddress(module, "XInputGetState"));
-                if (fn) return fn;
-            }
+            if (module) result[i] = std::bit_cast<GetState>(GetProcAddress(module, "XInputGetState"));
         }
-        Log("menu: XInput unavailable; keyboard/mouse controls remain available");
-        return static_cast<GetState>(nullptr);
+        return result;
     }();
-    if (get) {
+    WORD buttons = 0;
+    unsigned connected = 0;
+    for (size_t provider = 0; provider < providers.size(); ++provider) {
+        auto get = providers[provider];
+        if (!get) continue;
         for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
             XINPUT_STATE state{};
-            if (get(i, &state) == ERROR_SUCCESS) return state.Gamepad.wButtons;
+            if (get(i, &state) == ERROR_SUCCESS) {
+                connected |= 1u << (provider * XUSER_MAX_COUNT + i);
+                buttons |= state.Gamepad.wButtons;
+            }
         }
     }
-    return 0;
+    nextConnectionPoll = now + 250;
+    if (connected != previousConnections) {
+        previousConnections = connected;
+        Log("menu: XInput controller mask=0x%x (providers 1_3, 1_4, 9_1_0; four slots each)", connected);
+        if (!connected) Log("menu: no XInput controller is exposed; native Steam Input layouts may require gamepad emulation");
+    }
+    return buttons;
 }
 } // namespace
 
@@ -62,12 +77,13 @@ bool SettingsMenu::Pressed(int key) {
     return pressed;
 }
 
-void SettingsMenu::SetOpen(bool open, UObject* controller) {
-    if (open && !OverlayReady()) {
-        Log("menu: cannot open because the renderer is not ready");
-        return;
-    }
-    if (open_ == open) return;
+bool SettingsMenu::InputHeld() const {
+    for (int key : {VK_F8, VK_ESCAPE, VK_RETURN, VK_LBUTTON, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT})
+        if (GetAsyncKeyState(key) & 0x8000) return true;
+    return buttons_ != 0;
+}
+
+void SettingsMenu::RestoreInput() {
     if (IsLive(blockedController_)) {
         if (auto library = FindDefaultObject("WidgetBlueprintLibrary"))
             Call(library, "SetInputMode_GameOnly").set("Target", blockedController_).invoke();
@@ -76,6 +92,16 @@ void SettingsMenu::SetOpen(bool open, UObject* controller) {
         Call(blockedController_, "SetIgnoreLookInput").setBool("bNewLookInput", false).invoke();
     }
     blockedController_ = nullptr;
+}
+
+void SettingsMenu::SetOpen(bool open, UObject* controller) {
+    if (open && !OverlayReady()) {
+        Log("menu: cannot open because the renderer is not ready");
+        return;
+    }
+    if (open_ == open) return;
+    // Do not leak the closing Escape/A/click into vanilla pause, jump or attack input.
+    if (open || !InputHeld()) RestoreInput();
     open_ = open;
     if (!open_) PublishOverlay({});
     confirmDamage_ = false;
@@ -95,6 +121,7 @@ void SettingsMenu::SetOpen(bool open, UObject* controller) {
 MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings& settings) {
     MenuActions result;
     bool toggle = Pressed(VK_F8);
+    bool passenger = Pressed(VK_F9);
     bool back = Pressed(VK_ESCAPE);
     bool up = Pressed(VK_UP), down = Pressed(VK_DOWN);
     bool left = Pressed(VK_LEFT), right = Pressed(VK_RIGHT);
@@ -102,12 +129,17 @@ MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings
     WORD buttons = GamepadButtons(), pressed = buttons & ~buttons_;
     constexpr WORD chord = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_Y;
     toggle |= (buttons & chord) == chord && (buttons_ & chord) != chord;
+    constexpr WORD passengerChord = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_X;
+    passenger |= (buttons & passengerChord) == passengerChord && (buttons_ & passengerChord) != passengerChord;
     buttons_ = buttons;
+    if (!open_ && blockedController_ && (!InputHeld() || blockedController_ != controller))
+        RestoreInput();
     if (!focused || (open_ && controller != blockedController_)) {
         SetOpen(false, controller);
         return result;
     }
     if (toggle) SetOpen(!open_, controller);
+    result.passenger = passenger;
     if (!open_) return result;
     if (back || (pressed & XINPUT_GAMEPAD_B)) {
         if (confirmDamage_) confirmDamage_ = false;

@@ -3,6 +3,7 @@
 #include "menu.hpp"
 
 namespace coop {
+void HandleAppearanceEvent(ue::UObject* object, ue::UObject* function, void* parameters);
 
 class Appearance {
 public:
@@ -16,7 +17,7 @@ private:
         ue::UObject* mesh = nullptr;
         int palette = -1;
         bool visible = true;
-        std::vector<ue::UObject*> originals;
+        std::vector<std::shared_ptr<ue::UObject>> originals;
         std::vector<ue::UObject*> applied;
     };
     std::vector<Entry> entries_;

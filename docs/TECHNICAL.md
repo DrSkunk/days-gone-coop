@@ -22,8 +22,10 @@ a Windows DLL (`DaysGoneCoop.asi`) that runs **inside the game process**:
    reads properties and calls UFunctions such as `SpawnActor`,
    `SetSkeletalMesh` and `PlayAnimation`, the same way Blueprint scripts do.
 
-The game's files on disk are never modified. Removing the `.asi` file
-removes the mod.
+The original executable and game assets are not patched on disk. Installation
+adds the loader, plugin, configuration and license files; the plugin also writes
+settings and diagnostic logs. Normal gameplay can update saves. Removing the
+co-op `.asi` disables this plugin; remove the loader only if no other mod uses it.
 
 ```text
 DaysGone.exe
@@ -37,7 +39,7 @@ DaysGone.exe
                    ▼                              │
             HookedProcessEvent()                  │
               ├─ first call: remember game thread │
-              ├─ on game thread, 60 Hz: Tick()    │
+              ├─ on local HUD frame: Tick()       │
               │    ├─ resolve engine (once)       │
               │    ├─ find local player pawn      │
               │    ├─ UDP send/receive (30 Hz)    │
@@ -165,7 +167,10 @@ Source layout:
 | [`src/coop/dllmain.cpp`](../src/coop/dllmain.cpp) | `DllMain` / exported `InitializeASI`; finds the plugin's `.ini`, `.log` and `-anims.txt` paths |
 | [`src/coop/coop.cpp`](../src/coop/coop.cpp) | Build check, hook, tick loop, player tracking, avatar, teleport, config |
 | [`src/coop/ue.hpp`](../src/coop/ue.hpp) / [`ue.cpp`](../src/coop/ue.cpp) | Minimal UE 4.10 reflection layer |
-| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 64-byte wire format and validation |
+| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 128-byte v2 wire format and validation |
+| [`src/coop/combat.hpp`](../src/coop/combat.hpp) | Consent-scoped reliable damage queue |
+| [`src/coop/appearance.cpp`](../src/coop/appearance.cpp) | Private garment materials and texture tinting |
+| [`src/coop/menu.cpp`](../src/coop/menu.cpp) / [`overlay.cpp`](../src/coop/overlay.cpp) | Settings input and Direct3D 11 overlay |
 | [`src/coop/net.hpp`](../src/coop/net.hpp) / [`net.cpp`](../src/coop/net.cpp) | Non-blocking UDP peer (Winsock) |
 | [`src/coop/log.hpp`](../src/coop/log.hpp) / [`log.cpp`](../src/coop/log.cpp) | Timestamped log file |
 
@@ -254,22 +259,65 @@ addresses.
    `PlayerController`, `Character`, `SkeletalMeshActor`,
    `SkeletalMeshComponent`, `AnimSequence` and the `GameplayStatics` default
    object, then opens the UDP socket.
-2. **Local player.** Once per second it looks for the newest live
-   `PlayerController` whose `Pawn` points back at it; stale controllers from
-   unloaded worlds can linger until garbage collection. A pawn change destroys
-   the avatar.
+2. **Local player.** A cached `ULocalPlayer` supplies the active controller,
+   with a periodic object-array discovery fallback. The controller and pawn
+   must point back at each other; stale controllers from unloaded worlds can
+   linger until garbage collection. A pawn change destroys the avatar.
 3. **Send (30 Hz).** Reads the pawn's mesh-component location and rotation
    (actor location if it is not a Character), plus `GetVelocity`, and adds
-   `GetWorldOriginLocation` so positions are world-absolute.
+   `GetWorldOriginLocation` so positions are world-absolute. Accumulated send
+   deadlines avoid losing cadence to frame quantization; missed deadlines are
+   skipped rather than emitted as stale bursts.
 4. **Receive.** Drains up to 64 packets. Sequence numbers are compared with
    wraparound. After a 5 s gap the peer counts as reconnected, and the
    snapshot buffer and avatar are reset.
-5. **Interpolation.** The partner is rendered 100 ms in the past, interpolated
-   between snapshots, with up to 250 ms of velocity extrapolation.
+5. **Interpolation.** Sender timestamps preserve sample spacing even when the
+   receiver drains several packets in one frame. The adaptive buffer starts at
+   100 ms and stays within 80-250 ms. See the motion details below.
 6. **Avatar.** See §3.6.
 7. **Teleport.** If F7 goes from up to down while the game window has focus,
    the local pawn is moved to 150 cm beside the partner
    (`K2_SetActorLocation`, `bTeleport=true`).
+
+Visual updates follow the local HUD's `ReceiveDrawHUD` event; a timed fallback
+keeps initialization/networking progressing during loading or without a HUD.
+The HUD name is resolved only after engine/name-table initialization. Looking it
+up earlier caused a startup crash during testing and was corrected.
+
+#### Motion timeline and profiling
+
+[`motion.hpp`](../src/coop/motion.hpp) is independent of the engine calls.
+It keeps up to 96 snapshots, unwraps the sender's 32-bit millisecond clock and
+rejects backward timestamps. It estimates sender spacing and delivery jitter,
+increasing buffer delay faster than it decreases it. A playback clock slews
+within 0.98-1.02 times real time rather than snapping to every arriving packet;
+errors over 0.5 seconds rebase it.
+
+Positions use monotone cubic Hermite interpolation. Bike velocity comes from
+source-time position differences because the mounted native pawn can report
+zero velocity. Tangents do not cross on-foot/mounted/passenger transitions, and
+per-axis limiting prevents position overshoot. Angles take the shortest path.
+Both player and bike extrapolate for at most 150 ms, then hold; velocity is
+bounded to 7000 cm/s. Unchanged positions suppress stale native velocity.
+Teleports over 30 m and sender gaps over two seconds reset the timeline.
+
+Profiling first found repeated global object scans dominating the game-thread
+budget. `FindObject`/`FindClass` now cache weak lookups, validating authoritative
+object-array slot, pointer, serial, flags and identity metadata before reuse.
+Missing objects retry after one second. Owned skeletal-component lists and the
+local-player route are cached too. These caches do not root objects; material
+ownership described in §3.9 remains separate.
+
+Five-second `perf:` summaries report mod Tick cost, update/send/receive cadence,
+riding lookup cost and motion-buffer counters. On cachy the measured baseline
+was 9.45-9.93 ms mean / 122-129 ms peak, with only about 18 sends/s. After also
+backing off absent-controller polling, the final riding check measured
+0.67-0.73 ms mean / 5.6-7.2 ms peak on cachy and 1.77-1.96 ms mean /
+18.9-23.7 ms peak on the Deck, with approximately 30 sends/receives per second
+on each. Cached riding lookups
+were below the 0.01 ms logging resolution instead of about 1.9 ms per call.
+These measure plugin work, not total frame time or whole-game FPS. Cumulative
+extrapolation/hold counters include startup; compare consecutive steady periods.
 
 ### 3.6 The partner avatar
 
@@ -294,23 +342,158 @@ The partner therefore looks like *your* Deacon in *your* current outfit.
 
 ### 3.7 Network protocol
 
-[`protocol.hpp`](../src/coop/protocol.hpp) defines one fixed 64-byte,
+[`protocol.hpp`](../src/coop/protocol.hpp) defines one fixed 128-byte,
 little-endian UDP packet:
 
 | Field | Type | Notes |
 |---|---|---|
 | magic | u32 | `"DGCO"` (`0x4F434744`) |
-| version | u16 | 1 |
-| flags | u16 | bit 0 HasPawn, bit 1 InVehicle; other bits are rejected |
+| version | u16 | 2; both clients must upgrade together |
+| flags | u16 | HasPawn, InVehicle, HasBike, Passenger, FriendlyFire, AcceptPassengers, Alive, SyncBikes |
 | seq | u32 | wraps; compared with serial-number arithmetic |
 | timeMs | u32 | sender clock |
 | pos[3], yaw, pitch, vel[3] | f32 | must be finite and within ±1e8 |
 | name | char[16] | player name |
+| session, targetSession, consent, targetConsent | u32 each | connection/life/permission scope |
+| attackId, attackAck | u32 each | retransmission and deduplication |
+| damage | f32 | validated configured weapon damage |
+| bikePos[3], bikeRotation[3] | f32 | position and pitch/yaw/roll |
+| jacket, trousers, capColor, cap | u8 each | palettes 0-6 and cap visibility |
+| attackKind | u32 | none, melee or gunshot |
+| health | f32 | native health for state/consent checks |
 
 Peering is symmetric. In **host** mode (`PeerHost` empty) the plugin learns
 the partner from the first valid packet. In **join** mode it sends to the
 configured host. Either way it then pins the peer's IP and port and ignores
 everyone else until the game restarts.
+
+### 3.8 Motorcycle and passenger discoveries
+
+The assigned bike is not the player pawn. `CurrentPlayerVehicle` on the game
+mode is a **class**, not a vehicle instance: resolving it requires
+`GameMode.GetVehicle(VehicleClass)`. While mounted, `Pawn.GetVehicle` and
+`IsInVehicle` expose the actual vehicle. The proxy clones the chassis and 13
+modular skeletal parts, preserves their materials and slaves their poses to the
+chassis. Its transform is interpolated from the peer; its physics are not shared.
+The chassis and rider control assets are held at their neutral pose rather than
+looped as idle animations.
+
+The native `SeatsComponent.SeatSetups` array describes driver/passenger sockets.
+`SOCKET_PassengerSeat` belongs to a seat-part component rather than necessarily
+the chassis. Passenger mode poses an independent modular body with
+`bike_basic_control_buddy`, aligns its `hips` bone with that socket, and moves
+the hidden native character kinematically for the camera and health system.
+Fixed capsule-height offsets were rejected after screenshots showed the rider
+floating above or sinking into the seat. Measurements also found that Bend's
+native animation controller continued to change the local character's pose
+despite single-node animation calls. Reusing the independent avatar factory
+avoids that conflict. Bone offsets are composed in component space, avoiding
+feedback from cached world transforms after a teleport. Packets describe the
+independent body's mesh origin, matching the observer's identical riding pose.
+For this body's root mesh, component space already is actor space: applying its
+`GetRelativeTransform` again would incorrectly add the actor's world position.
+After correcting that distinction, a stationary 30-second measurement held the
+hip offset at 64.2 cm and visual root at -9989.2 cm, with seat variation below
+0.2 cm, rather than the previous large oscillations.
+
+The local passenger follows the interpolated remote bike. On the driver's
+machine, however, interpolating the returned passenger world position adds a
+second network delay and makes the body trail the native bike. The observer now
+uses its own native bike's passenger socket and the independent avatar's
+component-space hips offset. If the socket is unavailable, the body is hidden
+and an explicit settings/log error replaces a misleading stale seat. This is
+local visual anchoring, not authoritative shared vehicle physics.
+
+Before boarding, the plugin captures movement/custom mode, native component
+visibility, collision and the existing blueprint save-block flag. Each successful
+state change is tracked separately, so a partial boarding failure does not undo
+an input block or save block that the mod never acquired. Native animation mode
+is left untouched. Passenger-originated weapon attacks are not supported.
+It restores these on exit, driver dismount, permission removal or disconnect.
+Ground and capsule traces check manual exits. A forced cleanup may fall back to
+the original boarding position. The save block is an engine-wide boolean, not an
+ownership token; concurrent native changes remain a limitation.
+
+### 3.9 Garment colors and Unreal object lifetime
+
+The Deacon parts use runtime material instances that wrap asset materials.
+Following the `Parent` chain identifies jacket, jeans and cap material slots.
+Setting `Fabric Tint 1` did not visibly recolor these shaders. Their actual
+diffuse parameter is `Base Color (C/O) Map`. A private 1024-square
+`CanvasRenderTarget2D` draws that source texture multiplied by the chosen palette
+using `ReceiveUpdate` and `Canvas.K2_DrawTexture`. Normal maps and separate decals
+remain intact.
+
+`MeshComponent.CreateDynamicMaterialInstance` may return an existing dynamic
+instance instead of isolating it. Mutating that instance leaked local red into
+the peer's Original appearance. The replacement uses `KismetMaterialLibrary` to
+create a fresh MID from the non-dynamic parent, copies source parameters and
+explicitly assigns it.
+
+A C++ pointer is **not a garbage-collector reference**. Once a private MID replaces
+a native MID, UE may collect the original even though the plugin still remembers
+its address. A crash dump located a failure during later material copying.
+Originals now have shared native ownership backed by the supported build's
+FUObjectItem RootSet flag. The last owner removes only a root added by the
+plugin; preexisting engine roots are preserved. This allows Original restoration
+and peer cloning without retaining every historical material indefinitely.
+
+### 3.10 Settings renderer and threading
+
+Initial attempts to draw through Canvas/HUD callbacks did not render reliably.
+The current overlay uses pinned, MIT-licensed Dear ImGui v1.91.9b and the DX11
+backend. A setup thread creates a dummy D3D11 swap chain to locate shared
+`Present` and `ResizeBuffers` vtable slots. Those slots are replaced; this adds
+no second machine-code detour. The renderer restores D3D state and releases its
+render target on resize. Full swap-chain/device replacement is not established.
+
+The game thread publishes an immutable frame through a mutex; Present owns the
+ImGui context. Settings input supports keyboard, mouse and XInput, temporarily
+suppresses gameplay input, and restores it on closing or losing focus. Six
+preferences persist to INI; lethal friendly fire never does.
+
+All four slots in `xinput1_3`, `xinput1_4` and `xinput9_1_0` are checked. When
+none is connected, polling backs off to 250 ms. The tested Deck's official
+layout used native Steam Input actions, exposing no XInput device. Switching to
+Valve's Gamepad With Joystick Trackpad template exposed slot zero through all
+three providers (`mask=0x111`). No native Steam Input action backend was added.
+The user then confirmed menu opening/navigation and normal movement/driving
+after closing the menu; no View/Back native-map interference was reported.
+
+ProcessEvent also runs on other engine threads. An early reentrancy-guard write
+from those threads could leave gameplay ticking stuck. Thread selection is now
+atomic and other threads forward directly without touching the gameplay guard.
+Nested render-target callbacks preserve its previous value.
+
+### 3.11 Experimental friendly fire
+
+`OnWeaponFired_Event` was observed on the local BendPawn during real shooting.
+Native melee notifies did not consistently pass through ProcessEvent, so melee
+instead samples `m_bIsInMeleeAttack` and the weapon's native collision window.
+An attack is generated once on a window's rising edge, not merely on a mouse
+button press. Geometric range/aim checks and a native world trace reject misses
+and occlusion before transmission.
+
+Weapon damage is read through reflected nested `CurWeaponConfig` fields. The
+midpoint of min/max is used; native skills, criticals, spread, durability and
+falloff are not fully reproduced. The receiver calls Bend's `ApplyDamage`,
+including its additional `DamagedBodyIndex` parameter, and logs native return
+damage and health before/after. A real boot-knife swing sent one 20-point event;
+the receiving game's health changed from 121.9 to 106.9 after native processing.
+The native return value was zero despite the health decrease, so the return alone
+is not reliable evidence of damage. Subsequent pistol events requested 39 points
+and removed about 29.3 native health: one logged sequence was
+121.9 -> 92.6 -> 63.4 -> 34.1 -> 4.9 -> -24.4. The user confirmed both firearm
+health loss and death/reload. Negative native death health is normalized to
+zero on the wire, rather than sending a packet the decoder must reject.
+Aim/range checks use the rendered avatar position so the target corresponds
+to what the shooter sees, not a newer uninterpolated network position.
+
+The queue holds at most 64 events, repeats the head until acknowledged,
+deduplicates and expires events after three seconds. Session IDs come from
+`BCryptGenRandom`; consent epochs invalidate attacks across toggles, life changes,
+timeouts and reconnects. Both peers must opt in. These are consent/reliability
+checks, not cryptographic authentication.
 
 ## 4. Safety measures
 
@@ -353,22 +536,54 @@ everyone else until the game restarts.
   teleport was tested on the Deck through keyboard input. Current save folders
   were backed up before copying the test save, with the user's approval.
 
-Not verified: shared combat, riding the bike, long-distance travel, native
-Windows and long-session stability. Two real instances exchanging movement
-does not establish shared-world gameplay.
+Expansion checks confirmed the DX11 settings overlay, red garments, cap hiding,
+separate Original/Crimson and Crimson/Ocean appearances, native bike mounting,
+the modular bike proxy, passenger boarding/following and safe dismount. Original
+materials were restored after several minutes without the earlier collection
+crash. The matching final ASI was deployed to both machines and its SHA-256
+verified against the package
+(`e1b69096b6fc98ce089a23763c1b43908b248dac41bbe726705d1c699880675c`).
+Passenger alignment uses the live `hips` bone and
+native passenger socket: the settled component-space hips remained at 64.2 cm,
+with about 0.1 cm stationary visual-root variation. Short rolling/braking,
+manual exit/reboarding, driver dismount and disconnect cleanup were checked.
+The latter restored the native body, movement, collision and saving.
+
+The current suite passes 35 Python tests plus native C++ tests for the v2 wire
+format, serial ordering, mutual consent, scope invalidation, retransmission and
+deduplication, plus bone-to-socket alignment across yaw and translation changes.
+Motion tests cover timestamp wrap, teleport/gap recovery, role transitions,
+bounded bike/player extrapolation and paused stale velocity. A deterministic
+nine-second simulation combines 30 Hz sending, 60 Hz rendering, batched arrivals,
+jitter and one-in-seven packet loss. After warmup, constant-velocity frame steps
+must remain within 97.9-102.1% of ideal and track playback time within 0.02 cm.
+Native knife damage was observed (121.9 to 106.9 health for one transmitted
+20-point event). A one-sided opt-in test reached the native melee collision
+window but queued no damage while the partner remained off. Native pistol
+damage/death logs and the user's death/reload confirmation are described in
+§3.11. The final build passed a fresh short passenger drive/brake check, with
+the seated body visible on both clients. The final controller layout exposed
+XInput after restarting the game. The physical playtest confirmed Deck menu
+and normal gameplay controls. Moving passenger behavior was described as
+"much smoother, not perfect"; residual jitter remains and is not claimed fixed.
+Long-distance travel, native Windows and long-session stability remain unverified.
+Movement and visual motorcycle replication do not establish shared-world gameplay.
+
+The Snyk code-scan tool was unavailable in this environment; no Snyk scan was
+performed. Unit tests and live gameplay checks are not a security assessment.
 
 ## 6. Limitations and next steps
 
-This is a **ghost co-op prototype**. Each player runs their own single-player
-world, and only player positions and movement are shared. Real co-op would
+This is a **ghost co-op prototype with experimental gameplay extensions**. Each
+player runs their own single-player world. Full shared-world co-op would
 also need:
 
 - syncing enemies (freakers, NPCs) with one authoritative host;
-- combat, damage and death syncing;
-- vehicles: the bike as a replicated actor with rider animation;
+- complete combat/projectile/animation replication and native damage parity;
+- authoritative motorcycle physics, upgrades, fuel and damage;
 - syncing world state, missions and saves;
 - matching animations to the partner's actual state instead of speed tiers.
 
-Days Gone ships with no networking code for any of this, because the engine's
-replication layer is unused. Each item needs further reverse engineering
-of Bend's gameplay classes.
+The shipped single-player gameplay does not provide a usable campaign co-op
+mode. Each remaining feature needs further investigation of Bend's gameplay
+classes; the existence of Unreal networking APIs is not enough.

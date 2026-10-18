@@ -19,10 +19,14 @@ SIZE = struct.calcsize(FORMAT)
 assert SIZE == 128
 
 
-def encode(seq, time_ms, pos, yaw, pitch, vel, name, flags=HAS_PAWN):
+def encode(seq, time_ms, pos, yaw, pitch, vel, name, flags=HAS_PAWN, *,
+           session=1, target_session=0, consent=0, target_consent=0, attack_id=0, attack_ack=0,
+           damage=0.0, bike_pos=(0.0, 0.0, 0.0), bike_rotation=(0.0, 0.0, 0.0),
+           jacket=0, trousers=0, cap_color=0, cap=1, attack_kind=0, health=100.0):
     return struct.pack(FORMAT, MAGIC, VERSION, flags, seq & 0xFFFFFFFF, time_ms & 0xFFFFFFFF,
                        *pos, yaw, pitch, *vel, name.encode()[:15],
-                       1, 0, 0, 0, 0, 0, *([0.0] * 7), 0, 0, 0, 1, 0, 100.0)
+                       session, target_session, consent, target_consent, attack_id, attack_ack,
+                       damage, *bike_pos, *bike_rotation, jacket, trousers, cap_color, cap, attack_kind, health)
 
 
 def decode(data):
@@ -50,7 +54,11 @@ def decode(data):
                         not flags & 16 or damage <= 0):
         return None
     return {'flags': flags, 'seq': seq, 'time_ms': time_ms, 'pos': (x, y, z), 'yaw': yaw,
-            'pitch': pitch, 'vel': (vx, vy, vz), 'name': name.split(b'\0', 1)[0].decode(errors='replace')}
+            'pitch': pitch, 'vel': (vx, vy, vz), 'name': name.split(b'\0', 1)[0].decode(errors='replace'),
+            'session': session, 'target_session': target_session, 'consent': consent,
+            'target_consent': target_consent, 'attack_id': attack_id, 'attack_ack': attack_ack, 'damage': damage,
+            'bike_pos': (bx, by, bz), 'bike_rotation': (bp, byaw, br), 'jacket': jacket, 'trousers': trousers,
+            'cap_color': cap_color, 'cap': cap, 'attack_kind': attack_kind, 'health': health}
 
 
 def circle_state(anchor, t, radius, speed):

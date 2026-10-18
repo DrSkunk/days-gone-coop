@@ -46,6 +46,39 @@ class ProtocolTest(unittest.TestCase):
         data = fake_peer.encode(0x100000000, 0, (0, 0, 0), 0, 0, (0, 0, 0), 'x')
         self.assertEqual(fake_peer.decode(data)['seq'], 0)
 
+    def test_v2_extension_round_trip(self):
+        data = fake_peer.encode(1, 2, (1, 2, 3), 0, 0, (0, 0, 0), 'x', flags=255,
+                                session=11, target_session=22, consent=3, target_consent=4,
+                                attack_id=5, attack_ack=6, damage=25, attack_kind=2,
+                                bike_pos=(100, -200, 300), bike_rotation=(10, 20, -30),
+                                jacket=6, trousers=5, cap_color=4, cap=0, health=75)
+        state = fake_peer.decode(data)
+        self.assertEqual(state['bike_pos'], (100, -200, 300))
+        self.assertEqual(state['bike_rotation'], (10, 20, -30))
+        self.assertEqual(state['attack_id'], 5)
+        self.assertEqual(state['target_consent'], 4)
+        self.assertEqual(state['jacket'], 6)
+        self.assertEqual(struct.unpack_from('<6I', data, 64), (11, 22, 3, 4, 5, 6))
+        self.assertEqual(struct.unpack_from('<4BIf', data, 116), (6, 5, 4, 0, 2, 75))
+
+    def test_v2_rejects_invalid_extensions(self):
+        cases = ({'jacket': 7}, {'trousers': 7}, {'cap_color': 7}, {'cap': 2},
+                 {'damage': -1}, {'damage': 1001}, {'damage': 1}, {'attack_id': 1},
+                 {'attack_kind': 3}, {'attack_kind': 2}, {'health': -1}, {'health': 100001},
+                 {'bike_pos': (float('nan'), 0, 0)}, {'bike_rotation': (0, 0, float('inf'))},
+                 {'flags': 8}, {'flags': 9}, {'flags': 2})
+        for extension in cases:
+            with self.subTest(extension=extension):
+                self.assertIsNone(fake_peer.decode(fake_peer.encode(1, 0, (0, 0, 0), 0, 0, (0, 0, 0), 'x', **extension)))
+
+    def test_v2_attack_requires_every_consent_field(self):
+        attack = dict(flags=17, session=11, target_session=22, consent=3, target_consent=4,
+                      attack_id=5, attack_kind=2, damage=25)
+        for missing in ('session', 'target_session', 'consent', 'target_consent', 'attack_id', 'flags', 'damage'):
+            with self.subTest(missing=missing):
+                invalid = attack | {missing: 0}
+                self.assertIsNone(fake_peer.decode(fake_peer.encode(1, 0, (0, 0, 0), 0, 0, (0, 0, 0), 'x', **invalid)))
+
     def test_follow_approaches_and_stops(self):
         target = (2000.0, 0.0, 50.0)
         ghost, vel = fake_peer.follow_step((0.0, 0.0, 0.0), target, 0.1, 700.0)

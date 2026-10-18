@@ -9,17 +9,25 @@ runs its own single-player simulation. Use disposable saves for testing.
 - Exchanges player position, heading and velocity over UDP at approximately 30 Hz.
 - Spawns a separate, non-colliding skeletal avatar for the partner, using local
   Deacon meshes, modular parts and materials.
-- Smooths movement with 100 ms interpolation and bounded extrapolation.
+- Smooths movement on a sender-time timeline, with adaptive 80-250 ms buffering,
+  monotone cubic interpolation and up to 150 ms of bounded extrapolation.
 - Plays idle/walk/run/sprint animations according to received speed.
 - Hides the avatar after five seconds without state updates.
+- Replicates motorcycle position/orientation and rider animations, with a visual
+  clone of the observing player's motorcycle.
+- Offers experimental passenger riding on the partner's bike.
+- Replicates seven jacket/trouser/cap color presets and cap visibility.
+- Includes an in-game settings overlay with keyboard, mouse and gamepad controls.
+- Includes experimental, mutually opted-in friendly fire; see its validation
+  status and limitations below before relying on it.
 - **F7** teleports your player near the partner while the game window is focused.
   This is experimental: there is no terrain, streaming or safe-landing check.
 
-The avatar is a visual ghost, not a second AI/combat pawn. Enemies, damage, shots,
-inventory, loot, missions, doors, time, weather and saves are **not synchronized**.
-Bike models, riding animations, aiming, crouching and other detailed actions are
-not replicated. Both players see their own locally cloned appearance, not the
-other player's equipment. Materials may reflect local customization.
+The avatar is a visual ghost, not a second AI/combat pawn. Enemies, inventory,
+loot, missions, doors, time, weather and saves are **not synchronized**. Detailed
+aiming, crouching, weapon/projectile effects, motorcycle upgrades, fuel, damage
+and physics are not replicated. Equipment is cloned locally; only the selected
+color presets and cap visibility describe the partner's appearance.
 
 Only two players are supported. The protocol has no authentication or encryption:
 use a trusted LAN, never Internet port forwarding. The first valid endpoint in
@@ -32,13 +40,54 @@ IP or port. A timeout allows sequence numbering to restart, not a different endp
 - DaysGone.exe SHA-256:
   `17c2fca01d566914147a6d4924d038cb1f5a822c2829e4c45862e2bf837730b3`.
 - Engine metadata: Unreal Engine 4.10.1, with Bend-specific layouts.
-- Tested runtime: CachyOS on `cachy`, Proton Experimental.
-- Native Windows and a second real game instance remain untested.
+- Tested runtimes: CachyOS on `cachy` and SteamOS on a Steam Deck, using Proton.
+- Two real games have been tested together. Native Windows remains untested.
 
 The runtime checks the PE timestamp, image size and ProcessEvent prologue before
 installing a build-specific hook. These checks are not a full executable hash
 check. Do not disable them, update offsets speculatively or assume compatibility
 with another game release or another gameplay hook.
+
+## In-game controls and settings
+
+| Action | Keyboard/mouse | Gamepad |
+|---|---|---|
+| Open/close settings | F8 | View/Back + Y |
+| Select a row | Up/Down or click | D-pad Up/Down |
+| Change/activate | Left/Right, Enter or click | D-pad Left/Right or A |
+| Back/close | Esc | B |
+| Join/leave partner's motorcycle | F9 or menu | View/Back + X or menu |
+| Teleport near partner | F7 or menu | Menu |
+
+The game must be focused. The overlay does not pause either world. Colors,
+cap visibility, motorcycle synchronization and passenger permission save to the
+installed INI immediately. The palettes are Original, Crimson, Ocean, Forest,
+Sand, Charcoal and Violet. Hat customization currently means the existing cap's
+color and visibility, not alternative hat models.
+
+For a passenger, both players enable motorcycle sync; the driver allows a
+passenger, mounts their own bike normally and stops nearby. The passenger joins
+while on foot. This is a kinematic attachment to the visual bike, **not native
+two-seat vehicle simulation**. It temporarily disables passenger movement and
+collision, hides the native body in favor of an independent posed body, and
+blocks saving. Passenger weapon attacks are not supported. Leaving restores
+captured native visibility/state and checks
+for safe ground/capsule clearance; an unsafe manual exit is refused.
+
+Friendly fire defaults to **OFF every launch** and is deliberately not persisted.
+Both players must enable it and confirm lethal damage in their respective menus.
+Turning either side off blocks further accepted attacks. The transport scopes
+damage to the current connection and consent epochs, retransmits until
+acknowledged, deduplicates and expires old attacks. This does not authenticate
+the peer: trusted LAN only. Damage currently uses the midpoint of the weapon's
+configured native range; full vanilla critical/skill/falloff parity is not claimed.
+Real melee and firearm hits have reduced the other game's native health.
+The two-player test also confirmed death and normal reload after lethal damage.
+This does not establish full vanilla damage parity.
+
+Both clients must run protocol **v2 (128 bytes)**; v1 clients are incompatible.
+When upgrading an existing installation, replace the ASI but preserve each
+machine's configured INI. Keep the supplied Dear ImGui license with distributions.
 
 ## Install
 
@@ -128,9 +177,19 @@ host mode with `PlayerName=cachy`. Launch Days Gone normally through Steam on
 both devices and load saves in the same area. Do not run the simulated-partner
 start scripts for this two-device test.
 
-Normal Steam Deck controls remain available. To use the optional teleport
-without a keyboard, map a spare button to keyboard F7 through Steam Input.
-The plugin does not currently provide a controller-native teleport binding.
+The menu reads XInput, not native Steam Input actions. The official Days Gone
+layout did not expose an XInput controller on the tested Deck, so its mod-menu
+chords did nothing. The Deck was switched, with approval, to Valve's **Gamepad
+With Joystick Trackpad** template under Controller Settings > Current Layout >
+Templates. The running game then reported XInput mask `0x111` (slot zero through
+each of the three providers), rather than `0x0`. This replaces the official
+action layout, including its rear-grip assignments; restore it from Recommended
+if desired. The user confirmed that the menu and navigation work and normal
+movement/driving still work after closing it. No native-map interference was
+reported in that test.
+
+Teleport is available in the mod menu. F7 remains an optional Steam Input
+keyboard binding.
 
 ## Diagnostics and removal
 
@@ -143,6 +202,9 @@ The plugin writes `DaysGoneCoop.log` next to itself. Check for:
 - `avatar: spawned ...`
 - Periodic partner and avatar coordinates, with the avatar's screen position
   (`screen=(-1 -1)` means behind the camera) and component visibility
+- `perf:` lines with mod updates/s, mean/peak mod Tick time, send/receive rates,
+  riding-animation lookup time, adaptive delay and cumulative buffer counters.
+  Tick time is plugin game-thread work, not the whole game's frame time.
 
 A `FATAL` entry means the plugin disabled its gameplay work; do not bypass the
 check. No partner usually means mismatched INI settings, name resolution, the
@@ -169,9 +231,10 @@ The build emits a statically linked Windows x64 DLL at
 `package/DaysGoneCoop.asi` and copies the INI template alongside it. Building
 does not install anything or touch Steam, saves or remote machines.
 
-Tests cover the actual C++ packet decoder and sequence wraparound, plus Python
-protocol/handshake tests and offline PE inspection. They do not prove two-player
-gameplay, game-thread safety or stability through every world transition.
+Tests cover the actual C++ packet decoder, consent/retransmission, sequence and
+timestamp wraparound, and motion under jitter, batching and packet loss, plus
+Python protocol/handshake tests and offline PE inspection. They do not prove
+two-player gameplay, game-thread safety or stability through every world transition.
 
 ### Single-game simulated partner
 
@@ -229,11 +292,43 @@ walk animation in its log. The Deck-controlled partner was visually confirmed
 on cachy with textures. F7 teleport was exercised on the Deck using keyboard
 input. This is a real-game-to-real-game movement test, not the simulator.
 
-Earlier simulator tests also verified host-mode learning and reconnection after
-a timeout. Combat, long-distance travel, bike riding, native Windows and
-long-session stability remain unverified. Full shared-world co-op requires
-further game-specific replication and authority work beyond this visual
-prototype.
+Expansion tests verified the settings overlay, visible garment tinting, cap
+hiding, native bike mounting, modular bike proxies, passenger boarding/following
+and safe dismount. Separate Original/Crimson and Crimson/Ocean appearances have
+been visually confirmed on the two clients. Restoring Original after several
+minutes was also checked. In the earlier matching build on both devices, the
+passenger's component-space hips stayed at 64.2 cm and the stationary visual
+root varied by about 0.1 cm after settling. Short rolling/braking, manual
+dismount/reboarding, driver dismount and driver-disconnect cleanup were checked.
+The player subsequently reported jitter while moving. The revised networking
+uses sender timestamps rather than packet-drain times, smooths bike motion as
+well as player motion, and anchors the driver's view of the passenger directly
+to the local native seat instead of a round-trip-delayed position. A new short
+drive/brake check showed the seated passenger on both clients. The subsequent
+physical playtest reported **"much smoother, not perfect"**: residual moving
+jitter remains, so this is not a claim of fully solved passenger motion.
+
+Profiling found roughly 9.5-9.9 ms mean / 122-129 ms peak mod Tick time on cachy,
+with sends falling to about 18/s. After caching repeated object discovery,
+following HUD-frame cadence, correcting send deadlines and backing off absent
+controller polling, the final riding check measured about 0.67-0.73 ms mean /
+5.6-7.2 ms peak on cachy and 1.77-1.96 ms mean / 18.9-23.7 ms peak on the Deck,
+with roughly 30 sends/receives per second on both. Animation lookups dropped from about
+1.9 ms per call to below the log's 0.01 ms resolution. These are measurements of
+mod work, **not whole-game FPS benchmarks**.
+
+`make test` passes 35 Python tests plus native C++ protocol/consent/retransmission
+tests; `make build` cross-compiles the Windows plugin with warnings as errors.
+Real knife hits reduced the other game's native health (121.9 to 106.9 for one
+20-point attack before native processing). A one-sided opt-in test observed a
+native melee collision window without queuing damage while the partner was off.
+Pistol damage was confirmed by the user and native health logs, including
+121.9 -> 92.6 -> 63.4 -> 34.1 -> 4.9 -> -24.4; the user confirmed death/reload.
+Wire health clamps native negative death values to zero. Physical Deck menu
+opening/navigation and normal gameplay controls were confirmed after switching
+layouts. Residual moving jitter, long-distance travel, native Windows and
+long-session stability still need work or further validation. Full
+shared-world co-op still requires game-specific replication and authority work.
 
 Do not commit credentials, the `sshpw` file, game executables, assets, saves or
 runtime logs.

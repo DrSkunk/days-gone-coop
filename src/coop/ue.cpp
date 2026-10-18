@@ -3,6 +3,7 @@
 
 #include <windows.h>
 
+#include <iterator>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -58,6 +59,40 @@ std::unordered_map<std::string, int32_t>& NameCache() {
     static std::unordered_map<std::string, int32_t> cache;
     return cache;
 }
+
+struct CachedLookup {
+    UObject* object = nullptr;
+    UObject* type = nullptr;
+    UObject* outer = nullptr;
+    FName name{}, outerName{};
+    int32_t index = -1, serial = 0;
+    ULONGLONG retryAt = 0;
+
+    UObject* Get() const {
+        if (!object || index < 0 || index >= ObjectCount()) return nullptr;
+        auto items = *reinterpret_cast<uint8_t**>(g.objectArray + 0x10);
+        auto item = items + static_cast<size_t>(index) * 0x10;
+        if (*reinterpret_cast<UObject**>(item) != object || *reinterpret_cast<int32_t*>(item + 0xc) != serial ||
+            (*reinterpret_cast<int32_t*>(item + 8) & (ItemFlagPendingKill | ItemFlagUnreachable))) return nullptr;
+        if (object->cls != type || object->outer != outer || object->name.index != name.index ||
+            object->name.number != name.number ||
+            (outer && (outer->name.index != outerName.index || outer->name.number != outerName.number))) return nullptr;
+        return object;
+    }
+
+    void Set(UObject* value) {
+        object = value;
+        index = value ? value->internalIndex : -1;
+        if (value) {
+            type = value->cls;
+            outer = value->outer;
+            name = value->name;
+            outerName = outer ? outer->name : FName{};
+            auto items = *reinterpret_cast<uint8_t**>(g.objectArray + 0x10);
+            serial = *reinterpret_cast<int32_t*>(items + static_cast<size_t>(index) * 0x10 + 0xc);
+        } else retryAt = GetTickCount64() + 1000;
+    }
+};
 
 } // namespace
 
@@ -133,6 +168,31 @@ bool IsLive(const UObject* obj) {
     return (*reinterpret_cast<int32_t*>(item + 8) & (ItemFlagPendingKill | ItemFlagUnreachable)) == 0;
 }
 
+std::shared_ptr<UObject> RetainObject(UObject* obj) {
+    constexpr LONG rootSet = 1L << 30;
+    static std::unordered_map<UObject*, std::weak_ptr<UObject>> retained;
+    if (!IsLive(obj)) {
+        coop::Log("reflection: cannot retain a non-live object");
+        return {};
+    }
+    if (auto existing = retained[obj].lock()) return existing;
+    for (auto it = retained.begin(); it != retained.end();)
+        it = it->second.expired() ? retained.erase(it) : std::next(it);
+    auto items = *reinterpret_cast<uint8_t**>(g.objectArray + 0x10);
+    int32_t index = obj->internalIndex;
+    auto flags = reinterpret_cast<volatile LONG*>(items + static_cast<size_t>(index) * 0x10 + 8);
+    bool alreadyRooted = (InterlockedOr(flags, rootSet) & rootSet) != 0;
+    auto result = std::shared_ptr<UObject>(obj, [index, alreadyRooted](UObject* value) {
+        if (!alreadyRooted && ObjectAt(index) == value) {
+            auto current = *reinterpret_cast<uint8_t**>(g.objectArray + 0x10);
+            InterlockedAnd(reinterpret_cast<volatile LONG*>(current + static_cast<size_t>(index) * 0x10 + 8),
+                           ~(1L << 30));
+        }
+    });
+    retained[obj] = result;
+    return result;
+}
+
 UObject* ResolveWeak(uint64_t weak) {
     auto index = static_cast<int32_t>(weak & 0xffffffff);
     auto serial = static_cast<int32_t>(weak >> 32);
@@ -174,6 +234,10 @@ bool IsDefaultOrArchetype(const UObject* obj) {
 
 // Accepts a short object name or "Outer.Name" (e.g. "/Game/Animation/Deacon/run/run.Run").
 UObject* FindObject(const char* name, const UObject* cls) {
+    static std::unordered_map<std::string, std::unordered_map<const UObject*, CachedLookup>> cache;
+    auto& entry = cache[name][cls];
+    if (auto object = entry.Get()) return object;
+    if (!entry.object && GetTickCount64() < entry.retryAt) return nullptr;
     std::string full(name), outer;
     auto dot = full.rfind('.');
     if (dot != std::string::npos) {
@@ -181,25 +245,36 @@ UObject* FindObject(const char* name, const UObject* cls) {
         full = full.substr(dot + 1);
     }
     int32_t idx = FindNameIndex(full.c_str());
-    if (idx < 0) return nullptr;
+    if (idx < 0) { entry.Set(nullptr); return nullptr; }
     for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
         auto o = ObjectAt(i);
         if (!o || o->name.index != idx || o->name.number != 0 || (cls && !IsA(o, cls))) continue;
         if (!outer.empty() && (!o->outer || Name(o->outer) != outer)) continue;
+        if (!IsLive(o)) continue;
+        entry.Set(o);
         return o;
     }
+    entry.Set(nullptr);
     return nullptr;
 }
 
 UObject* FindClass(const char* name) {
+    static std::unordered_map<std::string, CachedLookup> cache;
+    auto& entry = cache[name];
+    if (auto object = entry.Get()) return object;
+    if (!entry.object && GetTickCount64() < entry.retryAt) return nullptr;
     int32_t idx = FindNameIndex(name);
-    if (idx < 0) return nullptr;
+    if (idx < 0) { entry.Set(nullptr); return nullptr; }
     for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
         auto o = ObjectAt(i);
         if (!o || o->name.index != idx || o->name.number != 0 || !o->cls) continue;
         std::string meta = Name(o->cls);
-        if (meta.size() >= 5 && meta.compare(meta.size() - 5, 5, "Class") == 0) return o;
+        if (meta.size() >= 5 && meta.compare(meta.size() - 5, 5, "Class") == 0 && IsLive(o)) {
+            entry.Set(o);
+            return o;
+        }
     }
+    entry.Set(nullptr);
     return nullptr;
 }
 
@@ -297,6 +372,30 @@ int Call::checkedOffset(const char* param, size_t size) const {
 bool Call::invoke() {
     if (!ok() || !IsLive(target_)) return false;
     g.processEvent(target_, fn_, buf_.data());
+    return true;
+}
+
+bool ReadStructFields(const void* data, size_t size, std::initializer_list<StructField> fields, void* out, size_t outSize) {
+    auto bytes = static_cast<const uint8_t*>(data);
+    for (auto field : fields) {
+        auto structure = FindObject(field.structure, FindClass("ScriptStruct"));
+        auto property = structure ? FindChild(structure, field.member) : nullptr;
+        if (!property) {
+            coop::Log("reflection: missing struct member %s.%s", field.structure, field.member);
+            return false;
+        }
+        int offset = PropertyOffset(property);
+        int length = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(property) + off::PropertyElementSize);
+        if (offset < 0 || length <= 0 || static_cast<size_t>(offset) > size ||
+            static_cast<size_t>(length) > size - static_cast<size_t>(offset)) {
+            coop::Log("reflection: invalid struct member bounds %s.%s", field.structure, field.member);
+            return false;
+        }
+        bytes += offset;
+        size = static_cast<size_t>(length);
+    }
+    if (outSize > size) return false;
+    std::memcpy(out, bytes, outSize);
     return true;
 }
 

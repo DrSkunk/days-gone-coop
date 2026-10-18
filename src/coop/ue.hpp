@@ -5,6 +5,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <initializer_list>
+#include <memory>
+#include <cmath>
 
 namespace ue {
 
@@ -14,6 +17,13 @@ struct FRotator { float pitch, yaw, roll; };
 struct alignas(16) FQuat { float x, y, z, w; };
 struct alignas(16) FTransform { FQuat rotation; FVector translation; float pad0; FVector scale; float pad1; };
 struct FIntVector { int32_t x, y, z; };
+
+inline FVector AlignBoneToSocket(FVector socket, FVector componentBone, float yawDegrees) {
+    float yaw = yawDegrees * 3.14159265f / 180.f;
+    return {socket.x - (componentBone.x * std::cos(yaw) - componentBone.y * std::sin(yaw)),
+            socket.y - (componentBone.x * std::sin(yaw) + componentBone.y * std::cos(yaw)),
+            socket.z - componentBone.z};
+}
 
 struct UObject {
     void** vtable;
@@ -57,6 +67,8 @@ bool DetectPropertyOffsetField(std::string& diag);
 int32_t ObjectCount();
 UObject* ObjectAt(int32_t i);
 bool IsLive(const UObject* obj);
+// Game-thread ownership for objects held only by native plugin state, invisible to UE's collector.
+std::shared_ptr<UObject> RetainObject(UObject* obj);
 // Resolves a TWeakObjectPtr (ObjectIndex, SerialNumber) to a live object or nullptr.
 UObject* ResolveWeak(uint64_t weak);
 
@@ -75,6 +87,29 @@ UObject* FindDefaultObject(const char* className);
 UObject* FindChild(const UObject* structObj, const char* name);
 UObject* FindFunction(const UObject* cls, const char* name);
 int PropertyOffset(const UObject* prop);
+struct StructField { const char* structure; const char* member; };
+bool ReadStructFields(const void* data, size_t size, std::initializer_list<StructField> fields, void* out, size_t outSize);
+template <typename T> bool ReadEventParam(UObject* function, void* parameters, const char* name, T& out) {
+    if (!function || !parameters) return false;
+    auto property = FindChild(function, name);
+    if (!property) return false;
+    int offset = PropertyOffset(property);
+    int size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(property) + off::PropertyElementSize);
+    auto total = *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(function) + off::FunctionParmsSize);
+    if (offset < 0 || size < static_cast<int>(sizeof(T)) || static_cast<size_t>(offset) + sizeof(T) > total) return false;
+    std::memcpy(&out, static_cast<uint8_t*>(parameters) + offset, sizeof(T));
+    return true;
+}
+template <typename T> bool GetStructField(UObject* obj, const char* name,
+                                         std::initializer_list<StructField> fields, T& out) {
+    if (!IsLive(obj)) return false;
+    auto property = FindChild(obj->cls, name);
+    if (!property) return false;
+    int offset = PropertyOffset(property);
+    int size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(property) + off::PropertyElementSize);
+    return offset >= 0 && size > 0 && size <= 16384 &&
+        ReadStructFields(reinterpret_cast<uint8_t*>(obj) + offset, size, fields, &out, sizeof(T));
+}
 
 template <typename T> bool GetProp(UObject* obj, const char* name, T& out) {
     UObject* p = FindChild(obj->cls, name);
@@ -106,6 +141,14 @@ public:
         return v;
     }
     bool has(const char* param) const { return offsetOf(param) >= 0; }
+    template <typename T> bool member(const char* param, std::initializer_list<StructField> fields, T& out) const {
+        auto property = fn_ ? FindChild(fn_, param) : nullptr;
+        if (!property) { reportError(param); return false; }
+        int size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(property) + off::PropertyElementSize);
+        int offset = size > 0 ? checkedOffset(param, static_cast<size_t>(size)) : -1;
+        if (offset < 0) return false;
+        return ReadStructFields(buf_.data() + offset, size, fields, &out, sizeof(T));
+    }
 
 private:
     int offsetOf(const char* param) const;

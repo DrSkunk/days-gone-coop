@@ -43,6 +43,13 @@ HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* chain, UINT interval, UINT fla
                     auto& io = ImGui::GetIO();
                     io.IniFilename = nullptr;
                     io.LogFilename = nullptr;
+                    const char* fonts[] = {"C:\\windows\\Fonts\\segoeui.ttf", "C:\\windows\\Fonts\\tahoma.ttf",
+                        "C:\\windows\\Fonts\\arial.ttf", "Z:\\usr\\share\\fonts\\TTF\\DejaVuSans.ttf"};
+                    for (auto path : fonts) {
+                        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+                        if (io.Fonts->AddFontFromFileTTF(path, 24.f)) break;
+                        Log("overlay: could not load font %s", path);
+                    }
                     if (ImGui_ImplDX11_Init(device, context)) {
                         activeChain = chain;
                         ready = true;
