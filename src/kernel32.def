@@ -1,0 +1,10 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+GetModuleHandleW
+GetModuleFileNameW
+CreateFileW
+WriteFile
+CloseHandle
+GetCurrentProcessId
+GetTickCount64
+DisableThreadLibraryCalls

@@ -1,0 +1,8 @@
+sshpw
+.env
+.venv/
+__pycache__/
+build/
+package/
+*.exe
+*.log
