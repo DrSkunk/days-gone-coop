@@ -11,25 +11,43 @@ import struct
 import time
 
 MAGIC = 0x4F434744
-VERSION = 1
+VERSION = 2
 HAS_PAWN = 1
-FORMAT = '<IHHII3fff3f16s'
+BASE_FORMAT = '<IHHII3fff3f16s'
+FORMAT = BASE_FORMAT + '6I7f4BIf'
 SIZE = struct.calcsize(FORMAT)
-assert SIZE == 64
+assert SIZE == 128
 
 
 def encode(seq, time_ms, pos, yaw, pitch, vel, name, flags=HAS_PAWN):
     return struct.pack(FORMAT, MAGIC, VERSION, flags, seq & 0xFFFFFFFF, time_ms & 0xFFFFFFFF,
-                       *pos, yaw, pitch, *vel, name.encode()[:15])
+                       *pos, yaw, pitch, *vel, name.encode()[:15],
+                       1, 0, 0, 0, 0, 0, *([0.0] * 7), 0, 0, 0, 1, 0, 100.0)
 
 
 def decode(data):
     if len(data) != SIZE:
         return None
-    magic, version, flags, seq, time_ms, x, y, z, yaw, pitch, vx, vy, vz, name = struct.unpack(FORMAT, data)
-    if magic != MAGIC or version != VERSION or flags & ~3:
+    values = struct.unpack(FORMAT, data)
+    magic, version, flags, seq, time_ms, x, y, z, yaw, pitch, vx, vy, vz, name = values[:14]
+    session, target_session, consent, target_consent, attack_id, attack_ack = values[14:20]
+    damage, bx, by, bz, bp, byaw, br = values[20:27]
+    jacket, trousers, cap_color, cap, attack_kind, health = values[27:]
+    if magic != MAGIC or version != VERSION or flags & ~255:
         return None
-    if any(not math.isfinite(v) or abs(v) > 1e8 for v in (x, y, z, yaw, pitch, vx, vy, vz)):
+    if any(not math.isfinite(v) or abs(v) > 1e8 for v in (x, y, z, yaw, pitch, vx, vy, vz, damage,
+                                                        bx, by, bz, bp, byaw, br, health)):
+        return None
+    if max(jacket, trousers, cap_color) > 6 or cap > 1 or not 0 <= damage <= 1000 or not 0 <= health <= 100000:
+        return None
+    if flags & 8 and (not flags & 2 or not flags & HAS_PAWN):
+        return None
+    if flags & 2 and not flags & HAS_PAWN:
+        return None
+    if attack_kind > 2 or (attack_kind == 0 and (attack_id or damage)):
+        return None
+    if attack_kind and (not all((attack_id, session, target_session, consent, target_consent)) or
+                        not flags & 16 or damage <= 0):
         return None
     return {'flags': flags, 'seq': seq, 'time_ms': time_ms, 'pos': (x, y, z), 'yaw': yaw,
             'pitch': pitch, 'vel': (vx, vy, vz), 'name': name.split(b'\0', 1)[0].decode(errors='replace')}

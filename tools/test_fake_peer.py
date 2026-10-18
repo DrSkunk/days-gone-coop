@@ -11,7 +11,7 @@ import fake_peer
 
 class ProtocolTest(unittest.TestCase):
     def test_wire_size_matches_plugin(self):
-        self.assertEqual(fake_peer.SIZE, 64)
+        self.assertEqual(fake_peer.SIZE, 128)
 
     def test_round_trip(self):
         data = fake_peer.encode(7, 1234, (1.0, -2.0, 3.5), 90.0, -5.0, (10.0, 0.0, -1.0), 'Boozer')

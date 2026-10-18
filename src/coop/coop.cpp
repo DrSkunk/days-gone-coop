@@ -2,9 +2,13 @@
 
 #include "log.hpp"
 #include "net.hpp"
+#include "menu.hpp"
+#include "appearance.hpp"
+#include "overlay.hpp"
 #include "ue.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +31,8 @@ constexpr double kPeerTimeout = 5.0;
 
 std::wstring g_basePath;
 Config g_cfg;
+MenuSettings g_settings;
+SettingsMenu g_menu;
 DWORD g_gameThread = 0;
 bool g_inTick = false;
 bool g_failed = false;
@@ -34,6 +40,18 @@ bool g_ready = false;
 double g_lastTick = 0, g_lastSend = 0, g_lastScan = -10;
 UdpPeer g_net;
 uint32_t g_seq = 0;
+uint32_t g_session = 0, g_consent = 1;
+StatePacket g_peer{};
+Appearance g_localAppearance, g_remoteAppearance;
+UObject* g_localBike = nullptr;
+struct BikeAvatar {
+    UObject* actor = nullptr;
+    UObject* component = nullptr;
+    UObject* source = nullptr;
+    std::vector<UObject*> parts;
+} g_bike;
+double g_lastBikeSpawn = -10;
+std::string g_settingsError;
 
 struct Classes {
     UObject *playerController, *character, *skelMeshActor, *skelMeshComponent, *animSequence;
@@ -50,6 +68,8 @@ struct Snapshot {
     float yaw;
     FVector vel;
     uint16_t flags;
+    FVector bikePos;
+    FRotator bikeRotation;
 };
 std::deque<Snapshot> g_snaps;
 std::string g_remoteName;
@@ -70,8 +90,25 @@ FVector g_localPos{};
 double g_localSettledAt = 0;
 
 void DestroyAvatar();
+void DestroyBike();
 UObject* g_anims[4] = {};
 bool g_teleportHeld = false;
+bool OwnWindowFocused();
+std::string Narrow(const std::wstring& w);
+void SaveSettings() {
+    std::wstring ini = g_basePath + L".ini";
+    const std::pair<const wchar_t*, int> values[] = {{L"JacketColor", g_settings.jacket}, {L"TrousersColor", g_settings.trousers},
+        {L"CapColor", g_settings.capColor}, {L"ShowCap", g_settings.cap}, {L"SyncMotorcycles", g_settings.motorcycles},
+        {L"AllowPassenger", g_settings.passengers}};
+    for (auto [key, value] : values) {
+        auto text = std::to_wstring(value);
+        if (!WritePrivateProfileStringW(L"Coop", key, text.c_str(), ini.c_str()))
+        {
+            g_settingsError = "Settings could not be saved; check the plugin log";
+            Log("settings: could not save %s (error %lu)", Narrow(std::wstring(key)).c_str(), GetLastError());
+        }
+    }
+}
 
 double Now() {
     static LARGE_INTEGER freq = [] {
@@ -176,6 +213,28 @@ UObject* FindLocalController() {
     return best;
 }
 
+void DumpClass(FILE* file, UObject* cls) {
+    for (auto type = cls; type; type = Super(type)) {
+        std::fprintf(file, "\nCLASS %s\n", FullName(type).c_str());
+        auto field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(type) + off::StructChildren);
+        for (int budget = 0; field && budget < 4096; ++budget) {
+            bool function = Name(field->cls) == "Function";
+            std::fprintf(file, "  %s %s offset=%d\n", Name(field->cls).c_str(), Name(field).c_str(),
+                         function ? -1 : PropertyOffset(field));
+            if (function) {
+                auto parameter = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(field) + off::StructChildren);
+                for (int p = 0; parameter && p < 128; ++p) {
+                    std::fprintf(file, "    %s %s offset=%d size=%d\n", Name(parameter->cls).c_str(),
+                                 Name(parameter).c_str(), PropertyOffset(parameter),
+                                 *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(parameter) + off::PropertyElementSize));
+                    parameter = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(parameter) + off::FieldNext);
+                }
+            }
+            field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(field) + off::FieldNext);
+        }
+    }
+}
+
 void Discover(UObject* pawn) {
     Log("discovery: controller %s", FullName(g_controller).c_str());
     std::string chain;
@@ -204,6 +263,46 @@ void Discover(UObject* pawn) {
     }
     if (f) std::fclose(f);
     Log("discovery: %d loaded AnimSequence objects listed in %s", count, Narrow(path).c_str());
+    path = g_basePath + L"-reflection.txt";
+    f = _wfopen(path.c_str(), L"w");
+    if (!f) {
+        Log("discovery: cannot write reflection report");
+        return;
+    }
+    const char* classes[] = {"VehiclePawn", "BendVehicleSeatsComponent", "BendRideVehicleComponent",
+                             "BendPlayerPawn", "BendWeapon", "HUD", "BendHUD", "Canvas", "MaterialInstanceDynamic",
+                             "BendDamageComponent", "BendHealthComponent"};
+    for (const char* name : classes)
+        if (auto cls = FindClass(name)) DumpClass(f, cls);
+    auto vehicles = FindClass("VehiclePawn");
+    auto materials = FindClass("MaterialInstance");
+    struct Array { uint8_t* data; int32_t count, capacity; };
+    for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+        auto obj = ObjectAt(i);
+        if (!IsLive(obj) || IsDefaultOrArchetype(obj)) continue;
+        if (vehicles && IsA(obj, vehicles)) {
+            std::fprintf(f, "\nVEHICLE %s\n", FullName(obj).c_str());
+            for (int32_t j = 0; j < n; ++j) {
+                auto component = ObjectAt(j);
+                if (IsLive(component) && component->outer == obj)
+                    std::fprintf(f, "  COMPONENT %s mesh=%s\n", FullName(component).c_str(),
+                                 FullName(Prop(component, "SkeletalMesh")).c_str());
+            }
+        }
+        if (materials && IsA(obj, materials)) {
+            Array values{};
+            if (!GetProp(obj, "VectorParameterValues", values) || !values.data ||
+                values.count < 1 || values.count > 128 || values.count > values.capacity) continue;
+            std::fprintf(f, "\nMATERIAL %s parent=%s\n", FullName(obj).c_str(), FullName(Prop(obj, "Parent")).c_str());
+            for (int j = 0; j < values.count; ++j) {
+                FName name{};
+                std::memcpy(&name, values.data + j * 0x28, sizeof name);
+                std::fprintf(f, "  VECTOR %s\n", NameString(name.index).c_str());
+            }
+        }
+    }
+    std::fclose(f);
+    Log("discovery: reflection report written to %s", Narrow(path).c_str());
 }
 
 void SendLocalState(UObject* pawn, double now) {
@@ -212,6 +311,16 @@ void SendLocalState(UObject* pawn, double now) {
     p.version = kProtocolVersion;
     p.seq = ++g_seq;
     p.timeMs = static_cast<uint32_t>(now * 1000.0);
+    p.session = g_session;
+    p.targetSession = g_peer.session;
+    p.consent = g_consent;
+    p.jacket = static_cast<uint8_t>(g_settings.jacket);
+    p.trousers = static_cast<uint8_t>(g_settings.trousers);
+    p.capColor = static_cast<uint8_t>(g_settings.capColor);
+    p.cap = g_settings.cap;
+    if (g_settings.friendlyFire) p.flags |= kFriendlyFire;
+    if (g_settings.motorcycles) p.flags |= kSyncBikes;
+    if (g_settings.passengers) p.flags |= kAcceptPassengers;
     std::snprintf(p.name, sizeof p.name, "%s", g_cfg.playerName.c_str());
     if (pawn) {
         UObject* mesh = IsA(pawn, C.character) ? Prop(pawn, "Mesh") : nullptr;
@@ -236,6 +345,11 @@ void SendLocalState(UObject* pawn, double now) {
         FVector v = vel.get<FVector>("ReturnValue");
         FVector origin = WorldOrigin(pawn);
         p.flags |= kHasPawn;
+        GetProp(pawn, "Health", p.health);
+        Call alive(pawn, "IsAlive");
+        if (alive.invoke() && alive.get<bool>("ReturnValue")) p.flags |= kAlive;
+        Call mounted(pawn, "IsInVehicle");
+        if (mounted.invoke() && mounted.get<bool>("ReturnValue")) p.flags |= kInVehicle;
         p.pos[0] = pos.x + origin.x;
         p.pos[1] = pos.y + origin.y;
         p.pos[2] = pos.z + origin.z;
@@ -244,6 +358,21 @@ void SendLocalState(UObject* pawn, double now) {
         p.vel[0] = v.x;
         p.vel[1] = v.y;
         p.vel[2] = v.z;
+        if (g_settings.motorcycles && IsLive(g_localBike)) {
+            auto mesh = Prop(g_localBike, "VehicleMesh");
+            Call location(mesh, "K2_GetComponentLocation"), rotation(mesh, "K2_GetComponentRotation");
+            if (location.invoke() && rotation.invoke()) {
+                auto at = location.get<FVector>("ReturnValue");
+                auto r = rotation.get<FRotator>("ReturnValue");
+                p.flags |= kHasBike;
+                p.bikePos[0] = at.x + origin.x;
+                p.bikePos[1] = at.y + origin.y;
+                p.bikePos[2] = at.z + origin.z;
+                p.bikeRotation[0] = r.pitch;
+                p.bikeRotation[1] = r.yaw;
+                p.bikeRotation[2] = r.roll;
+            }
+        }
     }
     g_net.Send(p);
 }
@@ -251,17 +380,21 @@ void SendLocalState(UObject* pawn, double now) {
 void ReceiveRemote(double now) {
     StatePacket p;
     for (int budget = 0; budget < 64 && g_net.Receive(p); ++budget) {
-        bool reconnect = now - g_lastRecv > kPeerTimeout;
+        bool reconnect = now - g_lastRecv > kPeerTimeout || p.session != g_peer.session;
         if (!reconnect && !NewerSequence(p.seq, g_lastRemoteSeq)) continue;
         if (reconnect) {
             g_snaps.clear();
             Log("peer %s (%s) connected", p.name, g_net.PeerText().c_str());
             DestroyAvatar();  // Rebuild from the player's current look; also a manual "respawn" lever.
+            DestroyBike();
         }
         g_lastRecv = now;
         g_lastRemoteSeq = p.seq;
         g_remoteName = p.name;
-        g_snaps.push_back({now, {p.pos[0], p.pos[1], p.pos[2]}, p.yaw, {p.vel[0], p.vel[1], p.vel[2]}, p.flags});
+        g_peer = p;
+        g_snaps.push_back({now, {p.pos[0], p.pos[1], p.pos[2]}, p.yaw, {p.vel[0], p.vel[1], p.vel[2]}, p.flags,
+                          {p.bikePos[0], p.bikePos[1], p.bikePos[2]},
+                          {p.bikeRotation[0], p.bikeRotation[1], p.bikeRotation[2]}});
         while (g_snaps.size() > 64) g_snaps.pop_front();
     }
 }
@@ -286,6 +419,12 @@ bool SampleRemote(double now, Snapshot& out) {
         out.pos = {a.pos.x + (b.pos.x - a.pos.x) * k, a.pos.y + (b.pos.y - a.pos.y) * k,
                    a.pos.z + (b.pos.z - a.pos.z) * k};
         out.yaw = LerpAngle(a.yaw, b.yaw, k);
+        out.bikePos = {a.bikePos.x + (b.bikePos.x - a.bikePos.x) * k,
+                       a.bikePos.y + (b.bikePos.y - a.bikePos.y) * k,
+                       a.bikePos.z + (b.bikePos.z - a.bikePos.z) * k};
+        out.bikeRotation = {LerpAngle(a.bikeRotation.pitch, b.bikeRotation.pitch, k),
+                            LerpAngle(a.bikeRotation.yaw, b.bikeRotation.yaw, k),
+                            LerpAngle(a.bikeRotation.roll, b.bikeRotation.roll, k)};
         return true;
     }
     out = g_snaps.back();
@@ -317,6 +456,7 @@ void DestroyAvatar() {
         if (IsLive(a)) Call(a, "K2_DestroyActor").invoke();
     if (IsLive(g_avatar.actor)) Call(g_avatar.actor, "K2_DestroyActor").invoke();
     g_avatar = Avatar{};
+    g_remoteAppearance.Clear();
 }
 
 bool CopyMeshAppearance(UObject* source, UObject* destination) {
@@ -345,12 +485,105 @@ bool CopyMeshAppearance(UObject* source, UObject* destination) {
         }
         auto material = get.get<UObject*>("ReturnValue");
         if (!material) continue;
+        material = g_localAppearance.BaseMaterial(source, i, material);
         if (!Call(destination, "SetMaterial").set("ElementIndex", i).set("Material", material).invoke()) {
             Log("avatar: SetMaterial failed for slot %d", i);
             return false;
         }
     }
     return true;
+}
+
+void DestroyBike() {
+    for (auto part : g_bike.parts)
+        if (IsLive(part)) Call(part, "K2_DestroyActor").invoke();
+    if (IsLive(g_bike.actor)) Call(g_bike.actor, "K2_DestroyActor").invoke();
+    g_bike = {};
+}
+
+void FindLocalBike(UObject* pawn) {
+    UObject* bike = nullptr;
+    Call riding(pawn, "GetVehicle");
+    if (riding.invoke()) bike = riding.get<UObject*>("ReturnValue");
+    if (!IsLive(bike)) {
+        Call mode(C.statics, "GetGameMode");
+        if (mode.set("WorldContextObject", pawn).invoke()) {
+            auto gameMode = mode.get<UObject*>("ReturnValue");
+            if (auto vehicleClass = Prop(gameMode, "CurrentPlayerVehicle")) {
+                Call vehicle(gameMode, "GetVehicle");
+                if (vehicle.set("VehicleClass", vehicleClass).invoke())
+                    bike = vehicle.get<UObject*>("ReturnValue");
+            }
+        }
+    }
+    bike = IsLive(bike) ? bike : nullptr;
+    if (g_localBike != bike) {
+        Log("bike: local bike %s", FullName(bike).c_str());
+        g_localBike = bike;
+        DestroyBike();
+    }
+}
+
+bool SpawnBike(UObject* pawn, const FVector& at) {
+    auto source = Prop(g_localBike, "VehicleMesh");
+    if (!IsLive(source)) return false;
+    g_bike.actor = SpawnMeshActor(pawn, at);
+    g_bike.component = Prop(g_bike.actor, "SkeletalMeshComponent");
+    if (!IsLive(g_bike.component) || !CopyMeshAppearance(source, g_bike.component)) {
+        Log("bike: failed to clone chassis");
+        DestroyBike();
+        return false;
+    }
+    g_bike.source = Prop(source, "SkeletalMesh");
+    std::vector<UObject*> copied{g_bike.source};
+    for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+        auto component = ObjectAt(i);
+        if (!IsLive(component) || component == source || component->outer != g_localBike ||
+            !IsA(component, C.skelMeshComponent)) continue;
+        auto mesh = Prop(component, "SkeletalMesh");
+        if (!IsLive(mesh) || std::find(copied.begin(), copied.end(), mesh) != copied.end()) continue;
+        auto part = SpawnMeshActor(pawn, at);
+        auto destination = Prop(part, "SkeletalMeshComponent");
+        if (!IsLive(destination) || !CopyMeshAppearance(component, destination)) {
+            if (IsLive(part)) Call(part, "K2_DestroyActor").invoke();
+            Log("bike: could not clone part %s", Name(mesh).c_str());
+            DestroyBike();
+            return false;
+        }
+        if (!Call(part, "K2_AttachRootComponentToActor").set("InParentActor", g_bike.actor)
+                .set("AttachLocationType", static_cast<uint8_t>(2)).invoke() ||
+            !Call(destination, "SetMasterPoseComponent").set("NewMasterBoneComponent", g_bike.component).invoke()) {
+            Call(part, "K2_DestroyActor").invoke();
+            DestroyBike();
+            return false;
+        }
+        copied.push_back(mesh);
+        g_bike.parts.push_back(part);
+    }
+    auto animation = FindObject("/Game/Vehicles/BikeHero/bike_basic_anim.bike_basic_anim", C.animSequence);
+    if (animation) Call(g_bike.component, "PlayAnimation").set("NewAnimToPlay", animation).setBool("bLooping", true).invoke();
+    Log("bike: cloned chassis and %d modular parts", static_cast<int>(g_bike.parts.size()));
+    return true;
+}
+
+void UpdateBike(UObject* pawn, double now) {
+    Snapshot sample{};
+    bool have = g_settings.motorcycles && pawn && now - g_lastRecv < kPeerTimeout &&
+                SampleRemote(now, sample) && (sample.flags & kHasBike) && now >= g_localSettledAt;
+    if (!have || !IsLive(g_localBike)) {
+        if (IsLive(g_bike.actor)) DestroyBike();
+        return;
+    }
+    if (IsLive(g_bike.actor) && g_bike.source != Prop(Prop(g_localBike, "VehicleMesh"), "SkeletalMesh")) DestroyBike();
+    FVector origin = WorldOrigin(pawn);
+    FVector position{sample.bikePos.x - origin.x, sample.bikePos.y - origin.y, sample.bikePos.z - origin.z};
+    if (!IsLive(g_bike.actor)) {
+        if (now - g_lastBikeSpawn < 2) return;
+        g_lastBikeSpawn = now;
+        if (!SpawnBike(pawn, position)) return;
+    }
+    Call(g_bike.actor, "K2_SetActorLocationAndRotation").set("NewLocation", position).set("NewRotation", sample.bikeRotation)
+        .setBool("bSweep", false).setBool("bTeleport", true).invoke();
 }
 
 bool SpawnAvatar(UObject* localPawn, const FVector& at) {
@@ -409,6 +642,10 @@ void AnimateAvatar(const Snapshot& s) {
     float speed = std::sqrt(s.vel.x * s.vel.x + s.vel.y * s.vel.y);
     int tier = speed < 30 ? 0 : speed < 250 ? 1 : speed < 520 ? 2 : 3;
     UObject* anim = nullptr;
+    if (s.flags & kInVehicle)
+        anim = FindObject(s.flags & kPassenger ?
+            "/Game/Animation/Deacon/bike/bikeBuddy/bike_basic_control_buddy.bike_basic_control_buddy" :
+            "/Game/Animation/Deacon/bike/bike_basic_control.bike_basic_control", C.animSequence);
     for (int i = tier; i >= 0 && !anim; --i) {
         if (!IsLive(g_anims[i])) g_anims[i] = nullptr;
         anim = g_anims[i];
@@ -473,6 +710,17 @@ void UpdateAvatar(UObject* localPawn, double now) {
     move.set("NewLocation", local).set("NewRotation", FRotator{0, s.yaw, 0});
     bool moved = move.setBool("bSweep", false).setBool("bTeleport", true).invoke();
     AnimateAvatar(s);
+    MenuSettings remoteSettings;
+    remoteSettings.jacket = g_peer.jacket;
+    remoteSettings.trousers = g_peer.trousers;
+    remoteSettings.capColor = g_peer.capColor;
+    remoteSettings.cap = g_peer.cap != 0;
+    static double lastAppearance = -10;
+    if (now - lastAppearance >= 0.25) {
+        lastAppearance = now;
+        g_remoteAppearance.Apply(g_avatar.component, remoteSettings);
+        for (auto part : g_avatar.parts) g_remoteAppearance.Apply(Prop(part, "SkeletalMeshComponent"), remoteSettings);
+    }
     if (now - g_lastStatus >= 10.0) {
         g_lastStatus = now;
         Call at(g_avatar.actor, "K2_GetActorLocation"), me(localPawn, "K2_GetActorLocation");
@@ -542,6 +790,9 @@ void Tick() {
         Log("local pawn: %s", pawn ? FullName(pawn).c_str() : "none");
         // The avatar may belong to the previous pawn's world; respawn it next to the new one.
         DestroyAvatar();
+        DestroyBike();
+        g_localBike = nullptr;
+        g_localAppearance.Clear();
         g_pawn = pawn;
         g_localSettledAt = now + 5.0;
     }
@@ -550,12 +801,43 @@ void Tick() {
         Discover(g_pawn);
     }
     ReceiveRemote(now);
+    if (g_pawn && now - g_lastScan < kTickInterval && now >= g_localSettledAt) FindLocalBike(g_pawn);
+    UpdateBike(g_pawn, now);
     if (now - g_lastSend >= kSendInterval) {
         g_lastSend = now;
         SendLocalState(g_pawn, now);
     }
     UpdateAvatar(g_pawn, now);
-    HandleTeleport(g_pawn, now);
+    auto actions = g_menu.Update(g_controller, OwnWindowFocused(), g_settings);
+    if (g_menu.IsOpen()) {
+        Call viewport(g_controller, "GetViewportSize");
+        if (viewport.invoke()) {
+            std::string status = now - g_lastRecv < kPeerTimeout ? "Connected: " + g_remoteName : "Waiting for a LAN partner";
+            if (!g_settingsError.empty()) status = g_settingsError;
+            g_menu.Draw(viewport.get<int>("SizeX"), viewport.get<int>("SizeY"), g_settings, status);
+        }
+    }
+    if (actions.changed) {
+        ++g_consent;
+        if (!g_consent) ++g_consent;
+        SaveSettings();
+    }
+    static double lastLocalAppearance = -10;
+    if (g_pawn && now >= g_localSettledAt && now - lastLocalAppearance >= 0.25) {
+        lastLocalAppearance = now;
+        for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+            auto component = ObjectAt(i);
+            if (IsLive(component) && component->outer == g_pawn && IsA(component, C.skelMeshComponent))
+                g_localAppearance.Apply(component, g_settings);
+        }
+    }
+    if (g_cfg.discovery) {
+        static bool held = false;
+        bool down = OwnWindowFocused() && (GetAsyncKeyState(VK_F6) & 0x8000);
+        if (down && !held && g_pawn) Discover(g_pawn);
+        held = down;
+    }
+    if (!g_menu.IsOpen()) HandleTeleport(g_pawn, now);
 }
 
 void HookedProcessEvent(UObject* obj, UObject* fn, void* parms) {
@@ -564,6 +846,18 @@ void HookedProcessEvent(UObject* obj, UObject* fn, void* parms) {
         g_inTick = true;
         Tick();
         g_inTick = false;
+    }
+    if (g_ready && g_cfg.discovery && !g_inTick && fn) {
+        static int hud = FindNameIndex("ReceiveDrawHUD");
+        static int shot = FindNameIndex("OnWeaponFired_Event");
+        static int melee = FindNameIndex("AnimNotify_MeleeDamage");
+        if (fn->name.index == hud || fn->name.index == shot || fn->name.index == melee) {
+            static bool hudLogged = false;
+            if (fn->name.index != hud || !hudLogged) {
+                Log("discovery: event %s on %s", Name(fn).c_str(), FullName(obj).c_str());
+                if (fn->name.index == hud) hudLogged = true;
+            }
+        }
     }
     g.processEvent(obj, fn, parms);
 }
@@ -617,6 +911,27 @@ bool Install(const std::wstring& basePath) {
     LogOpen(basePath + L".log");
     Log("Days Gone Co-op starting");
     g_cfg = LoadConfig(basePath + L".ini");
+    if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&g_session), sizeof g_session,
+                       BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        Log("FATAL: could not generate the network session identifier");
+        return false;
+    }
+    if (!g_session) g_session = 1;
+    std::wstring ini = basePath + L".ini";
+    auto palette = [&](const wchar_t* key) {
+        int value = static_cast<int>(GetPrivateProfileIntW(L"Coop", key, 0, ini.c_str()));
+        if (value < 0 || value >= kPaletteCount) {
+            Log("settings: invalid palette for %s; using Original", Narrow(std::wstring(key)).c_str());
+            return 0;
+        }
+        return value;
+    };
+    g_settings.jacket = palette(L"JacketColor");
+    g_settings.trousers = palette(L"TrousersColor");
+    g_settings.capColor = palette(L"CapColor");
+    g_settings.cap = GetPrivateProfileIntW(L"Coop", L"ShowCap", 1, ini.c_str()) != 0;
+    g_settings.motorcycles = GetPrivateProfileIntW(L"Coop", L"SyncMotorcycles", 1, ini.c_str()) != 0;
+    g_settings.passengers = GetPrivateProfileIntW(L"Coop", L"AllowPassenger", 1, ini.c_str()) != 0;
     if (g_cfg.port == 0 || g_cfg.port > 65535 || g_cfg.peerPort == 0 || g_cfg.peerPort > 65535) {
         Log("FATAL: Port and PeerPort must be between 1 and 65535");
         return false;
@@ -635,6 +950,7 @@ bool Install(const std::wstring& basePath) {
     g.objectArray = reinterpret_cast<uint8_t*>(g.imageBase + kObjectArrayRva);
     if (!InstallHook(reinterpret_cast<uint8_t*>(g.imageBase + kProcessEventRva))) return false;
     Log("ProcessEvent hook installed");
+    StartOverlay();
     return true;
 }
 

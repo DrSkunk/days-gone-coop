@@ -4,5 +4,6 @@ sshpw
 __pycache__/
 build/
 package/
+.deps/
 *.exe
 *.log

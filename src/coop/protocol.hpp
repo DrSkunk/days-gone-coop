@@ -7,11 +7,17 @@
 namespace coop {
 
 constexpr uint32_t kMagic = 0x4F434744; // "DGCO"
-constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kProtocolVersion = 2;
 
 enum StateFlags : uint16_t {
     kHasPawn = 1 << 0,
     kInVehicle = 1 << 1,
+    kHasBike = 1 << 2,
+    kPassenger = 1 << 3,
+    kFriendlyFire = 1 << 4,
+    kAcceptPassengers = 1 << 5,
+    kAlive = 1 << 6,
+    kSyncBikes = 1 << 7,
 };
 
 #pragma pack(push, 1)
@@ -27,19 +33,41 @@ struct StatePacket {
     float pitch;
     float vel[3];
     char name[16];
+    uint32_t session;
+    uint32_t targetSession;
+    uint32_t consent;
+    uint32_t targetConsent;
+    uint32_t attackId;
+    uint32_t attackAck;
+    float damage;
+    float bikePos[3];
+    float bikeRotation[3]; // pitch, yaw, roll
+    uint8_t jacket, trousers, capColor, cap;
+    uint32_t attackKind; // 0 = none, 1 = melee, 2 = gunshot
+    float health;
 };
 #pragma pack(pop)
-static_assert(sizeof(StatePacket) == 64, "wire format");
+static_assert(sizeof(StatePacket) == 128, "wire format");
 
 inline bool DecodeState(const char* data, int len, StatePacket& out) {
     if (len != static_cast<int>(sizeof(StatePacket))) return false;
     std::memcpy(&out, data, sizeof out);
     if (out.magic != kMagic || out.version != kProtocolVersion ||
-        (out.flags & ~(kHasPawn | kInVehicle))) return false;
+        (out.flags & ~(kHasPawn | kInVehicle | kHasBike | kPassenger | kFriendlyFire |
+                       kAcceptPassengers | kAlive | kSyncBikes))) return false;
     const float values[] = {out.pos[0], out.pos[1], out.pos[2], out.yaw, out.pitch,
-                            out.vel[0], out.vel[1], out.vel[2]};
+                            out.vel[0], out.vel[1], out.vel[2], out.bikePos[0], out.bikePos[1], out.bikePos[2],
+                            out.bikeRotation[0], out.bikeRotation[1], out.bikeRotation[2], out.damage, out.health};
     for (float f : values)
         if (!std::isfinite(f) || std::fabs(f) > 1e8f) return false;
+    if (out.jacket > 6 || out.trousers > 6 || out.capColor > 6 || out.cap > 1 ||
+        out.damage < 0 || out.damage > 1000 || out.health < 0 || out.health > 100000 || out.attackKind > 2) return false;
+    if ((out.flags & kPassenger) && (!(out.flags & kInVehicle) || !(out.flags & kHasPawn))) return false;
+    if ((out.flags & kInVehicle) && !(out.flags & kHasPawn)) return false;
+    if (out.attackKind == 0) {
+        if (out.attackId || out.damage != 0) return false;
+    } else if (!out.attackId || !out.session || !out.targetSession || !out.consent || !out.targetConsent ||
+               !(out.flags & kFriendlyFire) || out.damage <= 0) return false;
     out.name[sizeof out.name - 1] = 0;
     return true;
 }
