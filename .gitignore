@@ -1,4 +1,3 @@
-sshpw
 .env
 .venv/
 __pycache__/
@@ -11,3 +10,4 @@ DaysGoneCoop-debug.ini
 DaysGoneCoop-debug-result.ini
 DaysGoneCoop-debug.lock
 .DaysGoneCoop-debug-*
+dist/

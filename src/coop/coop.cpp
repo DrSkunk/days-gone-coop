@@ -9,6 +9,10 @@
 #include "overlay.hpp"
 #include "combat.hpp"
 #include "debug_commands.hpp"
+
+#ifndef COOP_VERSION
+#define COOP_VERSION "dev"
+#endif
 #include "enemy.hpp"
 #include "gear.hpp"
 #include "pose.hpp"
@@ -3334,7 +3338,7 @@ Config LoadConfig(const std::wstring& ini) {
 bool Install(const std::wstring& basePath) {
     g_basePath = basePath;
     LogOpen(basePath + L".log");
-    Log("Days Gone Co-op starting");
+    Log("Days Gone Co-op %s starting (protocol v%u)", COOP_VERSION, static_cast<unsigned>(kProtocolVersion));
     g_cfg = LoadConfig(basePath + L".ini");
     g_debugRequests.Initialize(GetPrivateProfileIntW(L"Debug", L"Request", 0, (basePath + L"-debug.ini").c_str()));
     if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&g_session), sizeof g_session,

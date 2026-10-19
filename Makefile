@@ -1,4 +1,7 @@
-.PHONY: test test-protocol inspect build
+.PHONY: test test-protocol inspect build dist
+
+VERSION ?= $(shell tr -d '[:space:]' < version.txt)
+DIST := dist/DaysGoneCoop-$(VERSION)
 
 test: test-protocol
 	poetry run python -m unittest discover -s tools -p 'test_*.py' -v
@@ -13,3 +16,12 @@ inspect:
 
 build:
 	bash build.sh
+
+# Release archive: the plugin, its default INI, licenses and the README.
+dist: build
+	rm -rf "$(DIST)" "$(DIST).zip"
+	mkdir -p "$(DIST)"
+	cp package/DaysGoneCoop.asi package/DaysGoneCoop.ini package/LICENSE-Dear-ImGui.txt LICENSE README.md "$(DIST)/"
+	cd dist && zip -qr -X "DaysGoneCoop-$(VERSION).zip" "DaysGoneCoop-$(VERSION)"
+	cd dist && shasum -a 256 "DaysGoneCoop-$(VERSION).zip" > "DaysGoneCoop-$(VERSION).zip.sha256"
+	@echo "packaged dist/DaysGoneCoop-$(VERSION).zip"
