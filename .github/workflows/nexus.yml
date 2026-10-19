@@ -1,0 +1,117 @@
+name: Nexus Mods
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      publish:
+        type: boolean
+        default: true
+    secrets:
+      NEXUSMODS_API_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub release tag (vX.Y.Z)
+        required: true
+        type: string
+      publish:
+        description: Upload to Nexus (leave unchecked to verify only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  attestations: read
+
+concurrency:
+  group: nexusmods-1019
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Verify release and optionally upload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      NEXUS_FILE_ID: ${{ vars.NEXUSMODS_FILE_ID }}
+      NEXUS_MOD_ID: ${{ vars.NEXUSMODS_MOD_ID }}
+    steps:
+      - name: Validate configuration
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          NEXUS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected a stable release tag in vX.Y.Z format."
+            exit 1
+          fi
+          if [[ ! "$NEXUS_FILE_ID" =~ ^[0-9]+$ || ! "$NEXUS_MOD_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Set NEXUSMODS_FILE_ID and NEXUSMODS_MOD_ID repository variables to the API IDs shown by Nexus."
+            exit 1
+          fi
+          if [[ "$PUBLISH" == "true" && -z "$NEXUS_API_KEY" ]]; then
+            echo "::error::Add the NEXUSMODS_API_KEY repository Actions secret before publishing."
+            exit 1
+          fi
+      - name: Download and verify the GitHub release
+        id: release
+        run: |
+          version="${TAG#v}"
+          archive="DaysGoneTogether-$version.zip"
+          release="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,body)"
+          if ! jq -e '.isDraft == false and .isPrerelease == false' <<< "$release"; then
+            echo "::error::Only published, non-prerelease GitHub releases may be uploaded."
+            exit 1
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern "$archive" --pattern "$archive.sha256"
+          (cd dist && sha256sum --strict --check "$archive.sha256")
+          gh attestation verify "dist/$archive" --repo "$GITHUB_REPOSITORY"
+          delimiter="notes_$(openssl rand -hex 16)"
+          {
+            echo "version=$version"
+            echo "archive=dist/$archive"
+            echo "notes<<$delimiter"
+            jq -r '.body' <<< "$release"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+      - name: Upload to Nexus Mods
+        id: nexus
+        if: inputs.publish
+        uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2 # v1.0.0-beta.11
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_id: ${{ vars.NEXUSMODS_FILE_ID }}
+          mod_id: ${{ vars.NEXUSMODS_MOD_ID }}
+          filename: ${{ steps.release.outputs.archive }}
+          version: ${{ steps.release.outputs.version }}
+          display_name: Days Gone Together ${{ steps.release.outputs.version }}
+          description: Experimental two-player LAN co-op. Manual installation required; see the mod page.
+          category: main
+          archive_existing_version: 'false'
+          allow_mod_manager_download: 'false'
+          primary_mod_manager_download: 'false'
+          show_requirements_pop_up: 'true'
+          update_mod_version: 'true'
+          changelog: ${{ steps.release.outputs.notes }}
+      - name: Record result
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          VERSION_ID: ${{ steps.nexus.outputs.version_id }}
+        run: |
+          {
+            echo "## Days Gone Together $TAG"
+            echo "GitHub release archive: checksum and provenance verified."
+            if [[ "$PUBLISH" == "true" ]]; then
+              echo "Uploaded Nexus file version: $VERSION_ID."
+            else
+              echo "**Verification only: nothing was uploaded to Nexus.**"
+            fi
+            echo "Mod page: https://www.nexusmods.com/daysgone/mods/1019"
+          } >> "$GITHUB_STEP_SUMMARY"

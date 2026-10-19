@@ -162,6 +162,12 @@ Releases are automated with
 3. The same workflow builds the ASI with that version, packages
    `DaysGoneTogether-X.Y.Z.zip` with a SHA-256 file, creates a signed build
    provenance attestation and uploads both files to the release.
+4. After the GitHub assets are uploaded, the reusable **Nexus Mods** workflow
+   downloads that exact archive, verifies its checksum and GitHub attestation,
+   and uploads it to [Nexus mod 1019](https://www.nexusmods.com/daysgone/mods/1019).
+   It updates the mod version and changelog, keeps older versions available and
+   disables mod-manager downloads because Vortex installation is not supported.
+   A Nexus failure is reported without removing the GitHub release.
 
 The **CI** workflow runs the tests and uploads a development build as a
 workflow artifact on every push and pull request. Dependabot keeps the pinned
@@ -170,3 +176,30 @@ GitHub Actions and Python dependencies current.
 Release PRs are opened with the default `GITHUB_TOKEN`, so they don't trigger
 the CI workflow themselves. Their changes are limited to version and changelog
 files.
+
+### Nexus publishing setup and recovery
+
+Configure these in the personal repository's **Settings > Secrets and
+variables > Actions**:
+
+- Secret `NEXUSMODS_API_KEY`: a Nexus API key belonging to an account with
+  upload permission for the mod. Never put the key in source control or chat.
+- Variable `NEXUSMODS_FILE_ID`: `8193009`, the existing file's **API File ID**,
+  not its short unique ID.
+- Variable `NEXUSMODS_MOD_ID`: `16333760627707`, the **Unique Mod ID**, not the
+  page's game-local number `1019`.
+
+The initial mod page and first file must be created on Nexus manually.
+Subsequent stable releases publish automatically; missing credentials fail
+explicitly. Nexus may still scan or moderate the file before it is downloadable.
+
+For a non-publishing check of an existing release:
+
+```sh
+gh workflow run nexus.yml -f tag=v0.2.0 -F publish=false
+```
+
+To upload an existing GitHub release after a failed Nexus job, run **Nexus
+Mods** from the Actions tab with its release tag and **Upload to Nexus**
+checked (or use `-F publish=true`). Check Nexus first: uploading is not
+idempotent, so do not rerun an upload that already created the version.

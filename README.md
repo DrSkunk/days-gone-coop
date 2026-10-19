@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/DrSkunk/days-gone-together/actions/workflows/ci.yml/badge.svg)](https://github.com/DrSkunk/days-gone-together/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/DrSkunk/days-gone-together?include_prereleases&sort=semver)](https://github.com/DrSkunk/days-gone-together/releases)
+[![Nexus Mods](https://img.shields.io/badge/Nexus_Mods-Days_Gone_Together-orange)](https://www.nexusmods.com/daysgone/mods/1019)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Days Gone Together** is an experimental two-player **LAN co-op mod for Days
@@ -61,7 +62,9 @@ their motorcycle and the host's nearby enemies in your world.
    Windows. Under Proton they are in
    `steamapps/compatdata/1259420/pfx/drive_c/users/steamuser/AppData/Local/BendGame/Saved/`.
 2. Download `DaysGoneTogether-<version>.zip` from
-   [Releases](https://github.com/DrSkunk/days-gone-together/releases).
+   [Nexus Mods](https://www.nexusmods.com/daysgone/mods/1019) or
+   [GitHub Releases](https://github.com/DrSkunk/days-gone-together/releases).
+   Use **Manual Download** on Nexus; Vortex installation is not supported.
 3. Install Ultimate ASI Loader x64 as `version.dll` in the game's
    `BendGame/Binaries/Win64/` folder, next to `DaysGone.exe`. Skip this step if
    you already have an ASI loader there, and don't overwrite other mods.

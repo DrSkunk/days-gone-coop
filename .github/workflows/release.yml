@@ -68,3 +68,16 @@ jobs:
         run: |
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             "dist/DaysGoneTogether-$VERSION.zip" "dist/DaysGoneTogether-$VERSION.zip.sha256"
+
+  nexus:
+    name: Publish to Nexus Mods
+    needs: [release-please, publish]
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+      attestations: read
+    uses: ./.github/workflows/nexus.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+    secrets:
+      NEXUSMODS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY }}
