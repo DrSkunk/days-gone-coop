@@ -604,8 +604,22 @@ Movement and visual motorcycle replication do not establish shared-world gamepla
 The Snyk code-scan tool was unavailable in this environment; no Snyk scan was
 performed. Unit tests and live gameplay checks are not a security assessment.
 The v3 presentation-state extension passes packet, validation and motion-buffer
-tests and cross-compiles, but has not yet been deployed to both game clients or
-validated against live aim/crouch/fire input.
+tests and cross-compiles. It is running on cachy; the Deck still has an earlier
+v3 build, so the wire format is compatible. Crouch replication was confirmed,
+but live aim/fire behavior remains unverified. Cachy's current discovery build
+is `eb280fb32d8829802fe1f7c56c6f78f6535b6a95ba843874401066313200a76b`.
+
+Further runtime reflection identified the open-world `BP_BendWorldManagerV3_C`
+instance and its native `BendWorldManager` base. The base exposes `WorldTime`,
+`WorldWeather`, mission/cinematic state, `SetWorldTimeOfDay(float, bool)` and
+`SelectWorldWeather(byte, byte, float)`. This gives a concrete route for
+session-only time/weather sync, but it is not implemented yet: enum meanings,
+transition behavior and mission/cinematic interactions still need validation
+before applying host state. The same scan found `BendFreakerPawn`,
+`BendAIPawn` and `BendFreakerController` classes, including health/death and
+awareness surfaces. No active freaker pawn was present in the captured runtime
+area, so host-authoritative enemy replication is still unimplemented and its
+spawn/proxy lifecycle is not yet validated.
 
 ## 6. Limitations and next steps
 
@@ -620,5 +634,5 @@ also need:
 - matching animations to the partner's actual state instead of speed tiers.
 
 The shipped single-player gameplay does not provide a usable campaign co-op
-mode. Each remaining feature needs further investigation of Bend's gameplay
-classes; the existence of Unreal networking APIs is not enough.
+mode. Shared-world sync must use the game's gameplay APIs and respect mission
+state; the existence of Unreal networking APIs is not enough.
