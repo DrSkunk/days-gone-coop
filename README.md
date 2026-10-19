@@ -1,441 +1,240 @@
-# Days Gone LAN ghost co-op prototype
+# Days Gone Co-op
 
-An experimental Windows x64 ASI plugin that displays one LAN partner in your
-Days Gone world. **This is not full campaign or combat co-op.** Each game still
-runs its own single-player simulation. Use disposable saves for testing.
+[![CI](https://github.com/DrSkunk/days-gone-coop/actions/workflows/ci.yml/badge.svg)](https://github.com/DrSkunk/days-gone-coop/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/DrSkunk/days-gone-coop?include_prereleases&sort=semver)](https://github.com/DrSkunk/days-gone-coop/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## What it does
+An experimental two-player **LAN co-op mod for Days Gone (PC)**. It runs as an
+ASI plugin inside the game and shows your partner, their motorcycle and the
+host's nearby enemies in your world.
 
-- Exchanges player position, heading and velocity over UDP at approximately 30 Hz.
-- Spawns a separate, non-colliding skeletal avatar for the partner, using local
-  Deacon meshes, modular parts and materials.
-- Smooths movement on a sender-time timeline, with adaptive 80-250 ms buffering,
-  monotone cubic interpolation and up to 150 ms of bounded extrapolation.
-  Timestamps follow the engine's frame-start clock, not the HUD draw time.
-- Mirrors the partner's real skeleton: every bone of the body is streamed at the
-  pose rate and written into a poseable copy, so strafing, aiming, crouching,
-  climbing and riding look like the partner's own animation rather than a
-  speed-picked clip. The older idle/walk/run/sprint clips remain as a fallback
-  when no pose stream arrives.
-- Shows the item in the partner's hands (knife, crossbow, rifle and so on) at the
-  same hand socket and offset. Muzzle flashes and projectiles are not replicated.
-- Rebuilds the partner's motorcycle from its chassis and modular parts and streams
-  the chassis skeleton, so steering, suspension and wheels follow the partner.
-- Replicates the host's nearby enemies (up to 16 within 80 m) as visual,
-  non-colliding copies posed from the host's skeletons. They are not AI on the
-  joining machine and cannot be damaged there.
-- Applies the host's time and weather to the joining player's current session,
-  then restores that player's original local values on disconnect.
-- Hides the avatar after five seconds without state updates.
-- Replicates motorcycle position/orientation and rider animations, with a visual
-  clone of the observing player's motorcycle.
-- Offers experimental passenger riding on the partner's bike.
-- Replicates seven jacket/trouser/cap color presets and cap visibility.
-- Includes an in-game settings overlay with keyboard, mouse and gamepad controls.
-- Includes experimental, mutually opted-in friendly fire; see its validation
-  status and limitations below before relying on it.
-- **F7** teleports your player near the partner while the game window is focused.
-  This is experimental: there is no terrain, streaming or safe-landing check.
+> [!IMPORTANT]
+> This is **not** full campaign co-op. Each player still runs their own
+> single-player game, and missions, inventory, loot and saves are not shared.
+> Use it on a trusted LAN only, and back up your saves before you try it.
 
-The avatar is a visual ghost, not a second AI/combat pawn. Enemy copies are
-visual only; inventory, loot, missions, doors and saves are **not synchronized**.
-Time/weather sync is experimental and session-only; each game otherwise runs its
-own world. Projectiles, muzzle flashes and damage effects are not replicated. Motorcycle upgrades, fuel, damage and physics are not
-replicated. The avatar uses locally available Deacon assets and only the
-selected color presets and cap visibility describe the partner's appearance.
+> [!NOTE]
+> **AI-assisted project.** Most of this mod was written with AI coding
+> assistants: the code, the reverse-engineering analysis and the documentation.
+> A human directed the work and tested it in the real game on real hardware.
+> See [How it was built](#how-it-was-built).
 
-Only two players are supported. The protocol has no authentication or encryption:
-use a trusted LAN, never Internet port forwarding. The first valid endpoint in
-host mode is pinned until the game restarts. Restart both games if a peer changes
-IP or port. A timeout allows sequence numbering to restart, not a different endpoint.
+## Features
 
-## Supported game
+| Feature | What you get |
+|---|---|
+| Partner avatar | Your partner appears as a Deacon in your world, with smoothed movement |
+| Animation mirroring | The partner's real skeleton pose is streamed, so walking, strafing, aiming, crouching and riding match their screen |
+| Held items | The weapon or tool in your partner's hands is shown in the same hand |
+| Motorcycles | The partner's bike is shown with its parts, steering and suspension |
+| Passenger riding | Ride on the back of your partner's bike (experimental) |
+| Host enemies | The joining player sees the host's nearby enemies, up to 16 within 80 m, as visual copies |
+| Time and weather | The joining player's time of day and weather follow the host |
+| Appearance | Seven color presets for jacket, trousers and cap, and an option to hide the cap |
+| Friendly fire | Optional. Both players must opt in each session |
+| Teleport | Jump next to your partner |
+| In-game menu | Settings overlay usable with keyboard, mouse or gamepad |
 
-- Steam app **1259420**, build **19221447**.
-- DaysGone.exe SHA-256:
-  `17c2fca01d566914147a6d4924d038cb1f5a822c2829e4c45862e2bf837730b3`.
-- Engine metadata: Unreal Engine 4.10.1, with Bend-specific layouts.
-- Tested runtimes: CachyOS on `cachy` and SteamOS on a Steam Deck, using Proton.
-- Two real games have been tested together. Native Windows remains untested.
+### What is not synchronized
 
-The runtime checks the PE timestamp, image size and ProcessEvent prologue before
-installing a build-specific hook. These checks are not a full executable hash
-check. Do not disable them, update offsets speculatively or assume compatibility
-with another game release or another gameplay hook.
+- Missions, story progress, inventory, loot, doors, saves.
+- Enemy AI and combat. Host enemies are visual copies for the joining player:
+  they can't be fought there, and that player's own enemies still exist.
+- Projectiles, muzzle flashes and hit effects.
+- Motorcycle physics, fuel, damage and upgrades.
+- Outfit models. Your partner is drawn with *your* Deacon outfit, tinted with
+  *their* chosen colors.
 
-## In-game controls and settings
+## Requirements
 
-| Action | Keyboard/mouse | Gamepad |
-|---|---|---|
-| Open/close settings | F8 | View/Back + Y |
-| Select a row | Up/Down or click | D-pad Up/Down |
-| Change/activate | Left/Right, Enter or click | D-pad Left/Right or A |
-| Back/close | Esc | B |
-| Join/leave partner's motorcycle | F9 or menu | View/Back + X or menu |
-| Teleport near partner | F7 or menu | Menu |
-
-The game must be focused. The overlay does not pause either world. Colors,
-cap visibility, motorcycle synchronization and passenger permission save to the
-installed INI immediately. The palettes are Original, Crimson, Ocean, Forest,
-Sand, Charcoal and Violet. Hat customization currently means the existing cap's
-color and visibility, not alternative hat models.
-
-For a passenger, both players enable motorcycle sync; the driver allows a
-passenger, mounts their own bike normally and stops nearby. The passenger joins
-while on foot. This is a kinematic attachment to the visual bike, **not native
-two-seat vehicle simulation**. It temporarily disables passenger movement and
-collision, hides the native body in favor of an independent posed body, and
-blocks saving. Passenger weapon attacks are not supported. Leaving restores
-captured native visibility/state and checks
-for safe ground/capsule clearance; an unsafe manual exit is refused.
-
-Friendly fire defaults to **OFF every launch** and is deliberately not persisted.
-Both players must enable it and confirm lethal damage in their respective menus.
-Turning either side off blocks further accepted attacks. The transport scopes
-damage to the current connection and consent epochs, retransmits until
-acknowledged, deduplicates and expires old attacks. This does not authenticate
-the peer: trusted LAN only. Damage currently uses the midpoint of the weapon's
-configured native range; full vanilla critical/skill/falloff parity is not claimed.
-Real melee and firearm hits have reduced the other game's native health.
-The two-player test also confirmed death and normal reload after lethal damage.
-This does not establish full vanilla damage parity.
-
-Both clients must run the same protocol version. The current source uses
-**v5** (144-byte state packet plus separate pose, enemy and held-item datagrams);
-v1-v4 clients are incompatible. Pose streaming uses roughly 300 kB/s in each
-direction, plus about 140 kB/s per eight replicated enemies. That is fine on a
-LAN but is not designed for the Internet.
-When upgrading an existing installation, replace the ASI but preserve each
-machine's configured INI. Keep the supplied Dear ImGui license with distributions.
+- Days Gone on **Steam, build 19221447**. The mod checks the executable and
+  disables itself on any other build, for example after a game update.
+- Windows, or Linux / Steam Deck with Proton. It has been tested under Proton
+  on a desktop Linux PC and a Steam Deck. Native Windows has not been tested yet.
+- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
+  (x64) to load the plugin.
+- Two PCs on the same LAN, both on the same mod version.
 
 ## Install
 
-1. Close the game and back up your saves. Launching/loading/teleporting can trigger
-   ordinary game autosaves; the plugin does not isolate or roll back saves.
-2. Install the x64 [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
-   next to the game executable if you do not already have a compatible loader.
-   Do not overwrite an existing loader or unrelated mod.
-3. Copy **both** [DaysGoneCoop.asi](package/DaysGoneCoop.asi) and
-   [DaysGoneCoop.ini](package/DaysGoneCoop.ini) into:
-
-   ```text
-   Days Gone/BendGame/Binaries/Win64/
-   ```
-
-4. On Proton, a loader named `version.dll` needs a native DLL override. If you
-   configure it via Steam launch options, preserve any existing options:
+1. **Back up your saves.** They are in `%LOCALAPPDATA%\BendGame\Saved\` on
+   Windows. Under Proton they are in
+   `steamapps/compatdata/1259420/pfx/drive_c/users/steamuser/AppData/Local/BendGame/Saved/`.
+2. Download `DaysGoneCoop-<version>.zip` from
+   [Releases](https://github.com/DrSkunk/days-gone-coop/releases).
+3. Install Ultimate ASI Loader x64 as `version.dll` in the game's
+   `BendGame/Binaries/Win64/` folder, next to `DaysGone.exe`. Skip this step if
+   you already have an ASI loader there, and don't overwrite other mods.
+4. Copy `DaysGoneCoop.asi` and `DaysGoneCoop.ini` from the zip into that same
+   folder. Both files must stay side by side.
+5. **Linux / Steam Deck only:** Wine must load the proxy `version.dll`. In
+   Steam, open the game's *Properties → Launch Options* and set:
 
    ```sh
-   WINEDLLOVERRIDES="version=n,b" %command% --launcher-skip
+   WINEDLLOVERRIDES="version=n,b" %command%
    ```
 
-   If other overrides exist, merge them instead of replacing them. `cachy`
-   already has an app-specific `version=native,builtin` override in the game's
-   Proton prefix, so it does not need an additional Steam launch-option change.
-5. Configure host/join below, allow inbound **UDP 27777** on the LAN firewall,
-   and start the game on both machines. Each player must load their own save.
+   If you already have launch options, add to them instead of replacing them.
 
-For Proton, the usual game location is beneath
-`~/.local/share/Steam/steamapps/common/`. Saves are beneath
-`steamapps/compatdata/1259420/pfx/drive_c/users/steamuser/AppData/Local/BendGame/Saved/`.
-An earlier development session backed up `cachy`'s saves to
-`~/DaysGoneCoop-save-backup-20261017-223310`.
+To verify a download:
 
-## Host and join
+```sh
+gh attestation verify DaysGoneCoop-<version>.zip --repo DrSkunk/days-gone-coop
+```
 
-On **cachy (host)**, edit the installed INI:
+The release also includes a `.sha256` checksum file.
+
+## Set up a session
+
+Edit `DaysGoneCoop.ini` on both PCs, then start the game.
+
+**Host:** leave `PeerHost` empty. The first player who connects becomes your
+partner for the rest of the session.
 
 ```ini
 [Coop]
 Port=27777
 PeerHost=
-PeerPort=27777
 PlayerName=Host
 ```
 
-On the **second PC**:
+**Joining player:** set `PeerHost` to the host's LAN IP address or hostname.
 
 ```ini
 [Coop]
 Port=27777
-PeerHost=cachy
+PeerHost=192.168.1.50
 PeerPort=27777
 PlayerName=Partner
 ```
 
-Use `cachy`'s IPv4 LAN address if hostname resolution fails. Each player has an
-independent world; load saves in the same region and travel close together.
-The host learns the joiner's source endpoint from the first valid packet.
-Configuration changes require restarting the game.
+- Allow inbound **UDP 27777** (or your `Port`) through the host's firewall,
+  for example with `sudo ufw allow from 192.168.1.0/24 to any port 27777 proto udp`.
+  **Never** forward this port to the Internet: the protocol has no encryption
+  or authentication.
+- Each player loads their own save. Meet up in the same area, or use teleport.
+- Settings are read when the game starts. Restart the game after editing the
+  INI or to switch partners.
 
-On the tested LAN, `cachy` is `192.168.1.131`; hostname resolution was intermittent,
-so the IP address was used for the LAN test. With approval, this narrow UFW rule
-was added on `cachy` (the firewall remains enabled):
+## Controls
 
-```sh
-sudo ufw allow in on eno1 from 192.168.1.0/24 to any port 27777 proto udp comment "Days Gone co-op LAN"
-```
+| Action | Keyboard / mouse | Gamepad (XInput) |
+|---|---|---|
+| Open or close the menu | F8 | View/Back + Y |
+| Select a row | Up/Down or click | D-pad Up/Down |
+| Change or activate | Left/Right, Enter or click | D-pad Left/Right or A |
+| Close | Esc | B |
+| Join or leave the partner's bike | F9 | View/Back + X |
+| Teleport next to the partner | F7 (`TeleportKey`) | Menu |
 
-To remove that rule later:
+The game window must be focused. The menu does not pause the game.
 
-```sh
-sudo ufw delete allow in on eno1 from 192.168.1.0/24 to any port 27777 proto udp
-```
+On a **Steam Deck**, the mod reads XInput, not Steam Input actions. If the
+gamepad shortcuts do nothing, pick the *Gamepad With Joystick Trackpad*
+template under *Controller Settings → Current Layout → Templates*.
 
-The other settings are documented in [the template](config/DaysGoneCoop.ini).
-`TeleportKey=118` means F7 (decimal Windows virtual-key code). `Discovery=1`
-writes component details and a list of loaded animations for investigation.
-It also records loaded actor/component classes matching time, weather, enemy,
-Freaker, AI-controller and spawner terms to help map shared-world APIs.
-Animation names refer to already loaded assets; the mod does not ship game assets.
+### Menu
 
-### Steam Deck joining cachy
-
-The Steam Deck installation uses the same PC plugin under Proton, including the
-`version.dll` loader and its native DLL override. The installed Deck INI has
-`PeerHost=192.168.1.131`, `PeerPort=27777` and `PlayerName=SteamDeck`; cachy uses
-host mode with `PlayerName=cachy`. Launch Days Gone normally through Steam on
-both devices and load saves in the same area. Do not run the simulated-partner
-start scripts for this two-device test.
-
-The menu reads XInput, not native Steam Input actions. The official Days Gone
-layout did not expose an XInput controller on the tested Deck, so its mod-menu
-chords did nothing. The Deck was switched, with approval, to Valve's **Gamepad
-With Joystick Trackpad** template under Controller Settings > Current Layout >
-Templates. The running game then reported XInput mask `0x111` (slot zero through
-each of the three providers), rather than `0x0`. This replaces the official
-action layout, including its rear-grip assignments; restore it from Recommended
-if desired. The user confirmed that the menu and navigation work and normal
-movement/driving still work after closing it. No native-map interference was
-reported in that test.
-
-Teleport is available in the mod menu. F7 remains an optional Steam Input
-keyboard binding.
-
-## Diagnostics and removal
-
-The plugin writes `DaysGoneCoop.log` next to itself. Check for:
-
-- `ProcessEvent hook installed`
-- `GNames ...` and engine class resolution
-- `network: listening ...`
-- `peer ... connected`
-- `avatar: spawned ...`
-- Periodic partner and avatar coordinates, with the avatar's screen position
-  (`screen=(-1 -1)` means behind the camera) and component visibility
-- `perf:` lines with mod updates/s, mean/peak mod Tick time, send/receive rates,
-  riding-animation lookup time, adaptive delay and cumulative buffer counters.
-  Tick time is plugin game-thread work, not the whole game's frame time.
-
-A `FATAL` entry means the plugin disabled its gameplay work; do not bypass the
-check. No partner usually means mismatched INI settings, name resolution, the
-firewall, or one player not having loaded a save. No avatar with a connected
-peer can mean missing meshes or different world positions. Consult the log.
-
-To uninstall, close the game and remove only `DaysGoneCoop.asi` and its INI.
-Optional plugin logs and animation lists can also be removed. Keep shared
-loaders and other mods. Existing diagnostic probe source in this workspace is
-historical and is not built by the current build script.
-
-### Opt-in native test tools
-
-These are local developer controls, **not a campaign trainer**. Swarmers
-spawned on the host are replicated to the joining player as visual copies, like
-any other host enemy, which makes them a quick way to test enemy replication. Back up your saves and use a disposable save. Set `DebugTools=1` in
-the installed INI and restart; this alone does not enable invulnerability.
-Normal packages default to `DebugTools=0`.
-
-The [debug helper](tools/debug_control.py) must run on a machine with local access
-to the game's Win64 directory. It uses only Python's standard library. From this
-checkout:
-
-```sh
-poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" begin
-poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" god-on
-poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" spawn-single
-poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" status
-poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" end
-```
-
-| Command | Behavior |
+| Row | Effect |
 |---|---|
-| `inspect` | Writes the native cheat/spawn/horde API and AI-object report |
-| `begin` | Captures state and verifies that native blueprint saving is blocked |
-| `god-on` / `god-off` | Explicitly disables/enables native damage on the test pawn |
-| `spawn-single` | Spawns one local swarmer with its native AI controller |
-| `spawn-pack` | Spawns eight independent swarmers; maximum 16 owned enemies |
-| `status` | Logs player/enemy health, controllers, brain components and movement |
-| `probe-player` | Applies 5 native base damage; checks unchanged health with protection, reduced health without it |
-| `probe-enemy` | Applies 5 native base damage to one living, owned enemy |
-| `time-shift` | Host only: advances the time of day by 6 hours (four shifts return to the start) |
-| `weather-next` | Host only: selects the next weather state (0-3) so the client can be checked |
-| `cleanup` | Destroys only owned test pawns/controllers, waiting for engine destruction |
-| `end` | Cleans up and restores captured native damage/saving state |
+| Jacket / Trousers / Cap color | Original, Crimson, Ocean, Forest, Sand, Charcoal, Violet |
+| Cap | Show or hide your cap |
+| Sync motorcycles | Show your partner's bike and send yours |
+| Allow a passenger | Let your partner ride on your bike |
+| Friendly fire | Real, lethal damage. Both players must turn it on, and it needs a second confirmation |
+| Sync host's enemies | Host: send nearby enemies. Joining player: show them |
+| Join / leave partner's bike | Same as F9 |
+| Teleport to partner | Same as F7 |
 
-Damage probes require more than 25 target health. `probe-player` requires a prior
-`god-on` or `god-off` to establish the actual damage flag. Unprotected probes
-really reduce health; they do not heal it afterward.
+Menu changes are saved to the INI right away, except friendly fire. Friendly
+fire starts off in every session and is never saved.
 
-The runtime reads `DaysGoneCoop-debug.ini` beside the ASI every 0.5 seconds.
-Its `[Debug]` section contains `Command=<allowlisted command>` and a nonzero
-`Request=<different integer>`. Publish the complete file atomically, not one key
-at a time. A matching request/state/message is written to
-`DaysGoneCoop-debug-result.ini`; detailed measurements go to the normal log.
-Startup skips any request already on disk. There is no network command interface
-and no arbitrary console command or UFunction execution.
+### Passenger riding
 
-Test sessions require a living player on foot outside missions/cinematics.
-They prevent mod passenger boarding and partner teleportation, and automatically
-end on pawn changes, death, mounting a bike, missions/cinematics, or five minutes
-without a new command. Failed cleanup leaves saving blocked and reports an error;
-restart instead of continuing normal play. An eight-enemy pack is **not a native
-horde**: no persistent horde completion, database, or population-manager controls
-are invoked.
+Both players need *Sync motorcycles* on, and the driver needs *Allow a
+passenger*. The driver gets on their bike and stops. The passenger walks up
+and presses F9. The passenger is attached to the bike as a visual rider, and
+it isn't the game's own two-seat vehicle code. The passenger can't attack, and
+saving is blocked while riding. Press F9 again to get off. An exit is refused
+when there is no safe ground to stand on.
 
-The native saving block reduces risk; it is not a save sandbox or rollback.
-Normal loading/autosaves and indirect gameplay effects can still matter. Reload a
-disposable/backed-up save after testing when you need to discard encounter effects.
-See the [technical investigation](docs/TECHNICAL.md#312-native-debug-and-controlled-ai-tests)
-for the reverse-engineering findings and measured validation.
+## Configuration reference
 
-## Build and tests
+All keys are in the `[Coop]` section of `DaysGoneCoop.ini`.
 
-Requires MinGW-w64's `x86_64-w64-mingw32-g++` for the plugin, a native C++20 compiler
-for protocol tests, and Poetry with Python 3.11+ for tooling tests.
+| Key | Default | Meaning |
+|---|---|---|
+| `Port` | `27777` | Local UDP port |
+| `PeerHost` | *(empty)* | Empty = host. Otherwise the host's IP or hostname |
+| `PeerPort` | same as `Port` | Host's UDP port (joining player only) |
+| `PlayerName` | `Deacon` | Name shown in the partner's log (max 15 characters) |
+| `TeleportKey` | `118` (F7) | Windows virtual-key code for teleport |
+| `JacketColor`, `TrousersColor`, `CapColor` | `0` | 0 Original … 6 Violet |
+| `ShowCap` | `1` | Show your cap |
+| `SyncMotorcycles` | `1` | Bike sync |
+| `SyncEnemies` | `1` | Host enemy sync |
+| `AllowPassenger` | `1` | Allow a passenger on your bike |
+| `Discovery` | `0` | Developers: log engine details; F6 dumps the local pawn |
+| `DebugTools` | `0` | Developers: enable test tools (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
+| `AnimIdle`, `AnimWalk`, `AnimRun`, `AnimSprint` | Deacon clips | Fallback animations used when no pose stream arrives |
 
-```sh
-poetry install
-make test
-make build
+## Troubleshooting
+
+The plugin writes `DaysGoneCoop.log` next to itself. A healthy start looks like this:
+
+```text
+Days Gone Co-op 0.1.0 starting (protocol v5)
+ProcessEvent hook installed
+GNames via pointer at rva 0x…, … names
+network: listening on UDP 27777, …
+peer Partner (…) connected
+avatar: spawned …
 ```
 
-The build emits a statically linked Windows x64 DLL at
-`package/DaysGoneCoop.asi` and copies the INI template alongside it. Building
-does not install anything or touch Steam, saves or remote machines.
+| Symptom | Likely cause |
+|---|---|
+| No log file | The ASI loader isn't loading. Check `version.dll` and, on Proton, the `WINEDLLOVERRIDES` launch option |
+| `FATAL: unsupported DaysGone.exe` | Wrong game version. The mod disables itself; wait for an updated release |
+| Never connects | Wrong `PeerHost`/port, firewall, a mod version mismatch, or a player hasn't loaded a save |
+| Connected but no partner visible | You are far apart (try F7), or the partner just loaded and the avatar is being rebuilt (wait about 5 seconds) |
 
-Tests cover the actual C++ packet decoder, consent/retransmission, sequence and
-timestamp wraparound, and motion under jitter, batching and packet loss, plus
-Python protocol/handshake tests and offline PE inspection. They do not prove
-two-player gameplay, game-thread safety or stability through every world transition.
+Any `FATAL` line means the mod switched itself off and the game keeps running
+normally.
 
-### Single-game simulated partner
+## Uninstall
 
-To try the mod on one PC, without a second player, copy `tools/fake_peer.py`,
-`tools/same-pc/start-test.sh` and `tools/same-pc/stop-test.sh` into one folder
-on the gaming PC (Linux/Proton with systemd), then run:
+Close the game and delete `DaysGoneCoop.asi`, `DaysGoneCoop.ini` and the
+`DaysGoneCoop*.log`/`.txt` files. Remove `version.dll`, and the launch option,
+only if no other mod uses the ASI loader.
 
-```sh
-./start-test.sh            # follow mode (default); also: circle | still
-```
+## How it was built
 
-It backs up the INI, points it at `127.0.0.1:27778`, starts the simulator as
-the `dg-coop-fakepeer` user service (log: `fake_peer.log` next to the scripts)
-and launches the game. Load a save. A second Deacon appears in front of you
-and to the right, then walks, runs or sprints to keep up. Loading a save or
-fast travelling rebuilds him with your current outfit after about five seconds.
-F7 still teleports you to him. Running the script again switches mode while the
-game keeps running. `./stop-test.sh` stops the simulator and restores the
-host-mode INI; restart the game afterwards.
+The mod is a C++20 DLL cross-compiled with MinGW-w64. It hooks Unreal Engine
+4's `UObject::ProcessEvent` and then drives the game through the engine's own
+reflection system, calling functions by name. Game files on disk are never
+modified, and no game assets are included. The full write-up covers the
+reverse engineering, hooking, networking and synchronization:
+[docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
-To run the simulator by hand against a game in host mode:
+**Use of AI:** most of this project was developed with AI coding assistants
+(GitHub Copilot and large language models). That covers code, the static and
+runtime analysis of the game, tests and documentation. A human chose the
+goals, reviewed the results and tested the mod in the real game. AI output
+can contain mistakes: check claims against the code and your own tests, and
+report anything wrong.
 
-```sh
-poetry run python tools/fake_peer.py --game cachy:27777 \
-  --port 27778 --offset 300 --radius 150 --speed 150 --duration 60
-```
+## Development
 
-The helper sends a handshake, receives the game's position and moves a ghost
-around it. Units are centimetres. Use `--speed 0` for a stationary partner, or
-`--follow` (with `--speed` as the top speed) to trail the player. Stop with
-Ctrl-C, or use `--duration` for a bounded run. Restart the game to switch from
-this test endpoint to a real partner.
+Building, testing, the simulated partner, debug tools and the release process
+are covered in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Contributions are
+welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-### Offline executable investigation
+## Legal
 
-```sh
-make inspect EXE="/path/to/DaysGone.exe" \
-  MANIFEST="/path/to/appmanifest_1259420.acf" > engine-inspection.json
-```
+Days Gone is © Sony Interactive Entertainment, developed by Bend Studio. This
+is an unofficial fan project, not affiliated with or endorsed by Sony or Bend
+Studio. It contains no game code or assets. You need your own copy of the game.
 
-This read-only tool verifies the full fingerprint against
-[the build inventory](config/steam-19221447.json), then reports static analysis
-candidates. Those candidates are not themselves callable engine addresses.
-See [PE inspection details](docs/PE-INSPECTION.md). For how the mod was
-reverse engineered and how it hooks the engine, see
-[the technical write-up](docs/TECHNICAL.md).
-
-## Validation status
-
-Two real game instances on `cachy` and a Steam Deck were tested over the LAN on
-2026-10-18. Both loaded the plugin and a progressed save, connected to each
-other, and spawned modular partner avatars. Moving the Deck changed the remote
-avatar's position on cachy; moving cachy was received on the Deck, including a
-walk animation in its log. The Deck-controlled partner was visually confirmed
-on cachy with textures. F7 teleport was exercised on the Deck using keyboard
-input. This is a real-game-to-real-game movement test, not the simulator.
-
-Expansion tests verified the settings overlay, visible garment tinting, cap
-hiding, native bike mounting, modular bike proxies, passenger boarding/following
-and safe dismount. Separate Original/Crimson and Crimson/Ocean appearances have
-been visually confirmed on the two clients. Restoring Original after several
-minutes was also checked. In the earlier matching build on both devices, the
-passenger's component-space hips stayed at 64.2 cm and the stationary visual
-root varied by about 0.1 cm after settling. Short rolling/braking, manual
-dismount/reboarding, driver dismount and driver-disconnect cleanup were checked.
-The player subsequently reported jitter while moving. The revised networking
-uses sender timestamps rather than packet-drain times, smooths bike motion as
-well as player motion, and anchors the driver's view of the passenger directly
-to the local native seat instead of a round-trip-delayed position. A new short
-drive/brake check showed the seated passenger on both clients. The subsequent
-physical playtest reported **"much smoother, not perfect"**: residual moving
-jitter remains, so this is not a claim of fully solved passenger motion.
-A follow-up build fixes one measured source of that jitter. HUD-draw time varies
-within a frame, so timestamps now use a frame-locked engine clock. On both
-clients, the seated passenger stayed visible through a drive/brake check, and
-the clock remained locked. Physical smoothness has not yet been retested.
-
-Profiling found roughly 9.5-9.9 ms mean / 122-129 ms peak mod Tick time on cachy,
-with sends falling to about 18/s. After caching repeated object discovery,
-following HUD-frame cadence, correcting send deadlines and backing off absent
-controller polling, the final riding check measured about 0.67-0.73 ms mean /
-5.6-7.2 ms peak on cachy and 1.77-1.96 ms mean / 18.9-23.7 ms peak on the Deck,
-with roughly 30 sends/receives per second on both. Animation lookups dropped from about
-1.9 ms per call to below the log's 0.01 ms resolution. These are measurements of
-mod work, **not whole-game FPS benchmarks**.
-
-`make test` passes 44 Python tests plus native C++ protocol/consent/retransmission,
-motion/frame-clock, and debug allowlist/request/bitfield tests; `make build`
-cross-compiles the Windows plugin with warnings as errors.
-Real knife hits reduced the other game's native health (121.9 to 106.9 for one
-20-point attack before native processing). A one-sided opt-in test observed a
-native melee collision window without queuing damage while the partner was off.
-Pistol damage was confirmed by the user and native health logs, including
-121.9 -> 92.6 -> 63.4 -> 34.1 -> 4.9 -> -24.4; the user confirmed death/reload.
-Wire health clamps native negative death values to zero. Physical Deck menu
-opening/navigation and normal gameplay controls were confirmed after switching
-layouts. Residual moving jitter, long-distance travel, native Windows and
-long-session stability still need work or further validation. Full
-shared-world co-op still requires game-specific replication and authority work.
-
-The pose, held-item, enemy and world-sync work was checked live between cachy
-and the Deck on 2026-10-19:
-
-- The partner's streamed skeleton visibly strafed, walked and held a crossbow/rifle
-  aim pose on the other machine.
-- The held weapon rendered in the avatar's hands, tracking `r_hand_socket` to
-  within 1 cm in the log. An earlier "invisible weapon" report turned out to be
-  the bike handlebars hiding the hands.
-- Host enemies spawned with `spawn-pack` appeared, were posed and expired on the
-  Deck.
-- `time-shift` moved the Deck's clock from 10.789 to 16.827 within a second.
-  `weather-next` moved the Deck's weather 0 -> 1 -> 2 within 0.5 s. This
-  uncovered that the native `GetWorldWeather()` always returns 0, so earlier
-  builds never sent a real weather value; the mod now reads the `WorldWeather`
-  property instead. Weather states 1 and 2 showed no obvious visual change in
-  that location on either machine.
-- The rebuilt bike rendered complete on the observer. Socket-mounted bike parts
-  now follow their socket every frame (the same fix as the held item), but this
-  has not been visually re-checked while riding.
-
-Do not commit credentials, the `sshpw` file, game executables, assets, saves or
-runtime logs.
+Licensed under the [MIT License](LICENSE). Release builds bundle
+[Dear ImGui](https://github.com/ocornut/imgui) (MIT); its license is included
+in the release archive.
