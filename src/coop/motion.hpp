@@ -14,6 +14,8 @@ struct MotionSnapshot {
     float yaw;
     ue::FVector vel;
     uint16_t flags;
+    uint8_t actions, weaponType;
+    uint32_t shotSequence;
     ue::FVector bikePos;
     ue::FRotator bikeRotation;
 };
@@ -67,7 +69,8 @@ public:
             }
         }
         MotionSnapshot value{time, {packet.pos[0], packet.pos[1], packet.pos[2]}, packet.yaw,
-            {packet.vel[0], packet.vel[1], packet.vel[2]}, packet.flags,
+            {packet.vel[0], packet.vel[1], packet.vel[2]}, packet.flags, packet.actions, packet.weaponType,
+            packet.shotSequence,
             {packet.bikePos[0], packet.bikePos[1], packet.bikePos[2]},
             {packet.bikeRotation[0], packet.bikeRotation[1], packet.bikeRotation[2]}};
         if (!samples_.empty()) {

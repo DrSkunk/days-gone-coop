@@ -13,6 +13,9 @@ runs its own single-player simulation. Use disposable saves for testing.
   monotone cubic interpolation and up to 150 ms of bounded extrapolation.
   Timestamps follow the engine's frame-start clock, not the HUD draw time.
 - Plays idle/walk/run/sprint animations according to received speed.
+- Replicates aiming/crouching state and brief gun/crossbow firing animations for
+  the partner avatar. This presentation update is not yet live-game validated;
+  it does not yet render the partner's weapon model or muzzle flash.
 - Hides the avatar after five seconds without state updates.
 - Replicates motorcycle position/orientation and rider animations, with a visual
   clone of the observing player's motorcycle.
@@ -25,10 +28,11 @@ runs its own single-player simulation. Use disposable saves for testing.
   This is experimental: there is no terrain, streaming or safe-landing check.
 
 The avatar is a visual ghost, not a second AI/combat pawn. Enemies, inventory,
-loot, missions, doors, time, weather and saves are **not synchronized**. Detailed
-aiming, crouching, weapon/projectile effects, motorcycle upgrades, fuel, damage
-and physics are not replicated. Equipment is cloned locally; only the selected
-color presets and cap visibility describe the partner's appearance.
+loot, missions, doors, time, weather and saves are **not synchronized**. The
+partner's held weapon, projectiles, muzzle flashes, reloads and damage effects
+are not replicated. Motorcycle upgrades, fuel, damage and physics are not
+replicated. The avatar uses locally available Deacon assets and only the
+selected color presets and cap visibility describe the partner's appearance.
 
 Only two players are supported. The protocol has no authentication or encryption:
 use a trusted LAN, never Internet port forwarding. The first valid endpoint in
@@ -86,7 +90,8 @@ Real melee and firearm hits have reduced the other game's native health.
 The two-player test also confirmed death and normal reload after lethal damage.
 This does not establish full vanilla damage parity.
 
-Both clients must run protocol **v2 (128 bytes)**; v1 clients are incompatible.
+Both clients must run the same protocol version. The current source uses
+**v3 (134 bytes)**; v1/v2 clients are incompatible.
 When upgrading an existing installation, replace the ASI but preserve each
 machine's configured INI. Keep the supplied Dear ImGui license with distributions.
 

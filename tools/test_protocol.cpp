@@ -121,8 +121,13 @@ void TestMotionBuffer() {
         packet.flags = kHasPawn | kAlive;
         packet.pos[0] = 120;
         packet.vel[0] = 1000;
+        packet.actions = kAiming | kCrouched;
+        packet.weaponType = kWeaponCrossbow;
+        packet.shotSequence = 4;
         assert(buffer.Push(packet, 30 + ms * 0.001));
     }
+    assert(buffer.Latest().actions == (kAiming | kCrouched));
+    assert(buffer.Latest().weaponType == kWeaponCrossbow && buffer.Latest().shotSequence == 4);
     for (int frame = 0; frame < 60; ++frame) {
         assert(buffer.Sample(30.1 + frame / 60.0, out));
         assert(out.pos.x == 120 && out.vel.x == 0);
@@ -251,6 +256,9 @@ int main() {
     static_assert(offsetof(coop::StatePacket, jacket) == 116);
     static_assert(offsetof(coop::StatePacket, attackKind) == 120);
     static_assert(offsetof(coop::StatePacket, health) == 124);
+    static_assert(offsetof(coop::StatePacket, actions) == 128);
+    static_assert(offsetof(coop::StatePacket, weaponType) == 129);
+    static_assert(offsetof(coop::StatePacket, shotSequence) == 130);
     coop::StatePacket packet{};
     packet.magic = coop::kMagic;
     packet.version = coop::kProtocolVersion;
@@ -303,6 +311,16 @@ int main() {
     assert(!coop::DecodeState(data, sizeof packet, decoded));
     packet.pos[0] = 1e9f;
     assert(!coop::DecodeState(data, sizeof packet, decoded));
+    packet.pos[0] = 0;
+    packet.actions = 0x80;
+    assert(!coop::DecodeState(data, sizeof packet, decoded));
+    packet.actions = 0;
+    packet.weaponType = 4;
+    assert(!coop::DecodeState(data, sizeof packet, decoded));
+    packet.weaponType = coop::kWeaponGun;
+    packet.shotSequence = 99;
+    assert(coop::DecodeState(data, sizeof packet, decoded));
+    assert(decoded.weaponType == coop::kWeaponGun && decoded.shotSequence == 99);
     assert(coop::NewerSequence(43, 42));
     assert(!coop::NewerSequence(42, 42));
     assert(!coop::NewerSequence(41, 42));

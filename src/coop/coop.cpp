@@ -44,6 +44,7 @@ bool g_ready = false;
 double g_lastTick = 0, g_nextSend = 0, g_lastScan = -10;
 UdpPeer g_net;
 uint32_t g_seq = 0;
+uint32_t g_localShotSequence = 0;
 uint32_t g_session = 0, g_consent = 1;
 StatePacket g_peer{};
 DamageChannel g_damage;
@@ -62,6 +63,8 @@ struct Avatar {
     UObject* component = nullptr;
     std::vector<UObject*> parts;
     UObject* currentAnim = nullptr;
+    uint32_t lastShotSequence = 0;
+    double shotUntil = 0;
     UObject* seatBike = nullptr;
     UObject* seatMesh = nullptr;
     FName seatSocket{}, pelvis{};
@@ -400,6 +403,21 @@ void SendLocalState(UObject* pawn, double now) {
     std::snprintf(p.name, sizeof p.name, "%s", g_cfg.playerName.c_str());
     g_damage.Fill(p);
     if (pawn) {
+        uint8_t crouched = 0;
+        if (GetProp(pawn, "bIsCrouched", crouched) && crouched) p.actions |= kCrouched;
+        Call aiming(pawn, "IsAiming");
+        if (aiming.invoke() && aiming.get<bool>("ReturnValue")) p.actions |= kAiming;
+        Call reloading(pawn, "IsReloading");
+        if (reloading.invoke() && reloading.get<bool>("ReturnValue")) p.actions |= kReloading;
+        Call held(pawn, "GetEquippedItemCurrentlyInHand");
+        UObject* weapon = held.invoke() ? held.get<UObject*>("ReturnValue") : nullptr;
+        if (IsLive(weapon)) {
+            Call crossbow(weapon, "IsCrossbow"), gun(weapon, "IsGun"), melee(weapon, "IsMelee");
+            if (crossbow.invoke() && crossbow.get<bool>("ReturnValue")) p.weaponType = kWeaponCrossbow;
+            else if (gun.invoke() && gun.get<bool>("ReturnValue")) p.weaponType = kWeaponGun;
+            else if (melee.invoke() && melee.get<bool>("ReturnValue")) p.weaponType = kWeaponMelee;
+        }
+        p.shotSequence = g_localShotSequence;
         UObject* mesh = g_passenger.pawn == pawn && IsLive(g_passengerAvatar.component) ?
             g_passengerAvatar.component : IsA(pawn, C.character) ? Prop(pawn, "Mesh") : nullptr;
         FVector pos{};
@@ -1044,6 +1062,7 @@ void ObserveAttack(UObject* object, UObject* function, void* parameters) {
         Log("combat: shot event did not expose a weapon");
         return;
     }
+    ++g_localShotSequence;
     QueueAttack(false, weapon);
 }
 
@@ -1135,10 +1154,31 @@ void SetAvatarHidden(bool hidden) {
     for (auto a : g_avatar.parts) Call(a, "SetActorHiddenInGame").setBool("bNewHidden", hidden).invoke();
 }
 
-void AnimateAvatar(const Snapshot& s) {
+void AnimateAvatar(const Snapshot& s, double now) {
     float speed = std::sqrt(s.vel.x * s.vel.x + s.vel.y * s.vel.y);
     int tier = speed < 30 ? 0 : speed < 250 ? 1 : speed < 520 ? 2 : 3;
     UObject* anim = nullptr;
+    bool riding = (s.flags & kInVehicle) != 0;
+    if (s.shotSequence && s.shotSequence != g_avatar.lastShotSequence) {
+        g_avatar.lastShotSequence = s.shotSequence;
+        if (!riding && (s.weaponType == kWeaponGun || s.weaponType == kWeaponCrossbow)) {
+            const char* shotPath = s.weaponType == kWeaponCrossbow ?
+                "/Game/Animation/Deacon/gun/gun_poses/dcn_gun_fire_crossbow.dcn_gun_fire_crossbow" :
+                "/Game/Animation/Deacon/gun/gun_poses/dcn_gun_fire_ak47.dcn_gun_fire_ak47";
+            anim = FindObject(shotPath, C.animSequence);
+            if (anim) {
+                g_avatar.currentAnim = anim;
+                g_avatar.shotUntil = now + 0.3;
+                Call(g_avatar.component, "PlayAnimation").set("NewAnimToPlay", anim).setBool("bLooping", false).invoke();
+                return;
+            }
+        }
+    }
+    if (g_avatar.shotUntil > 0) {
+        if (now < g_avatar.shotUntil) return;
+        g_avatar.shotUntil = 0;
+        g_avatar.currentAnim = nullptr;
+    }
     if (s.flags & kInVehicle) {
         double started = Now();
         anim = FindObject(s.flags & kPassenger ?
@@ -1146,6 +1186,15 @@ void AnimateAvatar(const Snapshot& s) {
             "/Game/Animation/Deacon/bike/bike_basic_control.bike_basic_control", C.animSequence);
         g_ridingLookupTime += Now() - started;
         ++g_ridingLookups;
+    } else if (speed < 30 && (s.actions & kCrouched)) {
+        anim = FindObject((s.actions & kAiming) && s.weaponType != kWeaponNone ?
+            "/Game/Animation/Deacon/gun/aimed_locomotion/rifle_aimed_idle_crouch.rifle_aimed_idle_crouch" :
+            "/Game/Animation/Deacon/crouch/dcn_idle_crouch.dcn_idle_crouch", C.animSequence);
+    } else if (speed < 30 && (s.actions & kAiming) &&
+               (s.weaponType == kWeaponGun || s.weaponType == kWeaponCrossbow)) {
+        anim = FindObject(s.weaponType == kWeaponGun ?
+            "/Game/Animation/Deacon/gun/aimed_locomotion/1lg2h_aimed_idle.1lg2h_aimed_idle" :
+            "/Game/Animation/Deacon/gun/aimed_locomotion/pistol_aimed_idle.pistol_aimed_idle", C.animSequence);
     }
     for (int i = tier; i >= 0 && !anim; --i) {
         if (!IsLive(g_anims[i])) g_anims[i] = nullptr;
@@ -1241,8 +1290,9 @@ void UpdateAvatar(UObject* localPawn, double now) {
         g_lastSpawnAttempt = now;
         g_avatar = Avatar{};
         if (!SpawnAvatar(localPawn, local, g_avatar)) return;
+        g_avatar.lastShotSequence = s.shotSequence;
     }
-    AnimateAvatar(s);
+    AnimateAvatar(s, now);
     if (s.flags & kPassenger) {
         if (!AnchorRemotePassenger(local, s.yaw, now)) {
             constexpr const char* error = "Partner passenger seat unavailable; waiting for the local bike";

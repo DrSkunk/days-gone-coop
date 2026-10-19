@@ -11,22 +11,24 @@ import struct
 import time
 
 MAGIC = 0x4F434744
-VERSION = 2
+VERSION = 3
 HAS_PAWN = 1
 BASE_FORMAT = '<IHHII3fff3f16s'
-FORMAT = BASE_FORMAT + '6I7f4BIf'
+FORMAT = BASE_FORMAT + '6I7f4BIfBBI'
 SIZE = struct.calcsize(FORMAT)
-assert SIZE == 128
+assert SIZE == 134
 
 
 def encode(seq, time_ms, pos, yaw, pitch, vel, name, flags=HAS_PAWN, *,
            session=1, target_session=0, consent=0, target_consent=0, attack_id=0, attack_ack=0,
            damage=0.0, bike_pos=(0.0, 0.0, 0.0), bike_rotation=(0.0, 0.0, 0.0),
-           jacket=0, trousers=0, cap_color=0, cap=1, attack_kind=0, health=100.0):
+           jacket=0, trousers=0, cap_color=0, cap=1, attack_kind=0, health=100.0,
+           actions=0, weapon_type=0, shot_sequence=0):
     return struct.pack(FORMAT, MAGIC, VERSION, flags, seq & 0xFFFFFFFF, time_ms & 0xFFFFFFFF,
                        *pos, yaw, pitch, *vel, name.encode()[:15],
                        session, target_session, consent, target_consent, attack_id, attack_ack,
-                       damage, *bike_pos, *bike_rotation, jacket, trousers, cap_color, cap, attack_kind, health)
+                       damage, *bike_pos, *bike_rotation, jacket, trousers, cap_color, cap, attack_kind, health,
+                       actions, weapon_type, shot_sequence & 0xFFFFFFFF)
 
 
 def decode(data):
@@ -36,13 +38,15 @@ def decode(data):
     magic, version, flags, seq, time_ms, x, y, z, yaw, pitch, vx, vy, vz, name = values[:14]
     session, target_session, consent, target_consent, attack_id, attack_ack = values[14:20]
     damage, bx, by, bz, bp, byaw, br = values[20:27]
-    jacket, trousers, cap_color, cap, attack_kind, health = values[27:]
+    jacket, trousers, cap_color, cap, attack_kind, health, actions, weapon_type, shot_sequence = values[27:]
     if magic != MAGIC or version != VERSION or flags & ~255:
         return None
     if any(not math.isfinite(v) or abs(v) > 1e8 for v in (x, y, z, yaw, pitch, vx, vy, vz, damage,
                                                         bx, by, bz, bp, byaw, br, health)):
         return None
     if max(jacket, trousers, cap_color) > 6 or cap > 1 or not 0 <= damage <= 1000 or not 0 <= health <= 100000:
+        return None
+    if actions & ~7 or weapon_type > 3:
         return None
     if flags & 8 and (not flags & 2 or not flags & HAS_PAWN):
         return None
@@ -58,7 +62,8 @@ def decode(data):
             'session': session, 'target_session': target_session, 'consent': consent,
             'target_consent': target_consent, 'attack_id': attack_id, 'attack_ack': attack_ack, 'damage': damage,
             'bike_pos': (bx, by, bz), 'bike_rotation': (bp, byaw, br), 'jacket': jacket, 'trousers': trousers,
-            'cap_color': cap_color, 'cap': cap, 'attack_kind': attack_kind, 'health': health}
+            'cap_color': cap_color, 'cap': cap, 'attack_kind': attack_kind, 'health': health,
+            'actions': actions, 'weapon_type': weapon_type, 'shot_sequence': shot_sequence}
 
 
 def circle_state(anchor, t, radius, speed):

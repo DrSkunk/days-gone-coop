@@ -167,7 +167,7 @@ Source layout:
 | [`src/coop/dllmain.cpp`](../src/coop/dllmain.cpp) | `DllMain` / exported `InitializeASI`; finds the plugin's `.ini`, `.log` and `-anims.txt` paths |
 | [`src/coop/coop.cpp`](../src/coop/coop.cpp) | Build check, hook, tick loop, player tracking, avatar, teleport, config |
 | [`src/coop/ue.hpp`](../src/coop/ue.hpp) / [`ue.cpp`](../src/coop/ue.cpp) | Minimal UE 4.10 reflection layer |
-| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 128-byte v2 wire format and validation |
+| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 134-byte v3 wire format and validation |
 | [`src/coop/combat.hpp`](../src/coop/combat.hpp) | Consent-scoped reliable damage queue |
 | [`src/coop/appearance.cpp`](../src/coop/appearance.cpp) | Private garment materials and texture tinting |
 | [`src/coop/menu.cpp`](../src/coop/menu.cpp) / [`overlay.cpp`](../src/coop/overlay.cpp) | Settings input and Direct3D 11 overlay |
@@ -349,19 +349,25 @@ built from engine primitives:
 4. Each frame the avatar is moved with `K2_SetActorLocationAndRotation`.
    `PlayAnimation` picks a looping clip by horizontal speed: < 30 cm/s idle,
    < 250 walk, < 520 run, otherwise sprint.
+   The v3 packet additionally carries native aiming/crouch/reload state, a
+   coarse weapon category and a monotonic shot sequence. At idle, aiming and
+   crouching select locally loaded Deacon rifle/crouch sequences; a new
+   gun/crossbow shot plays a short firing animation before returning to the
+   locomotion pose. This first presentation slice does not clone the weapon
+   model or reproduce muzzle flash/projectile effects.
 5. The avatar is hidden (`SetActorHiddenInGame`) when the peer times out.
 
 The partner therefore looks like *your* Deacon in *your* current outfit.
 
 ### 3.7 Network protocol
 
-[`protocol.hpp`](../src/coop/protocol.hpp) defines one fixed 128-byte,
+[`protocol.hpp`](../src/coop/protocol.hpp) defines one fixed 134-byte,
 little-endian UDP packet:
 
 | Field | Type | Notes |
 |---|---|---|
 | magic | u32 | `"DGCO"` (`0x4F434744`) |
-| version | u16 | 2; both clients must upgrade together |
+| version | u16 | 3; both clients must upgrade together |
 | flags | u16 | HasPawn, InVehicle, HasBike, Passenger, FriendlyFire, AcceptPassengers, Alive, SyncBikes |
 | seq | u32 | wraps; compared with serial-number arithmetic |
 | timeMs | u32 | sender clock |
@@ -374,6 +380,9 @@ little-endian UDP packet:
 | jacket, trousers, capColor, cap | u8 each | palettes 0-6 and cap visibility |
 | attackKind | u32 | none, melee or gunshot |
 | health | f32 | native health for state/consent checks |
+| actions | u8 | aiming, crouched and reloading state bits |
+| weaponType | u8 | none, gun, crossbow or melee |
+| shotSequence | u32 | increments on local fire events for a remote firing pose |
 
 Peering is symmetric. In **host** mode (`PeerHost` empty) the plugin learns
 the partner from the first valid packet. In **join** mode it sends to the
@@ -562,7 +571,7 @@ with about 0.1 cm stationary visual-root variation. Short rolling/braking,
 manual exit/reboarding, driver dismount and disconnect cleanup were checked.
 The latter restored the native body, movement, collision and saving.
 
-The current suite passes 35 Python tests plus native C++ tests for the v2 wire
+The current suite passes 35 Python tests plus native C++ tests for the v3 wire
 format, serial ordering, mutual consent, scope invalidation, retransmission and
 deduplication, plus bone-to-socket alignment across yaw and translation changes.
 Motion tests cover timestamp wrap, teleport/gap recovery, role transitions,
@@ -592,6 +601,9 @@ Movement and visual motorcycle replication do not establish shared-world gamepla
 
 The Snyk code-scan tool was unavailable in this environment; no Snyk scan was
 performed. Unit tests and live gameplay checks are not a security assessment.
+The v3 presentation-state extension passes packet, validation and motion-buffer
+tests and cross-compiles, but has not yet been deployed to both game clients or
+validated against live aim/crouch/fire input.
 
 ## 6. Limitations and next steps
 
