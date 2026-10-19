@@ -528,6 +528,98 @@ deduplicates and expires events after three seconds. Session IDs come from
 timeouts and reconnects. Both peers must opt in. These are consent/reliability
 checks, not cryptographic authentication.
 
+### 3.12 Native debug and controlled AI tests
+
+An opt-in, game-thread reflection report found a live `BendCheatManager` under
+the local `BendDefaultPlayerController_C`. Its native `CheatManager` base exposes
+`God`, `Summon`, `DamageTarget`, debug-camera and time-dilation functions.
+The controller already owns the manager; no external trainer injection is needed.
+The game also has a live `GameCheatMenuBP_C` and `GameCheatMenu` APIs including
+`ToggleCheatMenu` and `GetWorldDebugMenu`. Their presence does not prove that the
+shipping debug menu itself is usable.
+
+The public [Days gone remastered - Mod Menu](https://www.nexusmods.com/daysgone/mods/798)
+advertises swarmer/horde spawning and an AI spawner. Its reuse permissions are
+restricted. No binary, source, or assets from it were copied or installed;
+the implementation below uses this game's own reflected interfaces.
+
+The AI investigation changed from name matching to inheritance from `BendAIPawn`.
+It found 106 non-default AI pawn objects, including `SwarmerPawn_C` and
+`HordeSwarmerPawn_C`. Several had origin/staging positions or no controller:
+these include pooled actors, not 106 verified active enemies. Controller,
+location, health, mesh and subsequent movement are required evidence of activity.
+
+`AIBlueprintHelperLibrary.SpawnAIFromClass` has this reflected layout:
+
+| Parameter | Offset | Type |
+|---|---:|---|
+| WorldContextObject | 0 | UObject pointer |
+| PawnClass | 8 | UClass pointer |
+| BehaviorTree | 16 | UObject pointer |
+| Location | 24 | FVector |
+| Rotation | 36 | FRotator |
+| bNoCollisionFail | 48 | bool |
+| ReturnValue | 56 | pawn pointer |
+
+The runtime uses reflected parameter names, not hardcoded copies of these
+offsets. It spawns the loaded `SwarmerPawn_C` about six meters ahead, after
+ground and capsule-clearance traces, with collision failure enabled and no
+explicit behavior-tree override. The Blueprint/controller initializes the
+native AI. Returned pawn/controller objects are rooted for ownership tracking;
+ambient objects are never adopted. The first test spawned a real controller
+and behavior-tree component, moved 729.2 cm, and accepted native damage:
+health fell from 160 to 156.25 for five base damage. `ApplyDamage` returned zero
+despite the health reduction, so tests judge actual health, not that return value.
+The brain's `IsRunning` accessor is not reflected in this build; `running=-1`
+means unavailable, not a stopped or verified running tree.
+
+Invulnerability uses native `God()` once to measure which single bit changes
+in the pawn's `bCanBeDamaged` byte. The observed mask was `0x02`.
+The implementation then explicitly sets/restores only that measured bit,
+preserving every adjacent bitfield, even if the controller later changes pawn.
+The original flag is retained separately. In the first protected damage probe,
+player health remained 121.875 before/after five native base damage.
+This checks the normal damage entry point, not every scripted death/grapple path.
+
+The local test mailbox accepts only documented command names. It is polled on
+the game thread every 0.5 seconds, disabled by default, skips requests already
+present at startup, and is never populated from a UDP packet. An atomic
+standard-library Python helper publishes requests and waits for matching
+acknowledgements. There is no generic console/UFunction endpoint.
+
+`begin` captures `IsSavingBlockedByBlueprint`, enables
+`SetSavingBlockedByBlueprint(true)` and verifies the getter before mutations.
+Passenger boarding and partner teleportation are excluded while a test session
+owns this state. Native damage/saving state is restored on `end`, pawn changes,
+death, riding, missions/cinematics, or five minutes of command inactivity.
+Cleanup destroys only tracked actors/controllers and refuses a controller that
+has acquired an unrelated pawn. A first live test exposed deferred actor
+destruction: checking `IsLive` immediately after `K2_DestroyActor` was too early.
+The corrected implementation requests all owned destructions, waits across engine
+frames, and acknowledges cleanup only after both pawns/controllers are no longer
+live. A ten-second failure reports an error and leaves saving blocked.
+
+The final scripted pass on cachy (ASI SHA-256 `d524ca6e…ef12`) ran 20 requests,
+all with the expected result. One swarmer spawned and took native damage
+(200.000 → 196.250), then cleanup brought the owned count to 0. Two packs reached
+16 owned enemies, and the 17th spawn request was rejected. With `god-off`, the
+damage bit was restored (`flags 0x38 → 0x3a`) and the player took damage
+(121.875 → 120.938). With `god-on`, health stayed at 120.938. Cleanup and `end`
+restored the original damage and saving state. Save file hashes were unchanged
+throughout the session. Spawned enemies were not replicated to the Deck; that is
+still host-authoritative enemy work.
+
+The real horde Blueprints expose `ActivateHorde`, `SetSize`, `AddHordeMembers`,
+`ReloadHorde`, and `ForceDestroyHorde`, alongside `SaveDatabase` and completion
+logic. These are not used for disposable tests because they can affect persistent
+horde progress. `spawn-pack` instead creates eight independent native swarmers,
+with a hard limit of 16 owned enemies. A real horde's crowd/group behavior and
+host-authoritative enemy replication remain separate work.
+
+The native save blocker is not full save isolation. Saves were backed up on cachy
+before the encounter tests. Indirect gameplay/progression effects and ordinary
+autosaves outside the test session remain possible; disposable saves are required.
+
 ## 4. Safety measures
 
 - Exact build check (timestamp + image size) and prologue byte check before
@@ -619,20 +711,23 @@ tests. Crouch replication was confirmed, but live aim/fire behavior remains
 unverified. The v4 session time/weather synchronization passes protocol tests,
 is deployed to both clients, and has been checked for host-time application and
 disconnect restoration. A weather transition and mission/cinematic behavior
-still need validation. The identical deployed ASI SHA-256 is
+still need validation. The world-sync build deployed to both machines had SHA-256
 `8916da86c3a955ba5e7876cdec5c93a6df85cee8c7a38f0b468b5faa00da7349`.
+The opt-in debug build on cachy is newer and remains protocol-v4 compatible;
+the Deck has not been upgraded with the debug controls.
 
 Further runtime reflection identified the open-world `BP_BendWorldManagerV3_C`
 instance and its native `BendWorldManager` base. The base exposes `WorldTime`,
 `WorldWeather`, mission/cinematic state, `SetWorldTimeOfDay(float, bool)` and
 `SelectWorldWeather(byte, byte, float)`. The host sends these values in v4;
 the joining client applies them only outside mission/cinematic state and
-restores its prior session values after disconnect. The in-game transition and
-restore behavior still need validation. The same scan found `BendFreakerPawn`,
+restores its prior session values after disconnect. A real weather transition
+still needs validation. The same scan found `BendFreakerPawn`,
 `BendAIPawn` and `BendFreakerController` classes, including health/death and
-awareness surfaces. No active freaker pawn was present in the captured runtime
-area, so host-authoritative enemy replication is still unimplemented and its
-spawn/proxy lifecycle is not yet validated.
+awareness surfaces. The original name-only scan did not establish whether active
+freakers were present; the later inheritance scan found pooled and controlled AI
+objects, and controlled tests successfully spawned native swarmers. This does not
+implement host-authoritative enemy replication or validate an enemy proxy lifecycle.
 
 ## 6. Limitations and next steps
 

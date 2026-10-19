@@ -16,6 +16,7 @@ struct Config {
     uint32_t peerPort = 27777;
     std::string playerName = "Deacon";
     bool discovery = false;
+    bool debugTools = false;
     std::string animIdle = "dcn_idle_normal";
     std::string animWalk = "dcn_walk";
     std::string animRun = "/Game/Animation/Deacon/run/run.Run";

@@ -7,3 +7,7 @@ package/
 .deps/
 *.exe
 *.log
+DaysGoneCoop-debug.ini
+DaysGoneCoop-debug-result.ini
+DaysGoneCoop-debug.lock
+.DaysGoneCoop-debug-*

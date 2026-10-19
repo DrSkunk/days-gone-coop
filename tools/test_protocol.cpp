@@ -3,6 +3,7 @@
 #include "../src/coop/ue.hpp"
 #include "../src/coop/motion.hpp"
 #include "../src/coop/frameclock.hpp"
+#include "../src/coop/debug_commands.hpp"
 
 #include <cassert>
 #include <cstdio>
@@ -239,6 +240,38 @@ void TestDamageChannel() {
 }
 
 int main() {
+    using coop::DebugCommand;
+    for (auto text : {"", "God", "god", "god-on extra", "spawn", "DestroyAll", "begin\n", "spawn-pack; end"})
+        assert(coop::ParseDebugCommand(text) == DebugCommand::unknown);
+    assert(coop::ParseDebugCommand("god-on") == DebugCommand::godOn);
+    assert(coop::ParseDebugCommand("god-off") == DebugCommand::godOff);
+    assert(coop::ParseDebugCommand("spawn-single") == DebugCommand::spawnSingle);
+    assert(coop::ParseDebugCommand("spawn-pack") == DebugCommand::spawnPack);
+    assert(coop::ParseDebugCommand("begin") == DebugCommand::begin);
+    assert(coop::ParseDebugCommand("end") == DebugCommand::end);
+    assert(coop::ParseDebugCommand("cleanup") == DebugCommand::cleanup);
+    assert(coop::ParseDebugCommand("probe-player") == DebugCommand::probePlayer);
+    assert(coop::ParseDebugCommand("probe-enemy") == DebugCommand::probeEnemy);
+    assert(coop::ParseDebugCommand("inspect") == DebugCommand::inspect);
+    assert(coop::ParseDebugCommand("status") == DebugCommand::status);
+    coop::DebugRequestGate gate;
+    gate.Initialize(42);
+    assert(!gate.Accept(0) && !gate.Accept(42));
+    assert(gate.Accept(43) && !gate.Accept(43));
+    gate.Initialize(43);
+    assert(!gate.Accept(43));
+    assert(gate.Accept(44));
+    for (int byte = 0; byte <= 255; ++byte) {
+        for (int bit = 0; bit < 8; ++bit) {
+            uint8_t mask = static_cast<uint8_t>(1 << bit);
+            assert(coop::DebugDamageMask(byte, byte ^ mask) == mask);
+            assert(coop::DebugMaskedFlag(byte, mask, false) == (byte & ~mask));
+            assert(coop::DebugMaskedFlag(byte, mask, true) == (byte | mask));
+        }
+        assert(coop::DebugDamageMask(byte, byte) == 0);
+        assert(coop::DebugDamageMask(byte, byte ^ 3) == 0);
+    }
+    static_assert(coop::kDebugPackSize <= coop::kDebugEnemyLimit);
     auto point = ue::AlignBoneToSocket({10, 20, 30}, {1, 2, 3}, 0);
     assert(point.x == 9 && point.y == 18 && point.z == 27);
     point = ue::AlignBoneToSocket({10, 20, 30}, {1, 2, 3}, 90);
@@ -348,5 +381,5 @@ int main() {
     TestDamageChannel();
     TestMotionBuffer();
     TestFrameClock();
-    std::puts("C++ protocol, consent, retransmission, deduplication, motion/jitter and frame-clock tests passed");
+    std::puts("C++ protocol, combat, motion, frame-clock and debug-control tests passed");
 }

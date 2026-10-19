@@ -229,6 +229,64 @@ Optional plugin logs and animation lists can also be removed. Keep shared
 loaders and other mods. Existing diagnostic probe source in this workspace is
 historical and is not built by the current build script.
 
+### Opt-in native test tools
+
+These are local developer controls, **not synchronized enemies or a campaign
+trainer**. Back up your saves and use a disposable save. Set `DebugTools=1` in
+the installed INI and restart; this alone does not enable invulnerability.
+Normal packages default to `DebugTools=0`.
+
+The [debug helper](tools/debug_control.py) must run on a machine with local access
+to the game's Win64 directory. It uses only Python's standard library. From this
+checkout:
+
+```sh
+poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" begin
+poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" god-on
+poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" spawn-single
+poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" status
+poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/Win64" end
+```
+
+| Command | Behavior |
+|---|---|
+| `inspect` | Writes the native cheat/spawn/horde API and AI-object report |
+| `begin` | Captures state and verifies that native blueprint saving is blocked |
+| `god-on` / `god-off` | Explicitly disables/enables native damage on the test pawn |
+| `spawn-single` | Spawns one local swarmer with its native AI controller |
+| `spawn-pack` | Spawns eight independent swarmers; maximum 16 owned enemies |
+| `status` | Logs player/enemy health, controllers, brain components and movement |
+| `probe-player` | Applies 5 native base damage; checks unchanged health with protection, reduced health without it |
+| `probe-enemy` | Applies 5 native base damage to one living, owned enemy |
+| `cleanup` | Destroys only owned test pawns/controllers, waiting for engine destruction |
+| `end` | Cleans up and restores captured native damage/saving state |
+
+Damage probes require more than 25 target health. `probe-player` requires a prior
+`god-on` or `god-off` to establish the actual damage flag. Unprotected probes
+really reduce health; they do not heal it afterward.
+
+The runtime reads `DaysGoneCoop-debug.ini` beside the ASI every 0.5 seconds.
+Its `[Debug]` section contains `Command=<allowlisted command>` and a nonzero
+`Request=<different integer>`. Publish the complete file atomically, not one key
+at a time. A matching request/state/message is written to
+`DaysGoneCoop-debug-result.ini`; detailed measurements go to the normal log.
+Startup skips any request already on disk. There is no network command interface
+and no arbitrary console command or UFunction execution.
+
+Test sessions require a living player on foot outside missions/cinematics.
+They prevent mod passenger boarding and partner teleportation, and automatically
+end on pawn changes, death, mounting a bike, missions/cinematics, or five minutes
+without a new command. Failed cleanup leaves saving blocked and reports an error;
+restart instead of continuing normal play. An eight-enemy pack is **not a native
+horde**: no persistent horde completion, database, or population-manager controls
+are invoked.
+
+The native saving block reduces risk; it is not a save sandbox or rollback.
+Normal loading/autosaves and indirect gameplay effects can still matter. Reload a
+disposable/backed-up save after testing when you need to discard encounter effects.
+See the [technical investigation](docs/TECHNICAL.md#312-native-debug-and-controlled-ai-tests)
+for the reverse-engineering findings and measured validation.
+
 ## Build and tests
 
 Requires MinGW-w64's `x86_64-w64-mingw32-g++` for the plugin, a native C++20 compiler
@@ -334,8 +392,9 @@ with roughly 30 sends/receives per second on both. Animation lookups dropped fro
 1.9 ms per call to below the log's 0.01 ms resolution. These are measurements of
 mod work, **not whole-game FPS benchmarks**.
 
-`make test` passes 35 Python tests plus native C++ protocol/consent/retransmission
-tests; `make build` cross-compiles the Windows plugin with warnings as errors.
+`make test` passes 42 Python tests plus native C++ protocol/consent/retransmission,
+motion/frame-clock, and debug allowlist/request/bitfield tests; `make build`
+cross-compiles the Windows plugin with warnings as errors.
 Real knife hits reduced the other game's native health (121.9 to 106.9 for one
 20-point attack before native processing). A one-sided opt-in test observed a
 native melee collision window without queuing damage while the partner was off.

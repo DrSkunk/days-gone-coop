@@ -8,6 +8,7 @@
 #include "appearance.hpp"
 #include "overlay.hpp"
 #include "combat.hpp"
+#include "debug_commands.hpp"
 #include "ue.hpp"
 
 #include <windows.h>
@@ -110,6 +111,29 @@ UObject* g_worldManager = nullptr;
 UObject* g_worldPawn = nullptr;
 double g_worldScanAt = -10, g_worldUpdateAt = -10;
 
+struct DebugEnemy {
+    std::shared_ptr<UObject> pawn;
+    std::shared_ptr<UObject> controller;
+    FVector start{};
+    bool destroyRequested = false;
+};
+struct DebugSession {
+    UObject *pawn = nullptr, *controller = nullptr, *gameMode = nullptr, *cheats = nullptr;
+    std::shared_ptr<UObject> pawnHold, gameModeHold;
+    bool originalSavingBlocked = false;
+    uint8_t damageMask = 0;
+    bool originalDamageable = true;
+    std::vector<DebugEnemy> enemies;
+    double expires = 0, reportAt = 0;
+} g_debug;
+DebugRequestGate g_debugRequests;
+struct DebugPending {
+    uint32_t request = 0;
+    std::string command;
+    double deadline = 0;
+    bool ending = false;
+} g_debugPending;
+
 struct OwnedMeshCache {
     UObject* owner = nullptr;
     double refreshed = -10;
@@ -120,6 +144,7 @@ UObject* g_controller = nullptr;
 UObject* g_localPlayer = nullptr;
 UObject* g_pawn = nullptr;
 UObject* g_discoveredPawn = nullptr;
+UObject* g_debugDiscoveredPawn = nullptr;
 
 using Snapshot = MotionSnapshot;
 MotionBuffer g_motion;
@@ -444,8 +469,8 @@ UObject* FindLocalController() {
     return best;
 }
 
-void DumpClass(FILE* file, UObject* cls) {
-    for (auto type = cls; type; type = Super(type)) {
+void DumpClass(FILE* file, UObject* cls, bool includeParents = true) {
+    for (auto type = cls; type; type = includeParents ? Super(type) : nullptr) {
         std::fprintf(file, "\nCLASS %s\n", FullName(type).c_str());
         auto field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(type) + off::StructChildren);
         for (int budget = 0; field && budget < 4096; ++budget) {
@@ -593,6 +618,77 @@ void Discover(UObject* pawn) {
         reportedObjects, static_cast<int>(emittedClasses.size()));
     std::fclose(f);
     Log("discovery: reflection report written to %s", Narrow(path).c_str());
+}
+
+bool DiscoverDebug(UObject* pawn) {
+    auto path = g_basePath + L"-debug.txt";
+    FILE* file = _wfopen(path.c_str(), L"w");
+    if (!file) {
+        g_settingsError = "Cannot write the native debug API report";
+        Log("debug: cannot write discovery report");
+        return false;
+    }
+    std::fprintf(file, "CONTEXT pawn=%s controller=%s cheat-manager=%s cheat-class=%s\n",
+        FullName(pawn).c_str(), FullName(g_controller).c_str(),
+        FullName(Prop(g_controller, "CheatManager")).c_str(), FullName(Prop(g_controller, "CheatClass")).c_str());
+    const char* required[] = {"PlayerController", "BendPlayerController", "BendPlayerPawn", "BendPawn",
+        "BendGameMode", "GameMode", "GameplayStatics", "AIBlueprintHelperLibrary", "AIController",
+        "BendAIController", "BendAIPawn", "BendFreakerPawn", "CheatManager",
+        "BrainComponent", "BehaviorTreeComponent", "NavigationSystem"};
+    std::vector<UObject*> emitted;
+    for (const auto* name : required) {
+        if (auto cls = FindClass(name)) {
+            emitted.push_back(cls);
+            DumpClass(file, cls, false);
+        }
+    }
+    auto classClass = FindClass("Class");
+    auto aiPawnClass = FindClass("BendAIPawn");
+    auto matches = [](std::string name) {
+        std::transform(name.begin(), name.end(), name.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        for (const auto* term : {"cheat", "debug", "spawner", "spawnmanager", "population", "horde", "swarmer"})
+            if (name.find(term) != std::string::npos) return true;
+        return false;
+    };
+    int aiCount = 0;
+    for (int32_t i = 0, count = ObjectCount(); i < count; ++i) {
+        auto object = ObjectAt(i);
+        if (!IsLive(object) || IsDefaultOrArchetype(object) || !IsLive(object->cls)) continue;
+        if (classClass && IsA(object, classClass) && matches(Name(object)) &&
+            std::find(emitted.begin(), emitted.end(), object) == emitted.end()) {
+            emitted.push_back(object);
+            DumpClass(file, object, false);
+        }
+        if (aiPawnClass && IsA(object, aiPawnClass)) {
+            ++aiCount;
+            Call location(object, "K2_GetActorLocation");
+            float health = 0;
+            if (!location.invoke() || !GetProp(object, "Health", health)) {
+                std::fprintf(file, "AI unreadable=%s\n", FullName(object).c_str());
+                continue;
+            }
+            auto at = location.get<FVector>("ReturnValue");
+            std::fprintf(file, "AI %s health=%.3f at=(%.1f %.1f %.1f) controller=%s mesh=%s\n",
+                FullName(object).c_str(), health, at.x, at.y, at.z,
+                FullName(Prop(object, "Controller")).c_str(),
+                FullName(Prop(Prop(object, "Mesh"), "SkeletalMesh")).c_str());
+        } else if (matches(Name(object->cls))) {
+            std::fprintf(file, "INSTANCE %s\n", FullName(object).c_str());
+        }
+    }
+    std::fprintf(file, "\nSUMMARY classes=%llu ai-pawns=%d\n",
+        static_cast<unsigned long long>(emitted.size()), aiCount);
+    bool written = std::ferror(file) == 0;
+    written = std::fclose(file) == 0 && written;
+    if (!written) {
+        g_settingsError = "Writing the native debug API report failed";
+        Log("debug: discovery report write failed");
+        return false;
+    }
+    Log("debug: report %s classes=%llu ai-pawns=%d", Narrow(path).c_str(),
+        static_cast<unsigned long long>(emitted.size()), aiCount);
+    return true;
 }
 
 void SendLocalState(UObject* pawn, double now) {
@@ -957,6 +1053,296 @@ int TraceWorld(const FVector& start, const FVector& end, FVector* impact = nullp
     return 1;
 }
 
+bool DebugError(const char* message) {
+    g_settingsError = message;
+    Log("debug: ERROR %s", message);
+    return false;
+}
+
+bool DebugSetDamageable(bool damageable) {
+    if (!IsLive(g_debug.pawn) || !g_debug.damageMask) return DebugError("Debug protection state is unavailable");
+    auto property = FindChild(g_debug.pawn->cls, "bCanBeDamaged");
+    int offset = property ? PropertyOffset(property) : -1;
+    uint8_t current = 0, checked = 0;
+    if (offset < 0 || !GetProp(g_debug.pawn, "bCanBeDamaged", current))
+        return DebugError("Cannot read the native damage flag");
+    // The mask was measured from God(), not guessed; preserve every adjacent bitfield.
+    uint8_t updated = DebugMaskedFlag(current, g_debug.damageMask, damageable);
+    std::memcpy(reinterpret_cast<uint8_t*>(g_debug.pawn) + offset, &updated, sizeof updated);
+    if (!GetProp(g_debug.pawn, "bCanBeDamaged", checked) || checked != updated)
+        return DebugError("Could not verify the native damage flag");
+    Log("debug: native damageable=%d mask=0x%02x flags=0x%02x", damageable, g_debug.damageMask, checked);
+    return true;
+}
+
+bool DebugGod(bool enabled) {
+    if (!g_debug.damageMask) {
+        uint8_t before = 0, after = 0;
+        if (!IsLive(g_debug.pawn) || Prop(g_debug.controller, "Pawn") != g_debug.pawn ||
+            !GetProp(g_debug.pawn, "bCanBeDamaged", before) ||
+            !Call(g_debug.cheats, "God").invoke() || !GetProp(g_debug.pawn, "bCanBeDamaged", after))
+            return DebugError("Native God could not be measured; restart before continuing tests");
+        g_debug.damageMask = DebugDamageMask(before, after);
+        if (!g_debug.damageMask) {
+            if (before != after && !Call(g_debug.cheats, "God").invoke())
+                Log("debug: ERROR unexpected God flag change could not be reverted");
+            return DebugError("Native God did not change exactly one damage flag; protection is unverified");
+        }
+        g_debug.originalDamageable = (before & g_debug.damageMask) != 0;
+    }
+    return DebugSetDamageable(!enabled);
+}
+
+bool DebugCleanup() {
+    for (auto it = g_debug.enemies.begin(); it != g_debug.enemies.end();) {
+        auto pawn = it->pawn.get(), controller = it->controller.get();
+        if (!it->destroyRequested) {
+            if (IsLive(controller)) {
+                auto possessed = Prop(controller, "Pawn");
+                if (possessed && possessed != pawn)
+                    return DebugError("A test controller changed ownership; cleanup stopped without touching its new pawn");
+                if (!Call(controller, "K2_DestroyActor").invoke())
+                    return DebugError("A test controller could not be destroyed; saving remains blocked");
+            }
+            if (IsLive(pawn) && !Call(pawn, "K2_DestroyActor").invoke())
+                return DebugError("A test pawn could not be destroyed; saving remains blocked");
+            it->destroyRequested = true;
+        }
+        if (!IsLive(pawn) && !IsLive(controller)) it = g_debug.enemies.erase(it);
+        else ++it;
+    }
+    // Actor destruction can complete on a later engine frame; acknowledge only once observed.
+    if (!g_debug.enemies.empty()) return false;
+    Log("debug: owned test actors cleaned up");
+    return true;
+}
+
+bool DebugEnd() {
+    if (!g_debug.pawn) return true;
+    if (!DebugCleanup()) return false;
+    if (g_debug.damageMask && IsLive(g_debug.pawn) && !DebugSetDamageable(g_debug.originalDamageable)) return false;
+    if (IsLive(g_debug.gameMode)) {
+        Call blocked(g_debug.gameMode, "IsSavingBlockedByBlueprint");
+        if (!Call(g_debug.gameMode, "SetSavingBlockedByBlueprint")
+                .setBool("SavingBlocked", g_debug.originalSavingBlocked).invoke() ||
+            !blocked.invoke() || blocked.get<bool>("ReturnValue") != g_debug.originalSavingBlocked)
+            return DebugError("Could not restore saving; restart the game before continuing");
+    }
+    Log("debug: session ended; original damage and saving state restored");
+    g_debug = {};
+    return true;
+}
+
+bool DebugBegin(double now) {
+    if (g_debug.pawn) return DebugError("A debug session is already active; end it first");
+    Call riding(g_pawn, "IsInVehicle"), mode(C.statics, "GetGameMode");
+    if (!IsLive(g_pawn) || !Alive(g_pawn) || g_passenger.pawn || now < g_localSettledAt ||
+        !riding.invoke() || riding.get<bool>("ReturnValue") || !mode.set("WorldContextObject", g_pawn).invoke())
+        return DebugError("Debug sessions require a living, settled gameplay pawn on foot, not a passenger");
+    auto manager = FindWorldManager();
+    if (!WorldSyncAllowed(manager))
+        return DebugError("Debug sessions are blocked during missions, cinematics, or unavailable world state");
+    auto gameMode = mode.get<UObject*>("ReturnValue");
+    Call blocked(gameMode, "IsSavingBlockedByBlueprint");
+    if (!blocked.invoke()) return DebugError("Cannot capture the original saving state");
+    g_debug.pawn = g_pawn;
+    g_debug.controller = g_controller;
+    g_debug.cheats = Prop(g_controller, "CheatManager");
+    g_debug.gameMode = gameMode;
+    g_debug.pawnHold = RetainObject(g_pawn);
+    g_debug.gameModeHold = RetainObject(gameMode);
+    g_debug.originalSavingBlocked = blocked.get<bool>("ReturnValue");
+    g_debug.expires = now + 300;
+    if (!Call(gameMode, "SetSavingBlockedByBlueprint").setBool("SavingBlocked", true).invoke() ||
+        !blocked.invoke() || !blocked.get<bool>("ReturnValue"))
+        return DebugError("Saving could not be blocked; no test mutations were permitted, send end to restore");
+    Log("debug: session started; saving blocked, previous=%d; expires after 300 seconds without commands",
+        g_debug.originalSavingBlocked);
+    return true;
+}
+
+void DebugStatus() {
+    float health = 0;
+    if (IsLive(g_pawn) && !GetProp(g_pawn, "Health", health)) {
+        DebugError("The player's native health could not be inspected");
+        return;
+    }
+    Log("debug: status active=%d playerHealth=%.3f owned=%llu", g_debug.pawn != nullptr, health,
+        static_cast<unsigned long long>(g_debug.enemies.size()));
+    auto origin = IsLive(g_pawn) ? WorldOrigin(g_pawn) : FVector{};
+    for (const auto& enemy : g_debug.enemies) {
+        auto pawn = enemy.pawn.get(), controller = enemy.controller.get();
+        if (!IsLive(pawn)) { Log("debug: owned pawn is destroyed"); continue; }
+        Call where(pawn, "K2_GetActorLocation");
+        if (!where.invoke() || !GetProp(pawn, "Health", health)) {
+            DebugError("An owned enemy's location or health could not be inspected");
+            continue;
+        }
+        auto at = where.get<FVector>("ReturnValue");
+        float dx = at.x + origin.x - enemy.start.x, dy = at.y + origin.y - enemy.start.y;
+        auto brain = IsLive(controller) ? Prop(controller, "BrainComponent") : nullptr;
+        int running = -1;
+        if (IsLive(brain) && FindFunction(brain->cls, "IsRunning")) {
+            Call check(brain, "IsRunning");
+            if (check.invoke()) running = check.get<bool>("ReturnValue");
+        }
+        Log("debug: owned=%s health=%.3f at=(%.1f %.1f %.1f) moved=%.1f controller=%s brain=%s running=%d",
+            FullName(pawn).c_str(), health, at.x, at.y, at.z, std::sqrt(dx * dx + dy * dy),
+            IsLive(controller) ? FullName(controller).c_str() : "none", brain ? FullName(brain).c_str() : "none", running);
+    }
+}
+
+bool DebugSpawn(size_t count, double now) {
+    if (g_debug.enemies.size() + count > kDebugEnemyLimit)
+        return DebugError("Test spawn limit is 16 owned enemies; clean up before spawning more");
+    auto pawnClass = FindClass("SwarmerPawn_C"), library = FindDefaultObject("AIBlueprintHelperLibrary");
+    Call where(g_pawn, "K2_GetActorLocation"), facing(g_pawn, "K2_GetActorRotation");
+    if (!pawnClass || !library || !where.invoke() || !facing.invoke())
+        return DebugError("Loaded swarmer class, spawn library, or player transform is unavailable");
+    auto at = where.get<FVector>("ReturnValue");
+    auto rotation = facing.get<FRotator>("ReturnValue");
+    float yaw = rotation.yaw * 3.14159265f / 180;
+    auto origin = WorldOrigin(g_pawn);
+    for (size_t i = 0; i < count; ++i) {
+        float forward = 600 + (i / 4) * 180.f, side = (static_cast<int>(i % 4) - 1.5f) * 180.f;
+        FVector start{at.x + std::cos(yaw) * forward - std::sin(yaw) * side,
+                      at.y + std::sin(yaw) * forward + std::cos(yaw) * side, at.z + 300};
+        FVector ground{};
+        if (TraceWorld(start, {start.x, start.y, at.z - 1500}, &ground) != 1)
+            return DebugError("No verified ground at the test spawn point; any earlier spawns remain owned for cleanup");
+        FVector position{ground.x, ground.y, ground.z + 100};
+        if (TraceWorld(position, {position.x, position.y, position.z + 1}, nullptr, true) != 0)
+            return DebugError("Test spawn clearance is blocked; any earlier spawns remain owned for cleanup");
+        Call spawn(library, "SpawnAIFromClass");
+        if (!spawn.set("WorldContextObject", g_pawn).set("PawnClass", pawnClass)
+                .set("BehaviorTree", static_cast<UObject*>(nullptr)).set("Location", position)
+                .set("Rotation", rotation).setBool("bNoCollisionFail", false).invoke())
+            return DebugError("Native AI spawn failed; any earlier spawns remain owned for cleanup");
+        auto pawn = spawn.get<UObject*>("ReturnValue");
+        if (!IsLive(pawn)) return DebugError("Native AI spawn returned no live pawn; no ambient actors were adopted");
+        auto controller = Prop(pawn, "Controller");
+        g_debug.enemies.push_back({RetainObject(pawn), RetainObject(controller),
+            {position.x + origin.x, position.y + origin.y, position.z + origin.z}});
+        Log("debug: spawned owned pawn=%s controller=%s", FullName(pawn).c_str(),
+            IsLive(controller) ? FullName(controller).c_str() : "none");
+        if (!IsLive(controller)) return DebugError("Test pawn has no AI controller; send cleanup before retrying");
+    }
+    g_debug.reportAt = now + 3;
+    DebugStatus();
+    return true;
+}
+
+bool DebugProbe(bool player) {
+    UObject* target = player ? g_pawn : nullptr;
+    bool protectedPlayer = false;
+    if (player) {
+        uint8_t flags = 0;
+        if (!g_debug.damageMask || !GetProp(g_pawn, "bCanBeDamaged", flags))
+            return DebugError("Measure native debug protection with god-on or god-off before probing player damage");
+        protectedPlayer = !(flags & g_debug.damageMask);
+    } else {
+        for (const auto& enemy : g_debug.enemies) {
+            if (IsLive(enemy.pawn.get()) && Alive(enemy.pawn.get())) { target = enemy.pawn.get(); break; }
+        }
+    }
+    float before = 0, after = 0;
+    if (!IsLive(target) || !GetProp(target, "Health", before) || !std::isfinite(before) || before <= 25)
+        return DebugError("Damage probe requires a live target with more than 25 health");
+    Call damage(C.statics, "ApplyDamage");
+    if (!damage.set("DamagedActor", target).set("BaseDamage", 5.f).set("EventInstigator", g_controller)
+            .set("DamageCauser", g_pawn).set("DamageTypeClass", FindClass("DamageType")).invoke() ||
+        !GetProp(target, "Health", after) || !std::isfinite(after))
+        return DebugError("Native damage probe failed");
+    Log("debug: damage probe target=%s before=%.3f after=%.3f returned=%.3f",
+        protectedPlayer ? "protected player" : player ? "damageable player" : "owned enemy",
+        before, after, damage.get<float>("ReturnValue"));
+    if (protectedPlayer ? after != before : after >= before)
+        return DebugError("Damage probe did not produce the required health outcome; inspect the runtime log");
+    return true;
+}
+
+void DebugReply(uint32_t request, const std::string& command, bool success) {
+    success = success && g_settingsError.empty();
+    Log("debug: request=%u command=%s result=%s", request, command.c_str(), success ? "ok" : "error");
+    auto result = g_basePath + L"-debug-result.ini";
+    auto id = std::to_wstring(request);
+    auto message = success ? std::wstring(L"See DaysGoneCoop.log for measured details") :
+        std::wstring(g_settingsError.begin(), g_settingsError.end());
+    bool written = WritePrivateProfileStringW(L"Result", L"State", success ? L"ok" : L"error", result.c_str()) &&
+        WritePrivateProfileStringW(L"Result", L"Message", message.c_str(), result.c_str()) &&
+        WritePrivateProfileStringW(L"Result", L"Request", id.c_str(), result.c_str());
+    if (!written) DebugError("Could not write debug command acknowledgement; inspect the runtime log");
+}
+
+void UpdateDebugTools(double now) {
+    if (!g_cfg.debugTools) return;
+    static double pollAt = -10;
+    if (now < pollAt) return;
+    pollAt = now + 0.5;
+    if (g_debugPending.request) {
+        g_settingsError.clear();
+        bool complete = g_debugPending.ending ? DebugEnd() : DebugCleanup();
+        if (!complete && g_settingsError.empty() && now < g_debugPending.deadline) return;
+        if (!complete && g_settingsError.empty())
+            DebugError("Test actor cleanup timed out; saving remains blocked, restart before continuing");
+        DebugReply(g_debugPending.request, g_debugPending.command, complete);
+        g_debugPending = {};
+        return;
+    }
+    if (g_debug.pawn) {
+        Call riding(g_debug.pawn, "IsInVehicle");
+        if (g_debug.pawn != g_pawn || !IsLive(g_debug.pawn) || !Alive(g_debug.pawn) ||
+            !WorldSyncAllowed(FindWorldManager()) || !riding.invoke() || riding.get<bool>("ReturnValue") ||
+            now >= g_debug.expires) {
+            if (!DebugEnd()) return;
+        }
+    }
+    if (g_debug.reportAt && now >= g_debug.reportAt) {
+        g_debug.reportAt = 0;
+        DebugStatus();
+    }
+    auto path = g_basePath + L"-debug.ini";
+    uint32_t request = GetPrivateProfileIntW(L"Debug", L"Request", 0, path.c_str());
+    if (!g_debugRequests.Accept(request)) return;
+    wchar_t raw[64]{};
+    GetPrivateProfileStringW(L"Debug", L"Command", L"", raw, 64, path.c_str());
+    auto text = Narrow(std::wstring(raw));
+    auto command = ParseDebugCommand(text);
+    g_settingsError.clear();
+    bool success = true;
+    if (command == DebugCommand::unknown) success = DebugError("Unknown debug command; only documented commands are allowed");
+    else if (command == DebugCommand::inspect) {
+        if (IsLive(g_pawn)) success = DiscoverDebug(g_pawn);
+        else success = DebugError("Debug inspection requires a gameplay pawn");
+    } else if (command == DebugCommand::status) DebugStatus();
+    else if (command == DebugCommand::begin) success = DebugBegin(now);
+    else if (command == DebugCommand::end || command == DebugCommand::cleanup) {
+        if (command == DebugCommand::cleanup && !g_debug.pawn)
+            success = DebugError("Send begin before using test tools");
+        else {
+            g_debugPending = {request, text, now + 10, command == DebugCommand::end};
+            return;
+        }
+    }
+    else if (!g_debug.pawn || !IsLive(g_pawn)) success = DebugError("Send begin before using test tools");
+    else {
+        Call blocked(g_debug.gameMode, "IsSavingBlockedByBlueprint");
+        if (!blocked.invoke() || !blocked.get<bool>("ReturnValue"))
+            success = DebugError("Saving is no longer blocked; test mutations stopped, send end");
+        else switch (command) {
+            case DebugCommand::godOn: success = DebugGod(true); break;
+            case DebugCommand::godOff: success = DebugGod(false); break;
+            case DebugCommand::spawnSingle: success = DebugSpawn(1, now); break;
+            case DebugCommand::spawnPack: success = DebugSpawn(kDebugPackSize, now); break;
+            case DebugCommand::probePlayer: success = DebugProbe(true); break;
+            case DebugCommand::probeEnemy: success = DebugProbe(false); break;
+            default: success = DebugError("Debug command is unavailable in the current session"); break;
+        }
+    }
+    if (g_debug.pawn) g_debug.expires = now + 300;
+    DebugReply(request, text, success);
+}
+
 bool PassengerExitPosition(FVector& destination) {
     if (!IsLive(g_passenger.pawn)) return false;
     Call where(g_passenger.pawn, "K2_GetActorLocation");
@@ -1024,6 +1410,11 @@ bool EndPassenger(bool forced) {
 
 void TogglePassenger(double now) {
     if (g_passenger.pawn) { EndPassenger(false); return; }
+    if (g_debug.pawn) {
+        g_settingsError = "End the debug test session before boarding a passenger seat";
+        Log("passenger: boarding blocked by the active debug session");
+        return;
+    }
     if (!g_pawn || !Alive(g_pawn) || !g_settings.motorcycles || !IsLive(g_bike.component) ||
         now - g_lastRecv >= kPeerTimeout || !(g_peer.flags & kAlive) || !(g_peer.flags & kAcceptPassengers) ||
         !(g_peer.flags & kInVehicle) || (g_peer.flags & kPassenger) || now < g_localSettledAt) {
@@ -1570,6 +1961,10 @@ bool OwnWindowFocused() {
 }
 
 void TeleportToPartner(UObject* pawn, double now) {
+    if (g_debug.pawn) {
+        DebugError("End the debug test session before teleporting to a partner");
+        return;
+    }
     if (!pawn || g_motion.Empty() || now - g_lastRecv > kPeerTimeout || !EndPassenger(false)) return;
     const auto& s = g_motion.Latest();
     if (!(s.flags & kHasPawn)) return;
@@ -1669,6 +2064,10 @@ void Tick(bool hudFrame) {
         g_discoveredPawn = g_pawn;
         Discover(g_pawn);
     }
+    if (g_pawn && g_cfg.debugTools && g_pawn != g_debugDiscoveredPawn) {
+        g_debugDiscoveredPawn = g_pawn;
+        DiscoverDebug(g_pawn);
+    }
     static bool wasAlive = false, wasConnected = false;
     bool alive = g_pawn && Alive(g_pawn), connected = now - g_lastRecv < kPeerTimeout;
     if (alive != wasAlive || (wasConnected && !connected)) ++g_consent;
@@ -1676,6 +2075,7 @@ void Tick(bool hudFrame) {
     wasConnected = connected;
     ReceiveRemote(now);
     UpdateWorldSync(g_pawn, now);
+    UpdateDebugTools(now);
     UpdateDamageScope(now);
     if (g_pawn && now - g_lastScan < kTickInterval && now >= g_localSettledAt) FindLocalBike(g_pawn);
     UpdateBike(g_pawn, now);
@@ -1829,6 +2229,7 @@ Config LoadConfig(const std::wstring& ini) {
     c.peerPort = GetPrivateProfileIntW(L"Coop", L"PeerPort", c.port, ini.c_str());
     c.playerName = IniString(ini, L"PlayerName", c.playerName.c_str());
     c.discovery = GetPrivateProfileIntW(L"Coop", L"Discovery", 0, ini.c_str()) != 0;
+    c.debugTools = GetPrivateProfileIntW(L"Coop", L"DebugTools", 0, ini.c_str()) != 0;
     c.animIdle = IniString(ini, L"AnimIdle", c.animIdle.c_str());
     c.animWalk = IniString(ini, L"AnimWalk", c.animWalk.c_str());
     c.animRun = IniString(ini, L"AnimRun", c.animRun.c_str());
@@ -1842,6 +2243,7 @@ bool Install(const std::wstring& basePath) {
     LogOpen(basePath + L".log");
     Log("Days Gone Co-op starting");
     g_cfg = LoadConfig(basePath + L".ini");
+    g_debugRequests.Initialize(GetPrivateProfileIntW(L"Debug", L"Request", 0, (basePath + L"-debug.ini").c_str()));
     if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&g_session), sizeof g_session,
                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
         Log("FATAL: could not generate the network session identifier");
