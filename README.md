@@ -11,6 +11,7 @@ runs its own single-player simulation. Use disposable saves for testing.
   Deacon meshes, modular parts and materials.
 - Smooths movement on a sender-time timeline, with adaptive 80-250 ms buffering,
   monotone cubic interpolation and up to 150 ms of bounded extrapolation.
+  Timestamps follow the engine's frame-start clock, not the HUD draw time.
 - Plays idle/walk/run/sprint animations according to received speed.
 - Hides the avatar after five seconds without state updates.
 - Replicates motorcycle position/orientation and rider animations, with a visual
@@ -307,6 +308,10 @@ to the local native seat instead of a round-trip-delayed position. A new short
 drive/brake check showed the seated passenger on both clients. The subsequent
 physical playtest reported **"much smoother, not perfect"**: residual moving
 jitter remains, so this is not a claim of fully solved passenger motion.
+A follow-up build fixes one measured source of that jitter. HUD-draw time varies
+within a frame, so timestamps now use a frame-locked engine clock. On both
+clients, the seated passenger stayed visible through a drive/brake check, and
+the clock remained locked. Physical smoothness has not yet been retested.
 
 Profiling found roughly 9.5-9.9 ms mean / 122-129 ms peak mod Tick time on cachy,
 with sends falling to about 18/s. After caching repeated object discovery,

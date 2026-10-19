@@ -4,6 +4,7 @@
 #include "net.hpp"
 #include "menu.hpp"
 #include "motion.hpp"
+#include "frameclock.hpp"
 #include "appearance.hpp"
 #include "overlay.hpp"
 #include "combat.hpp"
@@ -102,6 +103,7 @@ UObject* g_discoveredPawn = nullptr;
 
 using Snapshot = MotionSnapshot;
 MotionBuffer g_motion;
+FrameClock g_frameClock;
 std::string g_remoteName;
 double g_lastRecv = -100;
 double g_lastStatus = -100;
@@ -1343,9 +1345,9 @@ bool InGameplay(UObject* pawn) {
 double g_lastHudTick = -1;
 
 void Tick(bool hudFrame) {
-    double now = Now();
-    if (!hudFrame && (now - g_lastHudTick < 0.5 || now - g_lastTick < kTickInterval)) return;
-    g_lastTick = now;
+    double wall = Now();
+    if (!hudFrame && (wall - g_lastHudTick < 0.5 || wall - g_lastTick < kTickInterval)) return;
+    g_lastTick = wall;
     if (!g_ready) {
         if (!ResolveEngine()) {
             g_failed = true;
@@ -1353,6 +1355,21 @@ void Tick(bool hudFrame) {
         }
         g_ready = true;
     }
+    // Engine real time advances once per frame, unlike the variable moment the HUD event runs.
+    static bool engineClock = true;
+    float engineTime = 0;
+    bool engineValid = false;
+    if (engineClock && IsLive(g_controller)) {
+        Call realTime(C.statics, "GetRealTimeSeconds");
+        engineValid = realTime.set("WorldContextObject", g_controller).invoke();
+        if (engineValid) {
+            engineTime = realTime.get<float>("ReturnValue");
+        } else {
+            engineClock = false;
+            Log("tick: engine real time unavailable; motion uses the wall clock");
+        }
+    }
+    double now = g_frameClock.Update(wall, engineTime, engineValid);
     if (now - g_lastScan >= 1.0 || !IsLive(g_controller)) {
         g_lastScan = now;
         auto controller = FindLocalController();
@@ -1430,21 +1447,22 @@ void Tick(bool hudFrame) {
     if (!g_menu.IsOpen()) HandleTeleport(g_pawn, now);
     static double profileStart = now, total = 0, peak = 0;
     static uint64_t frames = 0, previousReceived = 0, previousSent = 0;
-    double elapsed = (Now() - now) * 1000;
+    double elapsed = (Now() - wall) * 1000;
     total += elapsed;
     peak = std::max(peak, elapsed);
     ++frames;
     if (now - profileStart >= 5) {
         double seconds = now - profileStart;
         Log("perf: updates=%.1f/s tick mean=%.2fms peak=%.2fms send=%.1f/s recv=%.1f/s riding lookup=%.2fms (%llu calls) "
-            "buffer=%.0fms extrapolated=%llu held=%llu resets=%llu",
+            "buffer=%.0fms extrapolated=%llu held=%llu resets=%llu clock resyncs=%llu wall-fallbacks=%llu",
             frames / seconds, total / frames, peak, (g_seq - previousSent) / seconds,
             (g_receivedStates - previousReceived) / seconds,
             g_ridingLookups ? g_ridingLookupTime * 1000 / g_ridingLookups : 0,
             static_cast<unsigned long long>(g_ridingLookups), g_motion.DelaySeconds() * 1000,
             static_cast<unsigned long long>(g_motion.Stats().extrapolated),
             static_cast<unsigned long long>(g_motion.Stats().held),
-            static_cast<unsigned long long>(g_motion.Stats().resets));
+            static_cast<unsigned long long>(g_motion.Stats().resets), g_frameClock.Resyncs(),
+            g_frameClock.Fallbacks());
         profileStart = now;
         previousSent = g_seq;
         previousReceived = g_receivedStates;

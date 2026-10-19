@@ -301,6 +301,19 @@ Both player and bike extrapolate for at most 150 ms, then hold; velocity is
 bounded to 7000 cm/s. Unchanged positions suppress stale native velocity.
 Teleports over 30 m and sender gaps over two seconds reset the timeline.
 
+The remaining passenger jitter was traced to the clock feeding that timeline.
+Packet send stamps, arrival times and render sampling all used
+`QueryPerformanceCounter` at HUD-draw time. That point moves by several
+milliseconds within a frame, so at motorcycle speed both the sender's samples and
+the receiver's playback position wobbled by centimetres. [`frameclock.hpp`](../src/coop/frameclock.hpp)
+now advances with the per-frame delta of `GameplayStatics.GetRealTimeSeconds`.
+That engine value is fixed at frame start and ignores time dilation. The clock
+slews 5% toward wall time, resyncs if the error exceeds 0.1 s, and falls back to
+wall time for missing engine time, a non-positive or 0.25 s+ delta, or a world
+change. It never runs backward. The `perf:` line reports its resync and fallback
+counts. Unit tests drive 60 Hz frames with 0-8 ms HUD noise: frame steps
+stay within 0.5 ms, whereas raw wall-clock steps vary by more than 5 ms.
+
 Profiling first found repeated global object scans dominating the game-thread
 budget. `FindObject`/`FindClass` now cache weak lookups, validating authoritative
 object-array slot, pointer, serial, flags and identity metadata before reuse.
@@ -566,6 +579,14 @@ the seated body visible on both clients. The final controller layout exposed
 XInput after restarting the game. The physical playtest confirmed Deck menu
 and normal gameplay controls. Moving passenger behavior was described as
 "much smoother, not perfect"; residual jitter remains and is not claimed fixed.
+The later frame-locked clock build (SHA-256
+`c8b257f8d2ce5c8ab93bdd4599f8764476fc289e528ecd069fafdc1521f6e6fb`) was
+deployed to both machines. Its engine clock stayed locked through a
+drive/brake check with the seated passenger visible on both clients. Clock
+resync/fallback counts did not change while riding. The check measured about
+0.7-0.9 ms mean mod Tick on cachy and 1.4-1.9 ms on the Deck, with about
+30 sends/receives per second. Its perceived smoothness still needs a physical
+playtest.
 Long-distance travel, native Windows and long-session stability remain unverified.
 Movement and visual motorcycle replication do not establish shared-world gameplay.
 

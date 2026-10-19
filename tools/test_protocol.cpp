@@ -2,6 +2,7 @@
 #include "../src/coop/combat.hpp"
 #include "../src/coop/ue.hpp"
 #include "../src/coop/motion.hpp"
+#include "../src/coop/frameclock.hpp"
 
 #include <cassert>
 #include <cstdio>
@@ -15,6 +16,62 @@ coop::StatePacket MovingPacket(uint32_t milliseconds, float speed = 1000) {
     packet.timeMs = milliseconds;
     packet.pos[0] = packet.bikePos[0] = milliseconds * 0.001f * speed;
     return packet;
+}
+
+void TestFrameClock() {
+    using namespace coop;
+    // 60 Hz frames whose plugin callback runs 0-8 ms after frame start.
+    FrameClock clock;
+    uint32_t seed = 12345;
+    auto noise = [&seed] {
+        seed = seed * 1664525u + 1013904223u;
+        return (seed >> 8) % 8001 / 1e6;
+    };
+    double previous = 0, worstStep = 0, worstRawStep = 0, previousWall = 0;
+    for (int frame = 0; frame < 600; ++frame) {
+        double start = 100 + frame / 60.0, wall = start + noise();
+        double now = clock.Update(wall, static_cast<float>(frame / 60.0), true);
+        assert(now >= previous);
+        if (frame > 60) {
+            worstStep = std::max(worstStep, std::fabs(now - previous - 1 / 60.0));
+            worstRawStep = std::max(worstRawStep, std::fabs(wall - previousWall - 1 / 60.0));
+            assert(std::fabs(now - wall) < 0.01);
+        }
+        previous = now;
+        previousWall = wall;
+    }
+    assert(worstRawStep > 0.005);
+    assert(worstStep < 0.0005);
+    assert(clock.Resyncs() == 0);
+
+    // A world change resets engine time; the clock falls back to the wall clock without going backwards.
+    double before = clock.Now();
+    double after = clock.Update(before + 0.016, 0.5f, true);
+    assert(after >= before && std::fabs(after - (before + 0.016)) < 1e-9);
+    assert(clock.Fallbacks() == 1);
+    assert(std::fabs(clock.Update(after + 0.016, 0.516f, true) - (after + 0.016)) < 0.002);
+
+    // Missing engine time and long hitches use the wall clock.
+    before = clock.Now();
+    assert(std::fabs(clock.Update(before + 0.02, 0, false) - (before + 0.02)) < 1e-9);
+    assert(std::fabs(clock.Update(before + 0.04, 9, true) - (before + 0.04)) < 1e-9);
+    assert(std::fabs(clock.Update(before + 1.04, 10, true) - (before + 1.04)) < 1e-9);
+
+    // Engine time running slower than the wall clock is resynchronized rather than drifting.
+    FrameClock drifting;
+    double wall = 0;
+    for (int frame = 0; frame < 200; ++frame) {
+        wall += 1 / 30.0;
+        double now = drifting.Update(wall, static_cast<float>(frame / 60.0), true);
+        assert(std::fabs(now - wall) <= 0.1 + 1e-9);
+    }
+    assert(drifting.Resyncs() > 0);
+
+    // The clock never moves backwards, even if the wall clock does.
+    FrameClock monotonic;
+    monotonic.Update(5, 0, false);
+    assert(monotonic.Update(4, 0, false) == 5);
+    assert(monotonic.Update(std::numeric_limits<double>::quiet_NaN(), 0, false) == 5);
 }
 
 void TestMotionBuffer() {
@@ -253,5 +310,6 @@ int main() {
     assert(!coop::NewerSequence(0xffffffffu, 0));
     TestDamageChannel();
     TestMotionBuffer();
-    std::puts("C++ protocol, consent, retransmission, deduplication, and motion/jitter tests passed");
+    TestFrameClock();
+    std::puts("C++ protocol, consent, retransmission, deduplication, motion/jitter and frame-clock tests passed");
 }
