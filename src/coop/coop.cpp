@@ -380,8 +380,8 @@ void Discover(UObject* pawn) {
             }
         }
     }
-    const char* terms[] = {"time", "weather", "climate", "daynight", "freaker", "enemy",
-                           "infected", "aicontroller", "spawner"};
+    const char* terms[] = {"time", "weather", "climate", "daynight", "worldmanager", "freaker",
+                           "freakercontroller", "aipawn", "enemy", "infected", "aicontroller", "spawner"};
     auto matches = [&](std::string text) {
         std::transform(text.begin(), text.end(), text.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
