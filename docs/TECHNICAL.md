@@ -167,7 +167,7 @@ Source layout:
 | [`src/coop/dllmain.cpp`](../src/coop/dllmain.cpp) | `DllMain` / exported `InitializeASI`; finds the plugin's `.ini`, `.log` and `-anims.txt` paths |
 | [`src/coop/coop.cpp`](../src/coop/coop.cpp) | Build check, hook, tick loop, player tracking, avatar, teleport, config |
 | [`src/coop/ue.hpp`](../src/coop/ue.hpp) / [`ue.cpp`](../src/coop/ue.cpp) | Minimal UE 4.10 reflection layer |
-| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 134-byte v3 wire format and validation |
+| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 144-byte v4 wire format and validation |
 | [`src/coop/combat.hpp`](../src/coop/combat.hpp) | Consent-scoped reliable damage queue |
 | [`src/coop/appearance.cpp`](../src/coop/appearance.cpp) | Private garment materials and texture tinting |
 | [`src/coop/menu.cpp`](../src/coop/menu.cpp) / [`overlay.cpp`](../src/coop/overlay.cpp) | Settings input and Direct3D 11 overlay |
@@ -349,7 +349,7 @@ built from engine primitives:
 4. Each frame the avatar is moved with `K2_SetActorLocationAndRotation`.
    `PlayAnimation` picks a looping clip by horizontal speed: < 30 cm/s idle,
    < 250 walk, < 520 run, otherwise sprint.
-   The v3 packet additionally carries native aiming/crouch/reload state, a
+   The packet carries native aiming/crouch/reload state, a
    coarse weapon category and a monotonic shot sequence. At idle, aiming and
    crouching select locally loaded Deacon rifle/crouch sequences; a new
    gun/crossbow shot plays a short firing animation before returning to the
@@ -361,14 +361,14 @@ The partner therefore looks like *your* Deacon in *your* current outfit.
 
 ### 3.7 Network protocol
 
-[`protocol.hpp`](../src/coop/protocol.hpp) defines one fixed 134-byte,
+[`protocol.hpp`](../src/coop/protocol.hpp) defines one fixed 144-byte,
 little-endian UDP packet:
 
 | Field | Type | Notes |
 |---|---|---|
 | magic | u32 | `"DGCO"` (`0x4F434744`) |
-| version | u16 | 3; both clients must upgrade together |
-| flags | u16 | HasPawn, InVehicle, HasBike, Passenger, FriendlyFire, AcceptPassengers, Alive, SyncBikes |
+| version | u16 | 4; both clients must upgrade together |
+| flags | u16 | HasPawn, InVehicle, HasBike, Passenger, FriendlyFire, AcceptPassengers, Alive, SyncBikes, WorldState |
 | seq | u32 | wraps; compared with serial-number arithmetic |
 | timeMs | u32 | sender clock |
 | pos[3], yaw, pitch, vel[3] | f32 | must be finite and within ±1e8 |
@@ -383,6 +383,17 @@ little-endian UDP packet:
 | actions | u8 | aiming, crouched and reloading state bits |
 | weaponType | u8 | none, gun, crossbow or melee |
 | shotSequence | u32 | increments on local fire events for a remote firing pose |
+| worldTimeOfDay, worldRelativeTime | f32 | host world clock values, valid with WorldState |
+| worldWeather, worldTransitionRate | u8 each | host weather enum and transition mode, valid with WorldState |
+
+Only the configured host sends WorldState. The joining client applies it every
+0.5 seconds when neither world is in a mission or cinematic. It captures the
+client's original time/weather and restores them after timeout or when the host
+stops sending WorldState. These calls change the current game session only;
+they do not write save data. In a two-game test the Deck time was corrected
+from 10.651 to the host's 10.232, and a later host timeout logged restoration
+from 10.724 to the captured local 10.241. Both clients reported weather value 0,
+so no actual weather transition was tested.
 
 Peering is symmetric. In **host** mode (`PeerHost` empty) the plugin learns
 the partner from the first valid packet. In **join** mode it sends to the
@@ -573,7 +584,7 @@ with about 0.1 cm stationary visual-root variation. Short rolling/braking,
 manual exit/reboarding, driver dismount and disconnect cleanup were checked.
 The latter restored the native body, movement, collision and saving.
 
-The current suite passes 35 Python tests plus native C++ tests for the v3 wire
+The current suite passes 35 Python tests plus native C++ tests for the v4 wire
 format, serial ordering, mutual consent, scope invalidation, retransmission and
 deduplication, plus bone-to-socket alignment across yaw and translation changes.
 Motion tests cover timestamp wrap, teleport/gap recovery, role transitions,
@@ -604,18 +615,20 @@ Movement and visual motorcycle replication do not establish shared-world gamepla
 The Snyk code-scan tool was unavailable in this environment; no Snyk scan was
 performed. Unit tests and live gameplay checks are not a security assessment.
 The v3 presentation-state extension passes packet, validation and motion-buffer
-tests and cross-compiles. It is running on cachy; the Deck still has an earlier
-v3 build, so the wire format is compatible. Crouch replication was confirmed,
-but live aim/fire behavior remains unverified. Cachy's current discovery build
-is `eb280fb32d8829802fe1f7c56c6f78f6535b6a95ba843874401066313200a76b`.
+tests. Crouch replication was confirmed, but live aim/fire behavior remains
+unverified. The v4 session time/weather synchronization passes protocol tests,
+is deployed to both clients, and has been checked for host-time application and
+disconnect restoration. A weather transition and mission/cinematic behavior
+still need validation. The identical deployed ASI SHA-256 is
+`8916da86c3a955ba5e7876cdec5c93a6df85cee8c7a38f0b468b5faa00da7349`.
 
 Further runtime reflection identified the open-world `BP_BendWorldManagerV3_C`
 instance and its native `BendWorldManager` base. The base exposes `WorldTime`,
 `WorldWeather`, mission/cinematic state, `SetWorldTimeOfDay(float, bool)` and
-`SelectWorldWeather(byte, byte, float)`. This gives a concrete route for
-session-only time/weather sync, but it is not implemented yet: enum meanings,
-transition behavior and mission/cinematic interactions still need validation
-before applying host state. The same scan found `BendFreakerPawn`,
+`SelectWorldWeather(byte, byte, float)`. The host sends these values in v4;
+the joining client applies them only outside mission/cinematic state and
+restores its prior session values after disconnect. The in-game transition and
+restore behavior still need validation. The same scan found `BendFreakerPawn`,
 `BendAIPawn` and `BendFreakerController` classes, including health/death and
 awareness surfaces. No active freaker pawn was present in the captured runtime
 area, so host-authoritative enemy replication is still unimplemented and its
@@ -630,7 +643,7 @@ also need:
 - syncing enemies (freakers, NPCs) with one authoritative host;
 - complete combat/projectile/animation replication and native damage parity;
 - authoritative motorcycle physics, upgrades, fuel and damage;
-- syncing world state, missions and saves;
+- syncing missions and saves, plus world state beyond session time/weather;
 - matching animations to the partner's actual state instead of speed tiers.
 
 The shipped single-player gameplay does not provide a usable campaign co-op

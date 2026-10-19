@@ -11,7 +11,7 @@ import fake_peer
 
 class ProtocolTest(unittest.TestCase):
     def test_wire_size_matches_plugin(self):
-        self.assertEqual(fake_peer.SIZE, 134)
+        self.assertEqual(fake_peer.SIZE, 144)
 
     def test_round_trip(self):
         data = fake_peer.encode(7, 1234, (1.0, -2.0, 3.5), 90.0, -5.0, (10.0, 0.0, -1.0), 'Boozer')
@@ -46,13 +46,15 @@ class ProtocolTest(unittest.TestCase):
         data = fake_peer.encode(0x100000000, 0, (0, 0, 0), 0, 0, (0, 0, 0), 'x')
         self.assertEqual(fake_peer.decode(data)['seq'], 0)
 
-    def test_v3_extension_round_trip(self):
+    def test_v4_extension_round_trip(self):
         data = fake_peer.encode(1, 2, (1, 2, 3), 0, 0, (0, 0, 0), 'x', flags=255,
                                 session=11, target_session=22, consent=3, target_consent=4,
                                 attack_id=5, attack_ack=6, damage=25, attack_kind=2,
                                 bike_pos=(100, -200, 300), bike_rotation=(10, 20, -30),
                                 jacket=6, trousers=5, cap_color=4, cap=0, health=75,
-                                actions=7, weapon_type=2, shot_sequence=99)
+                                actions=7, weapon_type=2, shot_sequence=99,
+                                world_time_of_day=21.5, world_relative_time=0.75,
+                                world_weather=3, world_transition_rate=2)
         state = fake_peer.decode(data)
         self.assertEqual(state['bike_pos'], (100, -200, 300))
         self.assertEqual(state['bike_rotation'], (10, 20, -30))
@@ -64,18 +66,32 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(state['actions'], 7)
         self.assertEqual(state['weapon_type'], 2)
         self.assertEqual(state['shot_sequence'], 99)
+        self.assertEqual(state['world_time_of_day'], 21.5)
+        self.assertEqual(state['world_relative_time'], 0.75)
+        self.assertEqual((state['world_weather'], state['world_transition_rate']), (3, 2))
+        data = fake_peer.encode(2, 3, (1, 2, 3), 0, 0, (0, 0, 0), 'x',
+                                flags=fake_peer.HAS_PAWN | fake_peer.WORLD_STATE,
+                                world_time_of_day=6.25, world_weather=4)
+        state = fake_peer.decode(data)
+        self.assertEqual(state['flags'] & fake_peer.WORLD_STATE, fake_peer.WORLD_STATE)
+        self.assertEqual(state['world_time_of_day'], 6.25)
+        self.assertEqual(state['world_weather'], 4)
 
-    def test_v3_rejects_invalid_extensions(self):
+    def test_v4_rejects_invalid_extensions(self):
         cases = ({'jacket': 7}, {'trousers': 7}, {'cap_color': 7}, {'cap': 2},
                  {'damage': -1}, {'damage': 1001}, {'damage': 1}, {'attack_id': 1},
                  {'attack_kind': 3}, {'attack_kind': 2}, {'health': -1}, {'health': 100001},
                  {'bike_pos': (float('nan'), 0, 0)}, {'bike_rotation': (0, 0, float('inf'))},
-                 {'flags': 8}, {'flags': 9}, {'flags': 2}, {'actions': 8}, {'weapon_type': 4})
+                 {'flags': 8}, {'flags': 9}, {'flags': 2}, {'actions': 8}, {'weapon_type': 4},
+                 {'world_time_of_day': float('nan')}, {'world_relative_time': float('inf')},
+                 {'flags': fake_peer.HAS_PAWN | fake_peer.WORLD_STATE, 'world_time_of_day': 24.1},
+                 {'flags': fake_peer.HAS_PAWN | fake_peer.WORLD_STATE, 'world_relative_time': -0.1},
+                 {'flags': fake_peer.HAS_PAWN | fake_peer.WORLD_STATE, 'world_relative_time': 1.1})
         for extension in cases:
             with self.subTest(extension=extension):
                 self.assertIsNone(fake_peer.decode(fake_peer.encode(1, 0, (0, 0, 0), 0, 0, (0, 0, 0), 'x', **extension)))
 
-    def test_v3_attack_requires_every_consent_field(self):
+    def test_v4_attack_requires_every_consent_field(self):
         attack = dict(flags=17, session=11, target_session=22, consent=3, target_consent=4,
                       attack_id=5, attack_kind=2, damage=25)
         for missing in ('session', 'target_session', 'consent', 'target_consent', 'attack_id', 'flags', 'damage'):

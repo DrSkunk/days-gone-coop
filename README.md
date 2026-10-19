@@ -14,8 +14,12 @@ runs its own single-player simulation. Use disposable saves for testing.
   Timestamps follow the engine's frame-start clock, not the HUD draw time.
 - Plays idle/walk/run/sprint animations according to received speed.
 - Replicates aiming/crouching state and brief gun/crossbow firing animations for
-  the partner avatar. This presentation update is not yet live-game validated;
-  it does not yet render the partner's weapon model or muzzle flash.
+  the partner avatar. Crouching was confirmed in-game; aim/fire still needs
+  validation. It does not render the partner's weapon model or muzzle flash.
+- Applies the host's time and weather to the joining player's current session,
+  then restores that player's original local values on disconnect. Host-time
+  application and timeout restoration were logged in a two-game test; a weather
+  transition still needs testing.
 - Hides the avatar after five seconds without state updates.
 - Replicates motorcycle position/orientation and rider animations, with a visual
   clone of the observing player's motorcycle.
@@ -28,7 +32,8 @@ runs its own single-player simulation. Use disposable saves for testing.
   This is experimental: there is no terrain, streaming or safe-landing check.
 
 The avatar is a visual ghost, not a second AI/combat pawn. Enemies, inventory,
-loot, missions, doors, time, weather and saves are **not synchronized**. The
+loot, missions, doors and saves are **not synchronized**. Time/weather sync is
+experimental and session-only; each game otherwise runs its own world. The
 partner's held weapon, projectiles, muzzle flashes, reloads and damage effects
 are not replicated. Motorcycle upgrades, fuel, damage and physics are not
 replicated. The avatar uses locally available Deacon assets and only the
@@ -91,7 +96,7 @@ The two-player test also confirmed death and normal reload after lethal damage.
 This does not establish full vanilla damage parity.
 
 Both clients must run the same protocol version. The current source uses
-**v3 (134 bytes)**; v1/v2 clients are incompatible.
+**v4 (144 bytes)**; v1-v3 clients are incompatible.
 When upgrading an existing installation, replace the ASI but preserve each
 machine's configured INI. Keep the supplied Dear ImGui license with distributions.
 

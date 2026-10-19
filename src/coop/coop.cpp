@@ -90,8 +90,25 @@ struct Passenger {
 
 struct Classes {
     UObject *playerController, *character, *skelMeshActor, *skelMeshComponent, *animSequence;
-    UObject* statics; // GameplayStatics default object
+    UObject *statics, *worldManager; // GameplayStatics default object and BendWorldManager class
 } C{};
+
+struct WorldSnapshot {
+    bool valid = false;
+    float timeOfDay = 0;
+    float relativeTime = 0;
+    uint8_t weather = 0;
+    uint8_t transitionRate = 0;
+};
+struct WorldRestore {
+    UObject* manager = nullptr;
+    WorldSnapshot state{};
+};
+WorldSnapshot g_worldState;
+WorldRestore g_worldRestore;
+UObject* g_worldManager = nullptr;
+UObject* g_worldPawn = nullptr;
+double g_worldScanAt = -10, g_worldUpdateAt = -10;
 
 struct OwnedMeshCache {
     UObject* owner = nullptr;
@@ -230,10 +247,11 @@ bool ResolveEngine() {
     C.skelMeshComponent = FindClass("SkeletalMeshComponent");
     C.animSequence = FindClass("AnimSequence");
     C.statics = FindDefaultObject("GameplayStatics");
+    C.worldManager = FindClass("BendWorldManager");
     Log("classes: PlayerController=%p Character=%p SkeletalMeshActor=%p SkeletalMeshComponent=%p "
-        "AnimSequence=%p GameplayStatics CDO=%p",
+        "AnimSequence=%p GameplayStatics CDO=%p BendWorldManager=%p",
         (void*)C.playerController, (void*)C.character, (void*)C.skelMeshActor, (void*)C.skelMeshComponent,
-        (void*)C.animSequence, (void*)C.statics);
+        (void*)C.animSequence, (void*)C.statics, (void*)C.worldManager);
     if (!C.playerController || !C.character || !C.skelMeshActor || !C.skelMeshComponent || !C.statics) {
         Log("FATAL: required engine classes are missing");
         return false;
@@ -251,6 +269,160 @@ bool ResolveEngine() {
     }
     Log("network: %s", net.c_str());
     return true;
+}
+
+UObject* FindWorldManager() {
+    if (!C.worldManager) C.worldManager = FindClass("BendWorldManager");
+    if (!C.worldManager) return nullptr;
+    for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+        auto object = ObjectAt(i);
+        if (IsLive(object) && !IsDefaultOrArchetype(object) && IsA(object, C.worldManager)) return object;
+    }
+    return nullptr;
+}
+
+bool ReadWorldSnapshot(UObject* manager, WorldSnapshot& state) {
+    if (!IsLive(manager)) return false;
+    Call mission(manager, "GetIsMissionActive"), cinematic(manager, "GetIsCinematicActive");
+    bool missionAvailable = mission.invoke();
+    bool cinematicAvailable = cinematic.invoke();
+    bool missionActive = missionAvailable && mission.get<bool>("ReturnValue");
+    bool cinematicActive = cinematicAvailable && cinematic.get<bool>("ReturnValue");
+    static ULONGLONG lastDiagnostic = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!missionAvailable || !cinematicAvailable || missionActive || cinematicActive) {
+        if (now - lastDiagnostic >= 10000) {
+            Log("world sync: snapshot paused mission-api=%d cinematic-api=%d mission=%d cinematic=%d",
+                missionAvailable, cinematicAvailable, missionActive, cinematicActive);
+            lastDiagnostic = now;
+        }
+        return false;
+    }
+    Call time(manager, "GetWorldTimeOfDay"), relative(manager, "GetWorldTimeFractional");
+    Call weather(manager, "GetWorldWeather");
+    uint8_t transitionRate = 0;
+    bool timeAvailable = time.invoke();
+    bool relativeAvailable = relative.invoke();
+    bool weatherAvailable = weather.invoke();
+    bool transitionAvailable = GetProp(manager, "WeatherTransitionType", transitionRate);
+    if (!timeAvailable || !relativeAvailable || !weatherAvailable || !transitionAvailable) {
+        if (now - lastDiagnostic >= 10000) {
+            Log("world sync: getters time=%d relative=%d weather=%d transition=%d",
+                timeAvailable, relativeAvailable, weatherAvailable, transitionAvailable);
+            lastDiagnostic = now;
+        }
+        return false;
+    }
+    state.timeOfDay = time.get<float>("ReturnValue");
+    state.relativeTime = relative.get<float>("ReturnValue");
+    state.weather = weather.get<uint8_t>("ReturnValue");
+    state.transitionRate = transitionRate;
+    state.valid = std::isfinite(state.timeOfDay) && std::fabs(state.timeOfDay) < 1e6f &&
+                  std::isfinite(state.relativeTime) && std::fabs(state.relativeTime) < 1e6f;
+    return state.valid;
+}
+
+bool WorldSyncAllowed(UObject* manager) {
+    if (!IsLive(manager)) return false;
+    Call mission(manager, "GetIsMissionActive"), cinematic(manager, "GetIsCinematicActive");
+    return mission.invoke() && cinematic.invoke() &&
+           !mission.get<bool>("ReturnValue") && !cinematic.get<bool>("ReturnValue");
+}
+
+void ApplyWorldSnapshot(UObject* manager, const WorldSnapshot& state) {
+    if (!state.valid || !WorldSyncAllowed(manager)) return;
+    WorldSnapshot current{};
+    if (!ReadWorldSnapshot(manager, current)) return;
+    if (std::fabs(current.timeOfDay - state.timeOfDay) > 0.1f) {
+        if (Call(manager, "SetWorldTimeOfDay").set("TimeOfDay", state.timeOfDay)
+                .setBool("CanAdvanceDay", false).invoke())
+            Log("world sync: time %.3f -> %.3f", current.timeOfDay, state.timeOfDay);
+    }
+    bool transitioning = true;
+    if (current.weather != state.weather && GetProp(manager, "IsWeatherTransitioning", transitioning) &&
+        !transitioning) {
+        if (Call(manager, "SelectWorldWeather")
+                .set("NewWeather", state.weather)
+                .set("NewWeatherTransitionRate", state.transitionRate)
+                .set("RelativeTime", state.relativeTime).invoke())
+            Log("world sync: weather %u -> %u", current.weather, state.weather);
+    }
+}
+
+void RestoreWorldSnapshot() {
+    auto manager = g_worldRestore.manager;
+    auto state = g_worldRestore.state;
+    if (!state.valid || !IsLive(manager) || !WorldSyncAllowed(manager)) return;
+    WorldSnapshot current{};
+    if (!ReadWorldSnapshot(manager, current)) return;
+    if (std::fabs(current.timeOfDay - state.timeOfDay) > 0.1f &&
+        !Call(manager, "SetWorldTimeOfDay").set("TimeOfDay", state.timeOfDay)
+            .setBool("CanAdvanceDay", false).invoke()) return;
+    bool transitioning = true;
+    if (current.weather != state.weather) {
+        if (!GetProp(manager, "IsWeatherTransitioning", transitioning) || transitioning) return;
+        if (!Call(manager, "SelectWorldWeather")
+                .set("NewWeather", state.weather)
+                .set("NewWeatherTransitionRate", state.transitionRate)
+                .set("RelativeTime", state.relativeTime).invoke()) return;
+    }
+    Log("world sync: restored local session time %.3f -> %.3f weather %u -> %u",
+        current.timeOfDay, state.timeOfDay, current.weather, state.weather);
+    g_worldRestore = {};
+}
+
+void UpdateWorldSync(UObject* pawn, double now) {
+    if (pawn != g_worldPawn) {
+        if (!g_cfg.peerHost.empty() && g_worldRestore.state.valid &&
+            g_worldRestore.manager == g_worldManager)
+            RestoreWorldSnapshot();
+        g_worldPawn = pawn;
+        g_worldManager = nullptr;
+        g_worldRestore = {};
+        g_worldState = {};
+        g_worldScanAt = -10;
+        g_worldUpdateAt = -10;
+    }
+    if (!pawn) {
+        g_worldState = {};
+        return;
+    }
+    if (!IsLive(g_worldManager) && now >= g_worldScanAt) {
+        g_worldScanAt = now + 2.0;
+        g_worldManager = FindWorldManager();
+        if (IsLive(g_worldManager)) Log("world sync: manager %s", FullName(g_worldManager).c_str());
+    }
+    if (!IsLive(g_worldManager)) {
+        g_worldState = {};
+        return;
+    }
+    if (now < g_worldUpdateAt) return;
+    g_worldUpdateAt = now + 0.5;
+    if (g_cfg.peerHost.empty()) {
+        WorldSnapshot state{};
+        bool valid = ReadWorldSnapshot(g_worldManager, state);
+        if (valid && (!g_worldState.valid || std::fabs(g_worldState.timeOfDay - state.timeOfDay) > 0.1f ||
+                      g_worldState.weather != state.weather))
+            Log("world sync: host time=%.3f relative=%.3f weather=%u transition=%u",
+                state.timeOfDay, state.relativeTime, state.weather, state.transitionRate);
+        g_worldState = valid ? state : WorldSnapshot{};
+        return;
+    }
+    bool peerConnected = now - g_lastRecv <= kPeerTimeout;
+    if (!WorldSyncAllowed(g_worldManager)) return;
+    if (!peerConnected || !(g_peer.flags & kWorldState)) {
+        RestoreWorldSnapshot();
+        return;
+    }
+    if (!g_worldRestore.state.valid || g_worldRestore.manager != g_worldManager) {
+        WorldSnapshot original{};
+        if (!ReadWorldSnapshot(g_worldManager, original)) return;
+        g_worldRestore = {g_worldManager, original};
+        Log("world sync: captured local session time/weather");
+    }
+    WorldSnapshot remote{true, g_peer.worldTimeOfDay, g_peer.worldRelativeTime,
+                         g_peer.worldWeather, g_peer.worldTransitionRate};
+    ApplyWorldSnapshot(g_worldManager, remote);
 }
 
 // Stale controllers from an unloaded world can linger until GC, so prefer the newest one whose pawn
@@ -436,6 +608,13 @@ void SendLocalState(UObject* pawn, double now) {
     p.trousers = static_cast<uint8_t>(g_settings.trousers);
     p.capColor = static_cast<uint8_t>(g_settings.capColor);
     p.cap = g_settings.cap;
+    if (g_cfg.peerHost.empty() && g_worldState.valid) {
+        p.flags |= kWorldState;
+        p.worldTimeOfDay = g_worldState.timeOfDay;
+        p.worldRelativeTime = g_worldState.relativeTime;
+        p.worldWeather = g_worldState.weather;
+        p.worldTransitionRate = g_worldState.transitionRate;
+    }
     if (g_settings.friendlyFire) p.flags |= kFriendlyFire;
     if (g_settings.motorcycles) p.flags |= kSyncBikes;
     if (g_settings.passengers) p.flags |= kAcceptPassengers;
@@ -1496,6 +1675,7 @@ void Tick(bool hudFrame) {
     wasAlive = alive;
     wasConnected = connected;
     ReceiveRemote(now);
+    UpdateWorldSync(g_pawn, now);
     UpdateDamageScope(now);
     if (g_pawn && now - g_lastScan < kTickInterval && now >= g_localSettledAt) FindLocalBike(g_pawn);
     UpdateBike(g_pawn, now);

@@ -7,7 +7,7 @@
 namespace coop {
 
 constexpr uint32_t kMagic = 0x4F434744; // "DGCO"
-constexpr uint16_t kProtocolVersion = 3;
+constexpr uint16_t kProtocolVersion = 4;
 
 enum StateFlags : uint16_t {
     kHasPawn = 1 << 0,
@@ -18,6 +18,7 @@ enum StateFlags : uint16_t {
     kAcceptPassengers = 1 << 5,
     kAlive = 1 << 6,
     kSyncBikes = 1 << 7,
+    kWorldState = 1 << 8,
 };
 
 enum ActionFlags : uint8_t {
@@ -61,24 +62,32 @@ struct StatePacket {
     uint8_t actions;
     uint8_t weaponType;
     uint32_t shotSequence;
+    float worldTimeOfDay;
+    float worldRelativeTime;
+    uint8_t worldWeather;
+    uint8_t worldTransitionRate;
 };
 #pragma pack(pop)
-static_assert(sizeof(StatePacket) == 134, "wire format");
+static_assert(sizeof(StatePacket) == 144, "wire format");
 
 inline bool DecodeState(const char* data, int len, StatePacket& out) {
     if (len != static_cast<int>(sizeof(StatePacket))) return false;
     std::memcpy(&out, data, sizeof out);
     if (out.magic != kMagic || out.version != kProtocolVersion ||
         (out.flags & ~(kHasPawn | kInVehicle | kHasBike | kPassenger | kFriendlyFire |
-                       kAcceptPassengers | kAlive | kSyncBikes))) return false;
+                       kAcceptPassengers | kAlive | kSyncBikes | kWorldState))) return false;
     const float values[] = {out.pos[0], out.pos[1], out.pos[2], out.yaw, out.pitch,
                             out.vel[0], out.vel[1], out.vel[2], out.bikePos[0], out.bikePos[1], out.bikePos[2],
-                            out.bikeRotation[0], out.bikeRotation[1], out.bikeRotation[2], out.damage, out.health};
+                            out.bikeRotation[0], out.bikeRotation[1], out.bikeRotation[2], out.damage, out.health,
+                            out.worldTimeOfDay, out.worldRelativeTime};
     for (float f : values)
         if (!std::isfinite(f) || std::fabs(f) > 1e8f) return false;
     if (out.jacket > 6 || out.trousers > 6 || out.capColor > 6 || out.cap > 1 ||
         out.damage < 0 || out.damage > 1000 || out.health < 0 || out.health > 100000 || out.attackKind > 2 ||
         (out.actions & ~(kAiming | kCrouched | kReloading)) || out.weaponType > kWeaponMelee) return false;
+    if ((out.flags & kWorldState) &&
+        (out.worldTimeOfDay < 0 || out.worldTimeOfDay > 24 ||
+         out.worldRelativeTime < 0 || out.worldRelativeTime > 1)) return false;
     if ((out.flags & kPassenger) && (!(out.flags & kInVehicle) || !(out.flags & kHasPawn))) return false;
     if ((out.flags & kInVehicle) && !(out.flags & kHasPawn)) return false;
     if (out.attackKind == 0) {
