@@ -12,14 +12,20 @@ runs its own single-player simulation. Use disposable saves for testing.
 - Smooths movement on a sender-time timeline, with adaptive 80-250 ms buffering,
   monotone cubic interpolation and up to 150 ms of bounded extrapolation.
   Timestamps follow the engine's frame-start clock, not the HUD draw time.
-- Plays idle/walk/run/sprint animations according to received speed.
-- Replicates aiming/crouching state and brief gun/crossbow firing animations for
-  the partner avatar. Crouching was confirmed in-game; aim/fire still needs
-  validation. It does not render the partner's weapon model or muzzle flash.
+- Mirrors the partner's real skeleton: every bone of the body is streamed at the
+  pose rate and written into a poseable copy, so strafing, aiming, crouching,
+  climbing and riding look like the partner's own animation rather than a
+  speed-picked clip. The older idle/walk/run/sprint clips remain as a fallback
+  when no pose stream arrives.
+- Shows the item in the partner's hands (knife, crossbow, rifle and so on) at the
+  same hand socket and offset. Muzzle flashes and projectiles are not replicated.
+- Rebuilds the partner's motorcycle from its chassis and modular parts and streams
+  the chassis skeleton, so steering, suspension and wheels follow the partner.
+- Replicates the host's nearby enemies (up to 16 within 80 m) as visual,
+  non-colliding copies posed from the host's skeletons. They are not AI on the
+  joining machine and cannot be damaged there.
 - Applies the host's time and weather to the joining player's current session,
-  then restores that player's original local values on disconnect. Host-time
-  application and timeout restoration were logged in a two-game test; a weather
-  transition still needs testing.
+  then restores that player's original local values on disconnect.
 - Hides the avatar after five seconds without state updates.
 - Replicates motorcycle position/orientation and rider animations, with a visual
   clone of the observing player's motorcycle.
@@ -31,11 +37,10 @@ runs its own single-player simulation. Use disposable saves for testing.
 - **F7** teleports your player near the partner while the game window is focused.
   This is experimental: there is no terrain, streaming or safe-landing check.
 
-The avatar is a visual ghost, not a second AI/combat pawn. Enemies, inventory,
-loot, missions, doors and saves are **not synchronized**. Time/weather sync is
-experimental and session-only; each game otherwise runs its own world. The
-partner's held weapon, projectiles, muzzle flashes, reloads and damage effects
-are not replicated. Motorcycle upgrades, fuel, damage and physics are not
+The avatar is a visual ghost, not a second AI/combat pawn. Enemy copies are
+visual only; inventory, loot, missions, doors and saves are **not synchronized**.
+Time/weather sync is experimental and session-only; each game otherwise runs its
+own world. Projectiles, muzzle flashes and damage effects are not replicated. Motorcycle upgrades, fuel, damage and physics are not
 replicated. The avatar uses locally available Deacon assets and only the
 selected color presets and cap visibility describe the partner's appearance.
 
@@ -96,7 +101,10 @@ The two-player test also confirmed death and normal reload after lethal damage.
 This does not establish full vanilla damage parity.
 
 Both clients must run the same protocol version. The current source uses
-**v4 (144 bytes)**; v1-v3 clients are incompatible.
+**v5** (144-byte state packet plus separate pose, enemy and held-item datagrams);
+v1-v4 clients are incompatible. Pose streaming uses roughly 300 kB/s in each
+direction, plus about 140 kB/s per eight replicated enemies. That is fine on a
+LAN but is not designed for the Internet.
 When upgrading an existing installation, replace the ASI but preserve each
 machine's configured INI. Keep the supplied Dear ImGui license with distributions.
 
@@ -231,8 +239,9 @@ historical and is not built by the current build script.
 
 ### Opt-in native test tools
 
-These are local developer controls, **not synchronized enemies or a campaign
-trainer**. Back up your saves and use a disposable save. Set `DebugTools=1` in
+These are local developer controls, **not a campaign trainer**. Swarmers
+spawned on the host are replicated to the joining player as visual copies, like
+any other host enemy, which makes them a quick way to test enemy replication. Back up your saves and use a disposable save. Set `DebugTools=1` in
 the installed INI and restart; this alone does not enable invulnerability.
 Normal packages default to `DebugTools=0`.
 
@@ -258,6 +267,8 @@ poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/
 | `status` | Logs player/enemy health, controllers, brain components and movement |
 | `probe-player` | Applies 5 native base damage; checks unchanged health with protection, reduced health without it |
 | `probe-enemy` | Applies 5 native base damage to one living, owned enemy |
+| `time-shift` | Host only: advances the time of day by 6 hours (four shifts return to the start) |
+| `weather-next` | Host only: selects the next weather state (0-3) so the client can be checked |
 | `cleanup` | Destroys only owned test pawns/controllers, waiting for engine destruction |
 | `end` | Cleans up and restores captured native damage/saving state |
 
@@ -392,7 +403,7 @@ with roughly 30 sends/receives per second on both. Animation lookups dropped fro
 1.9 ms per call to below the log's 0.01 ms resolution. These are measurements of
 mod work, **not whole-game FPS benchmarks**.
 
-`make test` passes 42 Python tests plus native C++ protocol/consent/retransmission,
+`make test` passes 44 Python tests plus native C++ protocol/consent/retransmission,
 motion/frame-clock, and debug allowlist/request/bitfield tests; `make build`
 cross-compiles the Windows plugin with warnings as errors.
 Real knife hits reduced the other game's native health (121.9 to 106.9 for one
@@ -405,6 +416,26 @@ opening/navigation and normal gameplay controls were confirmed after switching
 layouts. Residual moving jitter, long-distance travel, native Windows and
 long-session stability still need work or further validation. Full
 shared-world co-op still requires game-specific replication and authority work.
+
+The pose, held-item, enemy and world-sync work was checked live between cachy
+and the Deck on 2026-10-19:
+
+- The partner's streamed skeleton visibly strafed, walked and held a crossbow/rifle
+  aim pose on the other machine.
+- The held weapon rendered in the avatar's hands, tracking `r_hand_socket` to
+  within 1 cm in the log. An earlier "invisible weapon" report turned out to be
+  the bike handlebars hiding the hands.
+- Host enemies spawned with `spawn-pack` appeared, were posed and expired on the
+  Deck.
+- `time-shift` moved the Deck's clock from 10.789 to 16.827 within a second.
+  `weather-next` moved the Deck's weather 0 -> 1 -> 2 within 0.5 s. This
+  uncovered that the native `GetWorldWeather()` always returns 0, so earlier
+  builds never sent a real weather value; the mod now reads the `WorldWeather`
+  property instead. Weather states 1 and 2 showed no obvious visual change in
+  that location on either machine.
+- The rebuilt bike rendered complete on the observer. Socket-mounted bike parts
+  now follow their socket every frame (the same fix as the held item), but this
+  has not been visually re-checked while riding.
 
 Do not commit credentials, the `sshpw` file, game executables, assets, saves or
 runtime logs.

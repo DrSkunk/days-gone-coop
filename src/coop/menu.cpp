@@ -14,7 +14,7 @@ using namespace ue;
 
 namespace coop {
 namespace {
-constexpr int kRows = 10;
+constexpr int kRows = 11;
 using Color = OverlayColor;
 OverlayFrame pendingFrame;
 
@@ -196,9 +196,12 @@ MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings
         } else {
             confirmDamage_ = true;
         }
-    } else if (selected_ == 7 && accept) result.passenger = true;
-    else if (selected_ == 8 && accept) result.teleport = true;
-    else if (selected_ == 9 && accept) SetOpen(false, controller);
+    } else if (selected_ == 7) {
+        settings.enemies = !settings.enemies;
+        result.changed = true;
+    } else if (selected_ == 8 && accept) result.passenger = true;
+    else if (selected_ == 9 && accept) result.teleport = true;
+    else if (selected_ == 10 && accept) SetOpen(false, controller);
     return result;
 }
 
@@ -209,7 +212,7 @@ void SettingsMenu::Draw(int width, int height, const MenuSettings& settings,
     renderWidth_ = width;
     renderHeight_ = height;
     float scale = std::min(width / 1280.f, height / 800.f);
-    float w = 700 * scale, h = 650 * scale, x = (width - w) * 0.5f, y = (height - h) * 0.5f;
+    float w = 700 * scale, h = 690 * scale, x = (width - w) * 0.5f, y = (height - h) * 0.5f;
     Color white{0.92f, 0.95f, 1.f, 1.f}, muted{0.55f, 0.64f, 0.72f, 1.f};
     Rect({0.01f, 0.02f, 0.03f, 0.75f}, 0, 0, static_cast<float>(width), static_cast<float>(height));
     Rect({0.025f, 0.045f, 0.065f, 0.98f}, x, y, w, h);
@@ -217,10 +220,10 @@ void SettingsMenu::Draw(int width, int height, const MenuSettings& settings,
     Text("DAYS GONE / CO-OP", white, x + 28 * scale, y + 22 * scale, 1.8f * scale);
     Text(status, muted, x + 28 * scale, y + 65 * scale, 0.9f * scale);
     std::array<std::string, kRows> labels = {"Jacket color", "Trousers color", "Cap color", "Cap",
-        "Sync motorcycles", "Allow a passenger", "Friendly fire", "Join / leave partner's bike", "Teleport to partner", "Close"};
+        "Sync motorcycles", "Allow a passenger", "Friendly fire", "Sync host's enemies", "Join / leave partner's bike", "Teleport to partner", "Close"};
     std::array<std::string, kRows> values = {PaletteName(settings.jacket), PaletteName(settings.trousers),
         PaletteName(settings.capColor), settings.cap ? "On" : "Off", settings.motorcycles ? "On" : "Off",
-        settings.passengers ? "On" : "Off", settings.friendlyFire ? "ON - LETHAL" : "Off", "", "", ""};
+        settings.passengers ? "On" : "Off", settings.friendlyFire ? "ON - LETHAL" : "Off", settings.enemies ? "On" : "Off", "", "", ""};
     float rowY = y + 108 * scale, rowH = 40 * scale;
     panelX_ = x; panelY_ = rowY; panelWidth_ = w; rowHeight_ = rowH;
     for (int i = 0; i < kRows; ++i) {
@@ -231,11 +234,11 @@ void SettingsMenu::Draw(int width, int height, const MenuSettings& settings,
     }
     Text(confirmDamage_ ? "Enable real damage and death? Press A / Enter again to confirm." :
          "Friendly fire requires BOTH players to opt in. The world keeps running.",
-         confirmDamage_ ? Color{1.f, 0.6f, 0.25f, 1.f} : muted, x + 28 * scale, y + 535 * scale, 0.86f * scale);
+         confirmDamage_ ? Color{1.f, 0.6f, 0.25f, 1.f} : muted, x + 28 * scale, y + 575 * scale, 0.86f * scale);
     Text("D-pad / arrows: select     Left / right / A: change     B / Esc: close", muted,
-         x + 28 * scale, y + 575 * scale, 0.86f * scale);
+         x + 28 * scale, y + 615 * scale, 0.86f * scale);
     Text("Open: F8 or View + Y     Appearance saves automatically", muted,
-         x + 28 * scale, y + 604 * scale, 0.86f * scale);
+         x + 28 * scale, y + 644 * scale, 0.86f * scale);
     POINT cursor{};
     RECT client{};
     HWND window = GetForegroundWindow();

@@ -42,6 +42,10 @@ public:
     const MotionSnapshot& Latest() const { return samples_.back(); }
     double DelaySeconds() const { return delay_; }
     double PlaybackTime() const { return playback_; }
+    // The sender clock (milliseconds) that the last Sample played back; lets other streams follow it.
+    double SenderMs() const {
+        return samples_.empty() ? 0 : lastTimestamp_ + (playback_ - samples_.back().t) * 1000.0;
+    }
     const Statistics& Stats() const { return stats_; }
     float BikeSpeed() const {
         auto velocity = samples_.empty() ? ue::FVector{} : Tangent(samples_.size() - 1, true);

@@ -7,7 +7,7 @@ namespace coop {
 
 enum class DebugCommand {
     unknown, inspect, begin, end, status, godOn, godOff, spawnSingle, spawnPack,
-    cleanup, probePlayer, probeEnemy
+    cleanup, probePlayer, probeEnemy, timeShift, weatherNext
 };
 
 inline DebugCommand ParseDebugCommand(std::string_view text) {
@@ -22,6 +22,8 @@ inline DebugCommand ParseDebugCommand(std::string_view text) {
     if (text == "cleanup") return DebugCommand::cleanup;
     if (text == "probe-player") return DebugCommand::probePlayer;
     if (text == "probe-enemy") return DebugCommand::probeEnemy;
+    if (text == "time-shift") return DebugCommand::timeShift;
+    if (text == "weather-next") return DebugCommand::weatherNext;
     return DebugCommand::unknown;
 }
 

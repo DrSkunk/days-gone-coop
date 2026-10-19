@@ -27,6 +27,26 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(data[:4], b'DGCO')
         self.assertEqual(struct.unpack_from('<H', data, 4)[0], fake_peer.VERSION)
 
+    def test_enemy_datagrams(self):
+        path = b'/Game/Characters/Freaker/Swarmer/parts_combo/swarmer_horde_c.swarmer_horde_c'
+        info = struct.pack(fake_peer.ENEMY_INFO, fake_peer.ENEMY_INFO_MAGIC, 1, 1, 0, 7, 3, path, b'', b'', b'')
+        self.assertEqual(fake_peer.decode_enemy_datagram(info), ('info', 3, [path.decode()]))
+        header = struct.pack(fake_peer.POSE_HEADER, fake_peer.POSE_MAGIC, 1, fake_peer.POSE_ENEMY, 2, 7, 500, 3,
+                             0, 1, 1, 1.0, 2.0, 3.0, 90.0, 50.0)
+        self.assertEqual(fake_peer.decode_enemy_datagram(header + b'\0' * 34), ('pose', 3, 2, (1.0, 2.0, 3.0), True))
+        self.assertIsNone(fake_peer.decode_enemy_datagram(header + b'\0' * 33))
+        body = header[:6] + bytes([0]) + header[7:]
+        self.assertIsNone(fake_peer.decode_enemy_datagram(body + b'\0' * 34))
+
+    def test_gear_datagrams(self):
+        self.assertEqual(struct.calcsize(fake_peer.GEAR), 240)
+        path = b'/Game/Weapons/Pistol/pistol_a.pistol_a'
+        data = struct.pack(fake_peer.GEAR, fake_peer.GEAR_MAGIC, 1, 1, 0, 7, 0, 0, 0, 0, 1, 1, 2, 3, 1, 1, 1,
+                           b'weapon_r', path)
+        self.assertEqual(fake_peer.decode_gear_datagram(data), ('skeletal', 'weapon_r', path.decode()))
+        self.assertIsNone(fake_peer.decode_gear_datagram(data[:-1]))
+        self.assertIsNone(fake_peer.decode_gear_datagram(data[:6] + bytes([3]) + data[7:]))
+
     def test_rejects_foreign_packets(self):
         self.assertIsNone(fake_peer.decode(b'\0' * 64))
         self.assertIsNone(fake_peer.decode(b'DGCO'))

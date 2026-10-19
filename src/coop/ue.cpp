@@ -375,6 +375,39 @@ bool Call::invoke() {
     return true;
 }
 
+bool ReadableMemory(const void* p, size_t len) {
+    return Readable(p, len);
+}
+
+bool BoundFunction::Bind(UObject* cls, const char* function, std::initializer_list<const char*> params) {
+    fn_ = nullptr;
+    cls_ = cls;
+    auto fn = cls ? FindFunction(cls, function) : nullptr;
+    if (!fn) return false;
+    size_t total = *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(fn) + off::FunctionParmsSize);
+    offsets_.clear();
+    for (auto name : params) {
+        auto property = FindChild(fn, name);
+        if (!property) {
+            coop::Log("reflection: %s.%s has no parameter %s", Name(cls).c_str(), function, name);
+            return false;
+        }
+        int offset = PropertyOffset(property);
+        int size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(property) + off::PropertyElementSize);
+        if (offset < 0 || size <= 0 || static_cast<size_t>(offset + size) > total) return false;
+        offsets_.push_back(offset);
+    }
+    buf_.assign(total, 0);
+    fn_ = fn;
+    return true;
+}
+
+bool BoundFunction::Invoke(UObject* target) {
+    if (!fn_ || !IsLive(target) || !IsA(target, cls_)) return false;
+    g.processEvent(target, fn_, buf_.data());
+    return true;
+}
+
 bool ReadStructFields(const void* data, size_t size, std::initializer_list<StructField> fields, void* out, size_t outSize) {
     auto bytes = static_cast<const uint8_t*>(data);
     for (auto field : fields) {

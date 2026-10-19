@@ -10,7 +10,8 @@ import time
 
 COMMANDS = (
     "inspect", "begin", "end", "status", "god-on", "god-off", "spawn-single",
-    "spawn-pack", "cleanup", "probe-player", "probe-enemy",
+    "spawn-pack", "cleanup", "probe-player", "probe-enemy", "time-shift",
+    "weather-next",
 )
 
 

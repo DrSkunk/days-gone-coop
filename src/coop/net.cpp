@@ -53,8 +53,12 @@ bool UdpPeer::Open(uint16_t port, const std::string& peerHost, uint16_t peerPort
 }
 
 void UdpPeer::Send(const StatePacket& p) {
+    SendRaw(&p, sizeof p);
+}
+
+void UdpPeer::SendRaw(const void* data, int size) {
     if (!hasPeer_) return;
-    int n = sendto(sock_, reinterpret_cast<const char*>(&p), sizeof p, 0,
+    int n = sendto(sock_, static_cast<const char*>(data), size, 0,
                    reinterpret_cast<const sockaddr*>(&peer_), sizeof peer_);
     int error = n == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (error && error != WSAEWOULDBLOCK && error != lastSendError_)
@@ -62,8 +66,8 @@ void UdpPeer::Send(const StatePacket& p) {
     lastSendError_ = error;
 }
 
-bool UdpPeer::Receive(StatePacket& out) {
-    char buf[512];
+bool UdpPeer::Receive(StatePacket& out, const std::function<void(const char*, int)>& other) {
+    char buf[1500];
     // Bound work on the game thread even if unrelated traffic floods the port.
     for (int budget = 0; budget < 128; ++budget) {
         sockaddr_in from{};
@@ -80,7 +84,10 @@ bool UdpPeer::Receive(StatePacket& out) {
         lastReceiveError_ = 0;
         if (hasPeer_ && (from.sin_addr.s_addr != peer_.sin_addr.s_addr ||
                         from.sin_port != peer_.sin_port)) continue;
-        if (!DecodeState(buf, n, out)) continue;
+        if (!DecodeState(buf, n, out)) {
+            if (hasPeer_ && other) other(buf, n);
+            continue;
+        }
         if (!hasPeer_) {
             peer_ = from;
             hasPeer_ = true;

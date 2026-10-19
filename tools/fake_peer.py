@@ -11,13 +11,49 @@ import struct
 import time
 
 MAGIC = 0x4F434744
-VERSION = 4
+VERSION = 5
 HAS_PAWN = 1
 WORLD_STATE = 1 << 8
+SYNC_ENEMIES = 1 << 9
 BASE_FORMAT = '<IHHII3fff3f16s'
 FORMAT = BASE_FORMAT + '6I7f4BIfBBIffBB'
 SIZE = struct.calcsize(FORMAT)
 assert SIZE == 144
+POSE_MAGIC = 0x534F5044
+ENEMY_INFO_MAGIC = 0x4E454D44
+POSE_HEADER = '<IHBBIIIBBH3fff'
+ENEMY_INFO = '<IHBBII' + '120s' * 4
+POSE_ENEMY = 2
+GEAR_MAGIC = 0x52474D44
+GEAR = '<IHBBII4f3f3f64s120s'
+GEAR_KINDS = {0: 'none', 1: 'skeletal', 2: 'static'}
+
+
+def decode_gear_datagram(data):
+    """Returns (kind, socket, path) for a held-item datagram."""
+    if len(data) != struct.calcsize(GEAR) or struct.unpack_from('<I', data)[0] != GEAR_MAGIC:
+        return None
+    magic, version, kind, reserved, session, number, *rest = struct.unpack(GEAR, data)
+    socket, path = (v.split(b'\0', 1)[0].decode('ascii', 'replace') for v in rest[-2:])
+    if version != 1 or kind not in GEAR_KINDS or reserved:
+        return None
+    return (GEAR_KINDS[kind], socket, path)
+
+
+def decode_enemy_datagram(data):
+    """Returns ('info', entity, paths) or ('pose', entity, bones, root, alive) for enemy datagrams."""
+    if len(data) == struct.calcsize(ENEMY_INFO) and struct.unpack_from('<I', data)[0] == ENEMY_INFO_MAGIC:
+        magic, version, count, reserved, session, entity, *paths = struct.unpack(ENEMY_INFO, data)
+        if version != 1 or not entity or not 1 <= count <= 4:
+            return None
+        return ('info', entity, [p.split(b'\0', 1)[0].decode('ascii', 'replace') for p in paths[:count]])
+    if len(data) >= struct.calcsize(POSE_HEADER) and struct.unpack_from('<I', data)[0] == POSE_MAGIC:
+        (magic, version, kind, count, session, time_ms, entity, chunk, chunks, flags,
+         x, y, z, yaw, health) = struct.unpack_from(POSE_HEADER, data)
+        if kind != POSE_ENEMY or not entity or len(data) != struct.calcsize(POSE_HEADER) + 17 * count:
+            return None
+        return ('pose', entity, count, (x, y, z), bool(flags & 1))
+    return None
 
 
 def encode(seq, time_ms, pos, yaw, pitch, vel, name, flags=HAS_PAWN, *,
@@ -43,7 +79,7 @@ def decode(data):
     damage, bx, by, bz, bp, byaw, br = values[20:27]
     jacket, trousers, cap_color, cap, attack_kind, health, actions, weapon_type, shot_sequence = values[27:36]
     world_time_of_day, world_relative_time, world_weather, world_transition_rate = values[36:]
-    if magic != MAGIC or version != VERSION or flags & ~511:
+    if magic != MAGIC or version != VERSION or flags & ~1023:
         return None
     if any(not math.isfinite(v) or abs(v) > 1e8 for v in (x, y, z, yaw, pitch, vx, vy, vz, damage,
                                                         bx, by, bz, bp, byaw, br, health,
@@ -117,6 +153,8 @@ def main():
     ap.add_argument('--speed', type=float, default=300.0, help='walking speed in cm/s (0 = stand still)')
     ap.add_argument('--offset', type=float, default=600.0, help='distance of the circle centre from the player, cm')
     ap.add_argument('--duration', type=float, default=0.0, help='stop after this many seconds (0 = until Ctrl-C)')
+    ap.add_argument('--sync-enemies', action='store_true',
+                    help="request the host's enemy streams and report what arrives")
     ap.add_argument('--follow', action='store_true',
                     help='walk after the player instead of circling (--speed is the maximum, e.g. 700)')
     args = ap.parse_args()
@@ -135,14 +173,30 @@ def main():
     print(f'fake peer on UDP {args.port}, sending to {game[0]}:{game[1]}; waiting for the game...')
     anchor, seq, start, last_log = None, 0, time.monotonic(), 0.0
     player, player_yaw, ghost, last_step = None, 0.0, None, time.monotonic()
+    flags = HAS_PAWN | (SYNC_ENEMIES if args.sync_enemies else 0)
+    enemies, enemy_packets, enemy_bones, enemy_paths, last_enemy_log = {}, 0, 0, {}, time.monotonic()
+    held = None
     while not args.duration or time.monotonic() - start < args.duration:
         while True:
             try:
-                data, sender = sock.recvfrom(512)
+                data, sender = sock.recvfrom(2048)
             except BlockingIOError:
                 break
             if sender != game:
                 continue
+            gear = decode_gear_datagram(data)
+            if gear and gear != held:
+                held = gear
+                print(f'held item: {gear[0]} {gear[2] or "-"} at {gear[1] or "-"}')
+            enemy = decode_enemy_datagram(data)
+            if enemy and enemy[0] == 'info':
+                if enemy_paths.get(enemy[1]) != enemy[2]:
+                    print(f'enemy {enemy[1]} look: {", ".join(enemy[2])}')
+                enemy_paths[enemy[1]] = enemy[2]
+            elif enemy:
+                enemies[enemy[1]] = (enemy[3], enemy[4])
+                enemy_packets += 1
+                enemy_bones += enemy[2]
             state = decode(data)
             if not state:
                 continue
@@ -159,6 +213,12 @@ def main():
                 last_log = now
                 print(f"game state seq={state['seq']} pos={tuple(round(v) for v in state['pos'])} "
                       f"yaw={state['yaw']:.0f} flags={state['flags']}")
+        if args.sync_enemies and time.monotonic() - last_enemy_log >= 5:
+            span = time.monotonic() - last_enemy_log
+            alive = sum(1 for _, a in enemies.values() if a)
+            print(f'enemies: {len(enemies)} streamed ({alive} alive), {enemy_packets / span:.1f} pose pkt/s, '
+                  f'{enemy_bones / max(enemy_packets, 1):.0f} bones/pkt')
+            enemies, enemy_packets, enemy_bones, last_enemy_log = {}, 0, 0, time.monotonic()
         t = time.monotonic() - start
         seq += 1
         now = time.monotonic()
@@ -166,13 +226,13 @@ def main():
         if args.follow and player is not None:
             ghost, vel = follow_step(ghost or player, player, dt, args.speed or 700.0, stop_dist=80.0)
             ghost_yaw = math.degrees(math.atan2(vel[1], vel[0])) - 90.0 if vel[0] or vel[1] else player_yaw
-            sock.sendto(encode(seq, int(t * 1000), ghost, ghost_yaw, 0.0, vel, 'GhostPartner'), game)
+            sock.sendto(encode(seq, int(t * 1000), ghost, ghost_yaw, 0.0, vel, 'GhostPartner', flags=flags), game)
         elif anchor is not None:
             if args.speed > 0:
                 pos, yaw, vel = circle_state(anchor, t, args.radius, args.speed)
             else:
                 pos, yaw, vel = anchor, 0.0, (0.0, 0.0, 0.0)
-            sock.sendto(encode(seq, int(t * 1000), pos, yaw, 0.0, vel, 'GhostPartner'), game)
+            sock.sendto(encode(seq, int(t * 1000), pos, yaw, 0.0, vel, 'GhostPartner', flags=flags), game)
         else:
             # A host-mode game needs our first packet before it can reply with its position.
             sock.sendto(encode(seq, int(t * 1000), (0, 0, 0), 0, 0, (0, 0, 0), 'GhostPartner', flags=0), game)

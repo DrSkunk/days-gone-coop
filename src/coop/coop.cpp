@@ -9,6 +9,10 @@
 #include "overlay.hpp"
 #include "combat.hpp"
 #include "debug_commands.hpp"
+#include "enemy.hpp"
+#include "gear.hpp"
+#include "pose.hpp"
+#include "skeleton.hpp"
 #include "ue.hpp"
 
 #include <windows.h>
@@ -20,6 +24,8 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace ue;
@@ -51,12 +57,40 @@ StatePacket g_peer{};
 DamageChannel g_damage;
 Appearance g_localAppearance, g_remoteAppearance;
 UObject* g_localBike = nullptr;
+struct BikePart {
+    UObject* actor = nullptr;
+    UObject* component = nullptr;
+    bool mastered = false;
+    FName socket{};
+    FVector location{}, scale{1, 1, 1};
+    FRotator rotation{};
+};
 struct BikeAvatar {
     UObject* actor = nullptr;
     UObject* component = nullptr;
     UObject* source = nullptr;
     std::vector<UObject*> parts;
+    std::vector<BikePart> attachments;
+    UObject* pose = nullptr;
+    PoseWriter writer;
+    bool posing = false;
 } g_bike;
+struct PoseSource {
+    UObject* mesh = nullptr;
+    UObject* asset = nullptr;
+    BoneTable table;
+    PoseReader reader;
+    std::vector<uint32_t> names;
+    std::vector<BonePose> bones;
+};
+PoseSource g_bodySource, g_bikeSource;
+PoseBuffer g_bodyPoses, g_bikePoses;
+double g_lastBodyPose = -10, g_lastBikePose = -10;
+constexpr double kPoseFresh = 0.5;
+struct PoseStats {
+    uint64_t sent = 0, bytes = 0, received = 0, rejected = 0, reads = 0;
+    double readTime = 0;
+} g_poseStats;
 double g_lastBikeSpawn = -10;
 std::string g_settingsError;
 struct Avatar {
@@ -70,6 +104,10 @@ struct Avatar {
     UObject* seatMesh = nullptr;
     FName seatSocket{}, pelvis{};
     bool hidden = false;
+    // Streamed-pose body: a runtime PoseableMeshComponent; `component` keeps the clip-driven fallback.
+    UObject* pose = nullptr;
+    PoseWriter writer;
+    bool posing = false;
 };
 Avatar g_passengerAvatar;
 Appearance g_passengerAppearance;
@@ -165,10 +203,18 @@ double g_localSettledAt = 0;
 
 void DestroyAvatar();
 void DestroyBike();
+void DestroyEnemyReplicas();
+void ReceiveEnemyPose(const PosePacket& packet, double now);
+void ReceiveEnemyInfo(const char* data, int len, double now);
+void ReceiveGear(const char* data, int len, double now);
+void SendGear(UObject* pawn, double now);
+void DestroyGear();
 void ReceiveDamage(const StatePacket& packet);
 void UpdateDamageScope(double now);
 bool EndPassenger(bool forced);
 bool SpawnAvatar(UObject* localPawn, const FVector& at, Avatar& avatar);
+void AttachPoseable(UObject* actor, UObject* fallback, UObject* source, UObject*& pose, PoseWriter& writer, const char* label);
+bool SetPosing(bool on, bool& posing, UObject* pose, UObject* fallback, const std::vector<UObject*>& masteredParts);
 UObject* g_anims[4] = {};
 bool g_teleportHeld = false;
 bool OwnWindowFocused();
@@ -176,7 +222,7 @@ std::string Narrow(const std::wstring& w);
 void SaveSettings() {
     std::wstring ini = g_basePath + L".ini";
     const std::pair<const wchar_t*, int> values[] = {{L"JacketColor", g_settings.jacket}, {L"TrousersColor", g_settings.trousers},
-        {L"CapColor", g_settings.capColor}, {L"ShowCap", g_settings.cap}, {L"SyncMotorcycles", g_settings.motorcycles},
+        {L"CapColor", g_settings.capColor}, {L"ShowCap", g_settings.cap}, {L"SyncMotorcycles", g_settings.motorcycles}, {L"SyncEnemies", g_settings.enemies},
         {L"AllowPassenger", g_settings.passengers}};
     for (auto [key, value] : values) {
         auto text = std::to_wstring(value);
@@ -299,9 +345,13 @@ bool ResolveEngine() {
 UObject* FindWorldManager() {
     if (!C.worldManager) C.worldManager = FindClass("BendWorldManager");
     if (!C.worldManager) return nullptr;
+    // A full object-array walk costs tens of milliseconds; reuse the manager while it lives.
+    static UObject* cached = nullptr;
+    if (IsLive(cached) && IsA(cached, C.worldManager)) return cached;
+    cached = nullptr;
     for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
         auto object = ObjectAt(i);
-        if (IsLive(object) && !IsDefaultOrArchetype(object) && IsA(object, C.worldManager)) return object;
+        if (IsLive(object) && !IsDefaultOrArchetype(object) && IsA(object, C.worldManager)) return cached = object;
     }
     return nullptr;
 }
@@ -324,11 +374,11 @@ bool ReadWorldSnapshot(UObject* manager, WorldSnapshot& state) {
         return false;
     }
     Call time(manager, "GetWorldTimeOfDay"), relative(manager, "GetWorldTimeFractional");
-    Call weather(manager, "GetWorldWeather");
-    uint8_t transitionRate = 0;
+    uint8_t transitionRate = 0, weather = 0;
     bool timeAvailable = time.invoke();
     bool relativeAvailable = relative.invoke();
-    bool weatherAvailable = weather.invoke();
+    // GetWorldWeather() always returns 0 in this build; the property tracks the selected weather.
+    bool weatherAvailable = GetProp(manager, "WorldWeather", weather);
     bool transitionAvailable = GetProp(manager, "WeatherTransitionType", transitionRate);
     if (!timeAvailable || !relativeAvailable || !weatherAvailable || !transitionAvailable) {
         if (now - lastDiagnostic >= 10000) {
@@ -340,7 +390,7 @@ bool ReadWorldSnapshot(UObject* manager, WorldSnapshot& state) {
     }
     state.timeOfDay = time.get<float>("ReturnValue");
     state.relativeTime = relative.get<float>("ReturnValue");
-    state.weather = weather.get<uint8_t>("ReturnValue");
+    state.weather = weather;
     state.transitionRate = transitionRate;
     state.valid = std::isfinite(state.timeOfDay) && std::fabs(state.timeOfDay) < 1e6f &&
                   std::isfinite(state.relativeTime) && std::fabs(state.relativeTime) < 1e6f;
@@ -358,10 +408,12 @@ void ApplyWorldSnapshot(UObject* manager, const WorldSnapshot& state) {
     if (!state.valid || !WorldSyncAllowed(manager)) return;
     WorldSnapshot current{};
     if (!ReadWorldSnapshot(manager, current)) return;
-    if (std::fabs(current.timeOfDay - state.timeOfDay) > 0.1f) {
+    // Small corrections keep lighting from visibly stepping while the client clock drifts.
+    if (std::fabs(current.timeOfDay - state.timeOfDay) > 0.02f) {
         if (Call(manager, "SetWorldTimeOfDay").set("TimeOfDay", state.timeOfDay)
                 .setBool("CanAdvanceDay", false).invoke())
-            Log("world sync: time %.3f -> %.3f", current.timeOfDay, state.timeOfDay);
+            if (std::fabs(current.timeOfDay - state.timeOfDay) > 0.25f)
+                Log("world sync: time %.3f -> %.3f", current.timeOfDay, state.timeOfDay);
     }
     bool transitioning = true;
     if (current.weather != state.weather && GetProp(manager, "IsWeatherTransitioning", transitioning) &&
@@ -485,6 +537,22 @@ void DumpClass(FILE* file, UObject* cls, bool includeParents = true) {
                                  *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(parameter) + off::PropertyElementSize));
                     parameter = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(parameter) + off::FieldNext);
                 }
+            }
+            field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(field) + off::FieldNext);
+        }
+    }
+}
+
+void DumpObjectReferences(FILE* file, UObject* object) {
+    std::fprintf(file, "REFS %s\n", FullName(object).c_str());
+    for (auto type = IsLive(object) ? object->cls : nullptr; type; type = Super(type)) {
+        auto field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(type) + off::StructChildren);
+        for (int budget = 0; field && budget < 4096; ++budget) {
+            auto kind = Name(field->cls);
+            if (kind == "ObjectProperty" || kind == "ClassProperty") {
+                UObject* value = nullptr;
+                std::memcpy(&value, reinterpret_cast<uint8_t*>(object) + PropertyOffset(field), sizeof value);
+                if (value) std::fprintf(file, "  %s.%s = %s\n", Name(type).c_str(), Name(field).c_str(), FullName(value).c_str());
             }
             field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(field) + off::FieldNext);
         }
@@ -620,6 +688,8 @@ void Discover(UObject* pawn) {
     Log("discovery: reflection report written to %s", Narrow(path).c_str());
 }
 
+UObject* SpawnMeshActor(UObject* context, const FVector& at);
+
 bool DiscoverDebug(UObject* pawn) {
     auto path = g_basePath + L"-debug.txt";
     FILE* file = _wfopen(path.c_str(), L"w");
@@ -652,6 +722,10 @@ bool DiscoverDebug(UObject* pawn) {
         return false;
     };
     int aiCount = 0;
+    UObject* nearestAI = nullptr;
+    float nearestDistance = 1e12f;
+    Call playerAt(pawn, "K2_GetActorLocation");
+    FVector player = playerAt.invoke() ? playerAt.get<FVector>("ReturnValue") : FVector{};
     for (int32_t i = 0, count = ObjectCount(); i < count; ++i) {
         auto object = ObjectAt(i);
         if (!IsLive(object) || IsDefaultOrArchetype(object) || !IsLive(object->cls)) continue;
@@ -673,8 +747,153 @@ bool DiscoverDebug(UObject* pawn) {
                 FullName(object).c_str(), health, at.x, at.y, at.z,
                 FullName(Prop(object, "Controller")).c_str(),
                 FullName(Prop(Prop(object, "Mesh"), "SkeletalMesh")).c_str());
+            float d = (at.x - player.x) * (at.x - player.x) + (at.y - player.y) * (at.y - player.y);
+            if (Prop(Prop(object, "Mesh"), "SkeletalMesh") && d < nearestDistance) {
+                nearestDistance = d;
+                nearestAI = object;
+            }
         } else if (matches(Name(object->cls))) {
             std::fprintf(file, "INSTANCE %s\n", FullName(object).c_str());
+        }
+    }
+    if (auto manager = FindWorldManager()) DumpClass(file, manager->cls, true);
+    for (const auto* name : {"SkinnedMeshComponent", "PoseableMeshComponent", "SkeletalMeshComponent",
+                             "Actor", "BlueprintGeneratedClass", "SkeletalMeshActor", "StaticMeshComponent"})
+        if (auto cls = FindClass(name)) DumpClass(file, cls, false);
+    auto dumpBones = [&](const char* label, UObject* mesh) {
+        BoneTable table;
+        if (!IsLive(mesh) || !ReadBoneTable(mesh, table)) {
+            std::fprintf(file, "\nBONES %s unavailable\n", label);
+            return;
+        }
+        std::fprintf(file, "\nBONES %s %s mesh=%s count=%zu\n", label, FullName(mesh).c_str(),
+                     FullName(table.asset).c_str(), table.names.size());
+        for (size_t b = 0; b < table.names.size(); ++b)
+            std::fprintf(file, "  %zu %s parent=%d\n", b, NameString(table.names[b].index).c_str(), table.parents[b]);
+        PoseReader reader;
+        std::vector<BonePose> pose;
+        double start = Now();
+        bool read = reader.Read(mesh, table, table.names.size(), pose);
+        std::fprintf(file, "POSEREAD %s ok=%d bones=%zu ms=%.3f\n", label, read, pose.size(), (Now() - start) * 1000);
+        for (size_t b = 0; read && b < pose.size() && b < 4; ++b)
+            std::fprintf(file, "  %zu t=(%.2f %.2f %.2f) q=(%.3f %.3f %.3f %.3f)\n", b, pose[b].t.x, pose[b].t.y,
+                         pose[b].t.z, pose[b].q[0], pose[b].q[1], pose[b].q[2], pose[b].q[3]);
+    };
+    dumpBones("player", Prop(pawn, "Mesh"));
+    if (IsLive(g_localBike)) {
+        dumpBones("bike", Prop(g_localBike, "VehicleMesh"));
+        auto sceneClass = FindClass("SceneComponent");
+        for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+            auto o = ObjectAt(i);
+            if (!o || o->outer != g_localBike || !IsLive(o) || !IsA(o, sceneClass)) continue;
+            Call visible(o, "IsVisible");
+            int vis = visible.invoke() ? visible.get<bool>("ReturnValue") : -1;
+            FName socket{};
+            GetProp(o, "AttachSocketName", socket);
+            std::fprintf(file, "BIKECOMP %s class=%s skel=%s static=%s parent=%s socket=%s master=%s visible=%d\n",
+                         Name(o).c_str(), Name(o->cls).c_str(), FullName(Prop(o, "SkeletalMesh")).c_str(),
+                         FullName(Prop(o, "StaticMesh")).c_str(), Name(Prop(o, "AttachParent")).c_str(),
+                         NameString(socket.index).c_str(), Name(WeakProp(o, "MasterPoseComponent")).c_str(), vis);
+        }
+        for (auto part : OwnedMeshes(g_nativeBikeMeshes, g_localBike, Now()))
+            std::fprintf(file, "BIKEPART %s mesh=%s master=%s anim=%s\n", FullName(part).c_str(),
+                         FullName(Prop(part, "SkeletalMesh")).c_str(), Name(WeakProp(part, "MasterPoseComponent")).c_str(),
+                         FullName(Prop(part, "AnimBlueprintGeneratedClass")).c_str());
+    }
+    auto dumpEnemy = [&](const char* label, UObject* enemyPawn) {
+            auto enemyMesh = Prop(enemyPawn, "Mesh");
+            dumpBones(label, enemyMesh);
+            std::fprintf(file, "ENEMYLOOK pawn=%s lookComponent=%s meshLook=%s\n", FullName(enemyPawn).c_str(),
+                         FullName(Prop(enemyPawn, "LookComponent")).c_str(), FullName(Prop(enemyMesh, "Look")).c_str());
+            if (auto look = Prop(enemyPawn, "LookComponent"); IsLive(look)) {
+                DumpClass(file, look->cls, false);
+                DumpObjectReferences(file, look);
+            }
+            DumpObjectReferences(file, enemyPawn);
+            for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+                auto o = ObjectAt(i);
+                if (!o || !IsLive(o) || !IsA(o, C.skelMeshComponent)) continue;
+                if (o->outer != enemyPawn && Prop(o, "AttachParent") != enemyMesh) continue;
+                Call visible(o, "IsVisible");
+                std::fprintf(file, "ENEMYPART %s class=%s outer=%s mesh=%s master=%s look=%s visible=%d\n", FullName(o).c_str(),
+                             Name(o->cls).c_str(), Name(o->outer).c_str(), FullName(Prop(o, "SkeletalMesh")).c_str(),
+                             Name(WeakProp(o, "MasterPoseComponent")).c_str(), FullName(Prop(o, "Look")).c_str(),
+                             visible.invoke() ? visible.get<bool>("ReturnValue") : -1);
+            }
+    };
+    for (const auto& enemy : g_debug.enemies)
+        if (IsLive(enemy.pawn.get())) {
+            dumpEnemy("enemy", enemy.pawn.get());
+            break;
+        }
+    if (IsLive(nearestAI)) {
+        std::fprintf(file, "\nNEARESTAI %s distance=%.0f\n", FullName(nearestAI).c_str(), std::sqrt(nearestDistance));
+        dumpEnemy("nearest-ai", nearestAI);
+    }
+    if (auto held = Call(pawn, "GetEquippedItemCurrentlyInHand"); held.invoke()) {
+        auto weapon = held.get<UObject*>("ReturnValue");
+        std::fprintf(file, "\nWEAPON %s class=%s\n", FullName(weapon).c_str(), IsLive(weapon) ? FullName(weapon->cls).c_str() : "-");
+        for (int32_t i = 0, n = IsLive(weapon) ? ObjectCount() : 0; i < n; ++i) {
+            auto o = ObjectAt(i);
+            if (o && o->outer == weapon && IsLive(o))
+                std::fprintf(file, "  WEAPONPART %s class=%s mesh=%s static=%s attach=%s\n", FullName(o).c_str(),
+                             Name(o->cls).c_str(), FullName(Prop(o, "SkeletalMesh")).c_str(),
+                             FullName(Prop(o, "StaticMesh")).c_str(), Name(Prop(o, "AttachParent")).c_str());
+        }
+    }
+    Call pawnAt(pawn, "K2_GetActorLocation");
+    FVector below = pawnAt.invoke() ? pawnAt.get<FVector>("ReturnValue") : FVector{};
+    below.z -= 500;
+    if (auto test = SpawnMeshActor(pawn, below)) {
+        auto playerMesh = Prop(pawn, "Mesh");
+        auto created = CreatePoseableComponent(test);
+        bool meshSet = created && Call(created, "SetSkeletalMesh").set("NewMesh", Prop(playerMesh, "SkeletalMesh")).invoke();
+        PoseWriter writer;
+        bool attached = meshSet && writer.Attach(created);
+        bool applied = false, matched = false;
+        if (attached) {
+            BoneTable table;
+            PoseReader reader;
+            std::vector<BonePose> pose;
+            if (ReadBoneTable(playerMesh, table) && reader.Read(playerMesh, table, table.names.size(), pose)) {
+                PoseFrame frame;
+                frame.names = table.hashes;
+                frame.bones = pose;
+                applied = writer.Apply(frame);
+                Call get(created, "GetBoneTransformByName");
+                size_t probe = std::min<size_t>(1, pose.size() - 1);
+                get.set("BoneName", table.names[probe]).set<uint8_t>("BoneSpace", 1);
+                Call ref(playerMesh, "GetSocketTransform");
+                ref.set("InSocketName", table.names[probe]).set<uint8_t>("TransformSpace", 2);
+                if (applied && get.invoke() && ref.invoke()) {
+                    auto a = get.get<FTransform>("ReturnValue").translation, b = ref.get<FTransform>("ReturnValue").translation;
+                    matched = std::fabs(a.x - b.x) + std::fabs(a.y - b.y) + std::fabs(a.z - b.z) < 0.5f;
+                    std::fprintf(file, "POSEWRITE probe=%zu poseable=(%.2f %.2f %.2f) source=(%.2f %.2f %.2f)\n", probe,
+                                 a.x, a.y, a.z, b.x, b.y, b.z);
+                }
+            }
+        }
+        std::fprintf(file, "POSEABLE_SELFTEST created=%s mesh=%d attach=%d offset=%d applied=%d matched=%d\n",
+                     FullName(created).c_str(), meshSet, attached, attached ? writer.Offset() : -1, applied, matched);
+        Log("debug: poseable self-test created=%d mesh=%d attach=%d applied=%d matched=%d", created != nullptr, meshSet,
+            attached, applied, matched);
+        Call(test, "K2_DestroyActor").invoke();
+    }
+    auto poseable = FindClass("PoseableMeshComponent");
+    auto bpgc = FindClass("BlueprintGeneratedClass");
+    for (int32_t i = 0, count = ObjectCount(); i < count; ++i) {
+        auto object = ObjectAt(i);
+        if (!object || !IsLive(object->cls)) continue;
+        if (poseable && IsA(object, poseable))
+            std::fprintf(file, "POSEABLE %s outer=%s\n", FullName(object).c_str(), FullName(object->outer).c_str());
+        if (bpgc && IsA(object, bpgc) && IsLive(object)) {
+            struct Array { UObject** data; int32_t count, capacity; } templates{};
+            if (GetProp(object, "ComponentTemplates", templates) && templates.data && templates.count > 0 &&
+                templates.count <= templates.capacity && templates.count < 256)
+                for (int t = 0; t < templates.count; ++t)
+                    if (poseable && templates.data[t] && IsA(templates.data[t], poseable))
+                        std::fprintf(file, "POSEABLE_TEMPLATE %s in %s\n", FullName(templates.data[t]).c_str(),
+                                     FullName(object).c_str());
         }
     }
     std::fprintf(file, "\nSUMMARY classes=%llu ai-pawns=%d\n",
@@ -689,6 +908,53 @@ bool DiscoverDebug(UObject* pawn) {
     Log("debug: report %s classes=%llu ai-pawns=%d", Narrow(path).c_str(),
         static_cast<unsigned long long>(emitted.size()), aiCount);
     return true;
+}
+
+bool ReadPoseSource(PoseSource& source, UObject* mesh) {
+    if (!IsLive(mesh)) return false;
+    auto asset = Prop(mesh, "SkeletalMesh");
+    if (mesh != source.mesh || asset != source.asset || !source.table.Valid()) {
+        source = PoseSource{};
+        if (!ReadBoneTable(mesh, source.table)) return false;
+        source.mesh = mesh;
+        source.asset = asset;
+        source.names = source.table.hashes;
+        Log("pose: streaming %d bones of %s", static_cast<int>(source.names.size()), Name(asset).c_str());
+    }
+    double start = Now();
+    bool read = source.reader.Read(mesh, source.table, source.names.size(), source.bones);
+    g_poseStats.readTime += Now() - start;
+    ++g_poseStats.reads;
+    return read;
+}
+
+// Streams the evaluated local pose of `mesh`; the receiver drives a poseable copy with it.
+void SendPose(PoseKind kind, PoseSource& source, UObject* mesh, uint32_t timeMs, float health, bool withRoot) {
+    if (!ReadPoseSource(source, mesh)) return;
+    PoseHeader header{};
+    header.kind = kind;
+    header.session = g_session;
+    header.timeMs = timeMs;
+    header.health = std::clamp(health, 0.f, 100000.f);
+    size_t real = source.names.size();
+    if (withRoot) {
+        BonePose root;
+        Call rotation(mesh, "K2_GetComponentRotation");
+        if (rotation.invoke()) {
+            auto r = rotation.get<FRotator>("ReturnValue");
+            RotatorToQuat(r.pitch, r.yaw, r.roll, root.q);
+            header.yaw = r.yaw;
+            source.names.push_back(kRootBoneHash);
+            source.bones.push_back(root);
+        }
+    }
+    EncodePose(header, source.names, source.bones, [](const PosePacket& packet, size_t size) {
+        g_net.SendRaw(&packet, static_cast<int>(size));
+        ++g_poseStats.sent;
+        g_poseStats.bytes += size;
+    });
+    source.names.resize(real);
+    source.bones.resize(real);
 }
 
 void SendLocalState(UObject* pawn, double now) {
@@ -713,6 +979,7 @@ void SendLocalState(UObject* pawn, double now) {
     }
     if (g_settings.friendlyFire) p.flags |= kFriendlyFire;
     if (g_settings.motorcycles) p.flags |= kSyncBikes;
+    if (g_settings.enemies && !g_cfg.peerHost.empty()) p.flags |= kSyncEnemies;
     if (g_settings.passengers) p.flags |= kAcceptPassengers;
     std::snprintf(p.name, sizeof p.name, "%s", g_cfg.playerName.c_str());
     g_damage.Fill(p);
@@ -794,19 +1061,51 @@ void SendLocalState(UObject* pawn, double now) {
         }
     }
     g_net.Send(p);
+    if (!(p.flags & kHasPawn) || now - g_lastRecv >= kPeerTimeout) return;
+    UObject* mesh = g_passenger.pawn == pawn && IsLive(g_passengerAvatar.component) ? g_passengerAvatar.component :
+        IsA(pawn, C.character) ? Prop(pawn, "Mesh") : nullptr;
+    if (mesh) SendPose(kPoseBody, g_bodySource, mesh, p.timeMs, p.health, true);
+    if (p.flags & kHasBike) SendPose(kPoseBike, g_bikeSource, Prop(g_localBike, "VehicleMesh"), p.timeMs, 0, false);
+    SendGear(pawn, now);
+}
+
+void ReceivePose(const char* data, int len, double now) {
+    uint32_t magic = 0;
+    if (len >= 4) std::memcpy(&magic, data, 4);
+    if (magic == kEnemyInfoMagic) {
+        ReceiveEnemyInfo(data, len, now);
+        return;
+    }
+    if (magic == kGearMagic) {
+        ReceiveGear(data, len, now);
+        return;
+    }
+    PosePacket packet;
+    if (!DecodePose(data, len, packet) || packet.header.session != g_peer.session || !g_peer.session) {
+        ++g_poseStats.rejected;
+        return;
+    }
+    ++g_poseStats.received;
+    if (packet.header.kind == kPoseBody && g_bodyPoses.Push(packet, now)) g_lastBodyPose = now;
+    else if (packet.header.kind == kPoseBike && g_bikePoses.Push(packet, now)) g_lastBikePose = now;
+    else if (packet.header.kind == kPoseEnemy) ReceiveEnemyPose(packet, now);
 }
 
 void ReceiveRemote(double now) {
     StatePacket p;
-    for (int budget = 0; budget < 64 && g_net.Receive(p); ++budget) {
+    auto other = [now](const char* data, int len) { ReceivePose(data, len, now); };
+    for (int budget = 0; budget < 64 && g_net.Receive(p, other); ++budget) {
         bool reconnect = now - g_lastRecv > kPeerTimeout || p.session != g_peer.session;
         if (!reconnect && !NewerSequence(p.seq, g_lastRemoteSeq)) continue;
         if (reconnect) {
             ++g_consent;
             g_motion.Clear();
+            g_bodyPoses.Clear();
+            g_bikePoses.Clear();
             Log("peer %s (%s) connected", p.name, g_net.PeerText().c_str());
             DestroyAvatar();  // Rebuild from the player's current look; also a manual "respawn" lever.
             DestroyBike();
+            DestroyEnemyReplicas();
         }
         g_lastRecv = now;
         ++g_receivedStates;
@@ -823,6 +1122,39 @@ void ReceiveRemote(double now) {
 
 bool SampleRemote(double now, Snapshot& out) {
     return g_motion.Sample(now, out);
+}
+
+bool WorldTransform(UObject* component, FName socket, FTransform& out) {
+    Call world(component, "GetSocketTransform");
+    if (!world.set("InSocketName", socket).set("TransformSpace", static_cast<uint8_t>(0)).invoke()) return false;
+    out = world.get<FTransform>("ReturnValue");
+    for (float f : {out.rotation.x, out.rotation.y, out.rotation.z, out.rotation.w, out.translation.x, out.translation.y,
+                    out.translation.z, out.scale.x, out.scale.y, out.scale.z})
+        if (!std::isfinite(f)) return false;
+    return true;
+}
+
+BonePose AsPose(const FTransform& x) {
+    BonePose pose;
+    pose.q[0] = x.rotation.x;
+    pose.q[1] = x.rotation.y;
+    pose.q[2] = x.rotation.z;
+    pose.q[3] = x.rotation.w;
+    NormalizeQuat(pose.q);
+    pose.t = x.translation;
+    return pose;
+}
+
+// PoseWriter fills the poseable's bone array directly, which bypasses the engine's child-transform update, so
+// actors mounted on a streamed socket are re-placed from the live socket every tick.
+bool FollowSocket(UObject* actor, UObject* parent, FName socket, const BonePose& offset) {
+    FTransform at{};
+    if (!IsLive(actor) || !IsLive(parent) || !WorldTransform(parent, socket, at)) return false;
+    BonePose world = ComposePose(offset, AsPose(at));
+    float pitch = 0, yaw = 0, roll = 0;
+    QuatToRotator(world.q, pitch, yaw, roll);
+    return Call(actor, "K2_SetActorLocationAndRotation").set("NewLocation", world.t)
+        .set("NewRotation", FRotator{pitch, yaw, roll}).setBool("bSweep", false).setBool("bTeleport", true).invoke();
 }
 
 UObject* SpawnMeshActor(UObject* context, const FVector& at) {
@@ -851,6 +1183,7 @@ void DestroyMeshAvatar(Avatar& avatar) {
 }
 
 void DestroyAvatar() {
+    DestroyGear();
     DestroyMeshAvatar(g_avatar);
     g_remoteAppearance.Clear();
 }
@@ -925,6 +1258,28 @@ void FindLocalBike(UObject* pawn) {
     }
 }
 
+// Socket-mounted parts hang off whichever chassis body is visible so they follow its bones.
+void AttachBikeParts() {
+    UObject* chassis = g_bike.posing && IsLive(g_bike.pose) ? g_bike.pose : g_bike.component;
+    for (const auto& part : g_bike.attachments) {
+        if (part.mastered) continue;
+        bool attached = Call(part.actor, "K2_AttachRootComponentTo").set("InParent", chassis).set("InSocketName", part.socket)
+            .set("AttachLocationType", static_cast<uint8_t>(2)).invoke() &&
+            Call(part.actor, "K2_SetActorRelativeLocation").set("NewRelativeLocation", part.location).invoke() &&
+            Call(part.actor, "K2_SetActorRelativeRotation").set("NewRelativeRotation", part.rotation).invoke() &&
+            Call(part.actor, "SetActorRelativeScale3D").set("NewRelativeScale", part.scale).invoke();
+        if (!attached) Log("bike: could not mount %s at %s", Name(Prop(part.component, "SkeletalMesh")).c_str(),
+                           NameString(part.socket.index).c_str());
+    }
+}
+
+std::vector<UObject*> MasteredBikeParts() {
+    std::vector<UObject*> parts;
+    for (const auto& part : g_bike.attachments)
+        if (part.mastered) parts.push_back(part.component);
+    return parts;
+}
+
 bool SpawnBike(UObject* pawn, const FVector& at) {
     auto source = Prop(g_localBike, "VehicleMesh");
     if (!IsLive(source)) return false;
@@ -936,29 +1291,48 @@ bool SpawnBike(UObject* pawn, const FVector& at) {
         return false;
     }
     g_bike.source = Prop(source, "SkeletalMesh");
-    std::vector<UObject*> copied{g_bike.source};
+    AttachPoseable(g_bike.actor, g_bike.component, source, g_bike.pose, g_bike.writer, "bike");
+    int mastered = 0, mounted = 0;
     for (auto component : OwnedMeshes(g_nativeBikeMeshes, g_localBike, Now())) {
         if (!IsLive(component) || component == source) continue;
         auto mesh = Prop(component, "SkeletalMesh");
-        if (!IsLive(mesh) || std::find(copied.begin(), copied.end(), mesh) != copied.end()) continue;
-        auto part = SpawnMeshActor(pawn, at);
-        auto destination = Prop(part, "SkeletalMeshComponent");
-        if (!IsLive(destination) || !CopyMeshAppearance(component, destination)) {
-            if (IsLive(part)) Call(part, "K2_DestroyActor").invoke();
+        Call visible(component, "IsVisible");
+        if (!IsLive(mesh) || !visible.invoke() || !visible.get<bool>("ReturnValue")) continue;
+        auto actor = SpawnMeshActor(pawn, at);
+        BikePart part;
+        part.actor = actor;
+        part.component = Prop(actor, "SkeletalMeshComponent");
+        if (!IsLive(part.component) || !CopyMeshAppearance(component, part.component)) {
+            if (IsLive(actor)) Call(actor, "K2_DestroyActor").invoke();
             Log("bike: could not clone part %s", Name(mesh).c_str());
             DestroyBike();
             return false;
         }
-        if (!Call(part, "K2_AttachRootComponentToActor").set("InParentActor", g_bike.actor)
-                .set("AttachLocationType", static_cast<uint8_t>(2)).invoke() ||
-            !Call(destination, "SetMasterPoseComponent").set("NewMasterBoneComponent", g_bike.component).invoke()) {
-            Call(part, "K2_DestroyActor").invoke();
-            DestroyBike();
-            return false;
+        g_bike.parts.push_back(actor);
+        // Parts either share the chassis skeleton (master pose) or are rigid pieces mounted on a chassis socket.
+        part.mastered = WeakProp(component, "MasterPoseComponent") == source;
+        if (part.mastered) {
+            if (!Call(actor, "K2_AttachRootComponentToActor").set("InParentActor", g_bike.actor)
+                    .set("AttachLocationType", static_cast<uint8_t>(2)).invoke() ||
+                !Call(part.component, "SetMasterPoseComponent").set("NewMasterBoneComponent", g_bike.component).invoke()) {
+                Log("bike: could not slave part %s", Name(mesh).c_str());
+                DestroyBike();
+                return false;
+            }
+            ++mastered;
+        } else {
+            GetProp(component, "AttachSocketName", part.socket);
+            GetProp(component, "RelativeLocation", part.location);
+            GetProp(component, "RelativeRotation", part.rotation);
+            GetProp(component, "RelativeScale3D", part.scale);
+            if (Prop(component, "AttachParent") != source)
+                Log("bike: part %s is mounted on %s; approximating on the chassis", Name(mesh).c_str(),
+                    Name(Prop(component, "AttachParent")).c_str());
+            ++mounted;
         }
-        copied.push_back(mesh);
-        g_bike.parts.push_back(part);
+        g_bike.attachments.push_back(part);
     }
+    AttachBikeParts();
     auto animation = FindObject("/Game/Vehicles/BikeHero/bike_basic_anim.bike_basic_anim", C.animSequence);
     if (!animation || !Call(g_bike.component, "PlayAnimation").set("NewAnimToPlay", animation)
             .setBool("bLooping", true).invoke() || !Call(g_bike.component, "Stop").invoke()) {
@@ -966,7 +1340,8 @@ bool SpawnBike(UObject* pawn, const FVector& at) {
         DestroyBike();
         return false;
     }
-    Log("bike: cloned chassis and %d modular parts", static_cast<int>(g_bike.parts.size()));
+    Log("bike: cloned chassis, %d skeleton-shared parts and %d socket-mounted parts; streamed pose %s", mastered, mounted,
+        g_bike.pose ? "ready" : "unavailable");
     return true;
 }
 
@@ -986,8 +1361,25 @@ void UpdateBike(UObject* pawn, double now) {
         g_lastBikeSpawn = now;
         if (!SpawnBike(pawn, position)) return;
     }
+    PoseFrame frame;
+    bool streamed = g_bike.pose && now - g_lastBikePose < kPoseFresh &&
+        g_bikePoses.Sample(g_motion.SenderMs(), frame) && g_bike.writer.Apply(frame);
+    bool wasPosing = g_bike.posing;
+    SetPosing(streamed, g_bike.posing, g_bike.pose, g_bike.component, MasteredBikeParts());
+    if (wasPosing != g_bike.posing) {
+        AttachBikeParts();
+        Log("bike: %s", g_bike.posing ? "following the partner's streamed chassis" : "chassis stream stale; neutral pose");
+    }
     Call(g_bike.actor, "K2_SetActorLocationAndRotation").set("NewLocation", position).set("NewRotation", sample.bikeRotation)
         .setBool("bSweep", false).setBool("bTeleport", true).invoke();
+    if (!g_bike.posing) return;
+    for (const auto& part : g_bike.attachments) {
+        if (part.mastered) continue;
+        BonePose offset;
+        RotatorToQuat(part.rotation.pitch, part.rotation.yaw, part.rotation.roll, offset.q);
+        offset.t = part.location;
+        FollowSocket(part.actor, g_bike.pose, part.socket, offset);
+    }
 }
 
 bool Alive(UObject* pawn) {
@@ -1221,6 +1613,14 @@ bool DebugSpawn(size_t count, double now) {
         auto pawn = spawn.get<UObject*>("ReturnValue");
         if (!IsLive(pawn)) return DebugError("Native AI spawn returned no live pawn; no ambient actors were adopted");
         auto controller = Prop(pawn, "Controller");
+        // The population system normally assigns a look; bare spawns render nothing without one.
+        auto body = Prop(pawn, "Mesh");
+        if (IsLive(body) && !Prop(body, "SkeletalMesh")) {
+            static UObject* meshClass = FindClass("SkeletalMesh");
+            auto look = FindObject("/Game/Characters/Freaker/Swarmer/parts_combo/swarmer_horde_c.swarmer_horde_c", meshClass);
+            bool dressed = look && Call(body, "SetSkeletalMesh").set("NewMesh", look).invoke();
+            Log("debug: test pawn look %s", dressed ? "set to the pooled horde swarmer mesh" : "unavailable; it stays invisible");
+        }
         g_debug.enemies.push_back({RetainObject(pawn), RetainObject(controller),
             {position.x + origin.x, position.y + origin.y, position.z + origin.z}});
         Log("debug: spawned owned pawn=%s controller=%s", FullName(pawn).c_str(),
@@ -1258,6 +1658,33 @@ bool DebugProbe(bool player) {
         before, after, damage.get<float>("ReturnValue"));
     if (protectedPlayer ? after != before : after >= before)
         return DebugError("Damage probe did not produce the required health outcome; inspect the runtime log");
+    return true;
+}
+
+// Host-only world tests: the client must follow through the regular world-state stream.
+bool DebugWorld(bool weather) {
+    if (!g_cfg.peerHost.empty()) return DebugError("World tests run on the host; the client follows the host");
+    UObject* manager = FindWorldManager();
+    WorldSnapshot current{};
+    if (!WorldSyncAllowed(manager) || !ReadWorldSnapshot(manager, current))
+        return DebugError("World state is unavailable during missions or cinematics");
+    if (!weather) {
+        float target = std::fmod(current.timeOfDay + 6.0f, 24.0f);
+        if (!Call(manager, "SetWorldTimeOfDay").set("TimeOfDay", target).setBool("CanAdvanceDay", false).invoke())
+            return DebugError("SetWorldTimeOfDay failed");
+        Log("debug: host time %.3f -> %.3f", current.timeOfDay, target);
+        return true;
+    }
+    bool transitioning = true;
+    if (!GetProp(manager, "IsWeatherTransitioning", transitioning) || transitioning)
+        return DebugError("Weather is transitioning; retry in a moment");
+    uint8_t target = static_cast<uint8_t>((current.weather + 1) % 4);
+    if (!Call(manager, "SelectWorldWeather").set("NewWeather", target)
+            .set("NewWeatherTransitionRate", current.transitionRate).set("RelativeTime", current.relativeTime).invoke())
+        return DebugError("SelectWorldWeather failed");
+    WorldSnapshot after{};
+    ReadWorldSnapshot(manager, after);
+    Log("debug: host weather %u -> %u (now %u)", current.weather, target, after.weather);
     return true;
 }
 
@@ -1336,6 +1763,8 @@ void UpdateDebugTools(double now) {
             case DebugCommand::spawnPack: success = DebugSpawn(kDebugPackSize, now); break;
             case DebugCommand::probePlayer: success = DebugProbe(true); break;
             case DebugCommand::probeEnemy: success = DebugProbe(false); break;
+            case DebugCommand::timeShift: success = DebugWorld(false); break;
+            case DebugCommand::weatherNext: success = DebugWorld(true); break;
             default: success = DebugError("Debug command is unavailable in the current session"); break;
         }
     }
@@ -1757,9 +2186,43 @@ bool SpawnAvatar(UObject* localPawn, const FVector& at, Avatar& avatar) {
         avatar.parts.push_back(part);
         Log("avatar: part %s", Name(partMesh).c_str());
     }
-    Log("avatar: spawned %s with mesh %s and %d extra parts", Name(avatar.actor).c_str(),
-        Name(skeletal).c_str(), static_cast<int>(avatar.parts.size()));
+    AttachPoseable(avatar.actor, avatar.component, localMesh, avatar.pose, avatar.writer, "avatar");
+    Log("avatar: spawned %s with mesh %s, %d extra parts, streamed pose %s", Name(avatar.actor).c_str(),
+        Name(skeletal).c_str(), static_cast<int>(avatar.parts.size()), avatar.pose ? "ready" : "unavailable");
     return true;
+}
+
+// Adds a hidden poseable copy of `source` under `actor`; on failure the clip-driven `fallback` stays in use.
+void AttachPoseable(UObject* actor, UObject* fallback, UObject* source, UObject*& pose, PoseWriter& writer, const char* label) {
+    pose = CreatePoseableComponent(actor);
+    if (pose && CopyMeshAppearance(source, pose) && writer.Attach(pose) &&
+        Call(pose, "SetVisibility").setBool("bNewVisibility", false).setBool("bPropagateToChildren", false).invoke()) {
+        Log("%s: poseable body %s with %d bones (array +0x%x)", label, Name(pose).c_str(),
+            static_cast<int>(writer.Table().names.size()),
+            writer.Offset());
+        return;
+    }
+    Log("%s: streamed pose unavailable; keeping animation clips", label);
+    if (IsLive(pose)) Call(actor, "K2_DestroyComponent").set("Component", pose).invoke();
+    if (IsLive(fallback)) Call(fallback, "SetVisibility").setBool("bNewVisibility", true).setBool("bPropagateToChildren", false).invoke();
+    pose = nullptr;
+    writer.Reset();
+}
+
+// Swaps which body renders; slaved parts follow whichever component is visible.
+bool SetPosing(bool on, bool& posing, UObject* pose, UObject* fallback, const std::vector<UObject*>& masteredParts) {
+    if (on == posing || (on && !IsLive(pose))) return posing;
+    posing = on;
+    if (IsLive(pose))
+        Call(pose, "SetVisibility").setBool("bNewVisibility", on).setBool("bPropagateToChildren", false).invoke();
+    Call(fallback, "SetVisibility").setBool("bNewVisibility", !on).setBool("bPropagateToChildren", false).invoke();
+    for (auto part : masteredParts)
+        Call(part, "SetMasterPoseComponent").set("NewMasterBoneComponent", on ? pose : fallback).invoke();
+    return posing;
+}
+
+UObject* AvatarBody() {
+    return g_avatar.posing && IsLive(g_avatar.pose) ? g_avatar.pose : g_avatar.component;
 }
 
 void SetAvatarHidden(bool hidden) {
@@ -1875,10 +2338,10 @@ bool AnchorRemotePassenger(FVector& location, float& yaw, double now) {
     }
     if (!g_avatar.pelvis.index) {
         std::string names;
-        g_avatar.pelvis = HipBone(g_avatar.component, names);
+        g_avatar.pelvis = HipBone(AvatarBody(), names);
         if (!g_avatar.pelvis.index) return false;
     }
-    Call seat(g_avatar.seatMesh, "GetSocketLocation"), hip(g_avatar.component, "GetSocketTransform");
+    Call seat(g_avatar.seatMesh, "GetSocketLocation"), hip(AvatarBody(), "GetSocketTransform");
     Call facing(Prop(g_pawn, "Mesh"), "K2_GetComponentRotation");
     if (!seat.set("InSocketName", g_avatar.seatSocket).invoke() ||
         !hip.set("InSocketName", g_avatar.pelvis).set("TransformSpace", static_cast<uint8_t>(2)).invoke() ||
@@ -1907,7 +2370,22 @@ void UpdateAvatar(UObject* localPawn, double now) {
         if (!SpawnAvatar(localPawn, local, g_avatar)) return;
         g_avatar.lastShotSequence = s.shotSequence;
     }
-    AnimateAvatar(s, now);
+    PoseFrame frame;
+    bool streamed = g_avatar.pose && now - g_lastBodyPose < kPoseFresh &&
+        g_bodyPoses.Sample(g_motion.SenderMs(), frame) && g_avatar.writer.Apply(frame);
+    std::vector<UObject*> mastered;
+    for (auto part : g_avatar.parts) mastered.push_back(Prop(part, "SkeletalMeshComponent"));
+    bool wasPosing = g_avatar.posing;
+    SetPosing(streamed, g_avatar.posing, g_avatar.pose, g_avatar.component, mastered);
+    if (wasPosing != g_avatar.posing) {
+        Log("avatar: %s", g_avatar.posing ? "following the partner's streamed skeleton" : "pose stream stale; using animation clips");
+        g_avatar.pelvis = {};
+        g_avatar.currentAnim = nullptr;
+    }
+    if (!g_avatar.posing) AnimateAvatar(s, now);
+    FRotator facing{0, s.yaw, 0};
+    if (g_avatar.posing)
+        if (auto root = FindBone(frame, kRootBoneHash)) QuatToRotator(root->q, facing.pitch, facing.yaw, facing.roll);
     if (s.flags & kPassenger) {
         if (!AnchorRemotePassenger(local, s.yaw, now)) {
             constexpr const char* error = "Partner passenger seat unavailable; waiting for the local bike";
@@ -1920,7 +2398,8 @@ void UpdateAvatar(UObject* localPawn, double now) {
     }
     SetAvatarHidden(false);
     Call move(g_avatar.actor, "K2_SetActorLocationAndRotation");
-    move.set("NewLocation", local).set("NewRotation", FRotator{0, s.yaw, 0});
+    if (s.flags & kPassenger) facing = FRotator{0, s.yaw, 0};
+    move.set("NewLocation", local).set("NewRotation", facing);
     bool moved = move.setBool("bSweep", false).setBool("bTeleport", true).invoke();
     MenuSettings remoteSettings;
     remoteSettings.jacket = g_peer.jacket;
@@ -1931,6 +2410,7 @@ void UpdateAvatar(UObject* localPawn, double now) {
     if (now - lastAppearance >= 0.25) {
         lastAppearance = now;
         g_remoteAppearance.Apply(g_avatar.component, remoteSettings);
+        if (IsLive(g_avatar.pose)) g_remoteAppearance.Apply(g_avatar.pose, remoteSettings);
         for (auto part : g_avatar.parts) g_remoteAppearance.Apply(Prop(part, "SkeletalMeshComponent"), remoteSettings);
     }
     if (now - g_lastStatus >= 10.0) {
@@ -1945,12 +2425,607 @@ void UpdateAvatar(UObject* localPawn, double now) {
         project.set("WorldLocation", FVector{a.x, a.y, a.z + 100.f});
         bool onScreen = project.invoke() && project.get<bool>("ReturnValue");
         struct Vec2 { float x, y; } screen = onScreen ? project.get<Vec2>("ScreenLocation") : Vec2{-1, -1};
-        Call visible(g_avatar.component, "IsVisible");
+        Call visible(AvatarBody(), "IsVisible");
         int vis = visible.invoke() ? visible.get<bool>("ReturnValue") : -1;
         Log("status: partner %s at (%.0f %.0f %.0f) moved=%d, avatar at (%.0f %.0f %.0f), you at (%.0f %.0f %.0f) "
             "origin (%.0f %.0f %.0f) anim=%s actions=0x%x weapon=%u shot=%u screen=(%.0f %.0f) visible=%d",
             g_remoteName.c_str(), local.x, local.y, local.z, moved, a.x, a.y, a.z, m.x, m.y, m.z, origin.x, origin.y,
-            origin.z, Name(g_avatar.currentAnim).c_str(), s.actions, s.weaponType, s.shotSequence, screen.x, screen.y, vis);
+            origin.z, g_avatar.posing ? "streamed" : Name(g_avatar.currentAnim).c_str(), s.actions, s.weaponType, s.shotSequence, screen.x, screen.y, vis);
+    }
+}
+
+// Host-to-client enemy replication. The host streams the evaluated skeletons of AI pawns near either
+// player; the client renders poseable copies. Replicas are visual only: they have no AI or collision.
+struct EnemySource {
+    UObject* pawn = nullptr;
+    uint32_t entity = 0;
+    UObject* mesh = nullptr;
+    UObject* asset = nullptr;
+    BoneTable table;
+    PoseReader reader;
+    std::vector<int> subset;
+    std::vector<uint32_t> names;
+    std::vector<BonePose> all, bones;
+    std::vector<std::string> paths;
+    double lastInfo = -10;
+};
+struct EnemyReplica {
+    UObject* actor = nullptr;
+    UObject* pose = nullptr;
+    std::vector<UObject*> parts;
+    PoseWriter writer;
+    PoseBuffer poses;
+    std::vector<std::string> paths;
+    double lastInfo = -10, lastSpawnAttempt = -10;
+    bool missingLogged = false;
+};
+std::vector<EnemySource> g_enemySources;
+std::unordered_map<uint32_t, EnemyReplica> g_enemyReplicas;
+uint32_t g_nextEnemyEntity = 1;
+double g_nextEnemySend = 0;
+struct EnemyStats {
+    uint64_t sent = 0, bytes = 0, infos = 0, reads = 0, applied = 0, rejected = 0;
+    double readTime = 0;
+} g_enemyStats;
+constexpr size_t kEnemyMaxReplicas = 32;
+
+bool EnemyReplicationActive(double now) {
+    return g_settings.enemies && now - g_lastRecv < kPeerTimeout;
+}
+
+// "Package.Asset" path that FindObject resolves on the other machine.
+std::string AssetPath(UObject* asset) {
+    if (!IsLive(asset) || !asset->outer || asset->outer->outer) return {};
+    return Name(asset->outer) + "." + Name(asset);
+}
+
+// ---- Held item mirroring --------------------------------------------------------------------------------------
+
+struct RemoteGear {
+    GearPacket desc{};
+    bool have = false;
+    double lastInfo = -10, lastAttempt = -10;
+    UObject* actor = nullptr;
+    UObject* component = nullptr;
+    UObject* parent = nullptr;
+    bool hidden = false, missingLogged = false;
+} g_gear;
+struct LocalGear {
+    GearPacket packet{};
+    bool valid = false;
+    double lastSent = -10;
+    UObject* loggedItem = nullptr;
+    bool loggedOk = false;
+    int32_t loggedSocket = 0;
+} g_localGear;
+
+void DestroyGear() {
+    if (IsLive(g_gear.actor)) Call(g_gear.actor, "K2_DestroyActor").invoke();
+    g_gear.actor = g_gear.component = g_gear.parent = nullptr;
+    g_gear.hidden = false;
+}
+
+
+// Finds the socket on `body` that the item's attach chain hangs from.
+bool GearSocket(UObject* item, UObject* body, FName& socket) {
+    UObject* node = item;
+    for (int depth = 0; depth < 8 && IsLive(node); ++depth) {
+        UObject* parent = Prop(node, "AttachParent");
+        if (!parent) {
+            Call get(node, "GetAttachParent");
+            if (get.invoke()) parent = get.get<UObject*>("ReturnValue");
+        }
+        if (parent == body) {
+            if (GetProp(node, "AttachSocketName", socket)) return true;
+            Call name(node, "GetAttachSocketName");
+            if (!name.invoke()) return false;
+            socket = name.get<FName>("ReturnValue");
+            return true;
+        }
+        node = parent;
+    }
+    return false;
+}
+
+bool DescribeGear(UObject* pawn, GearPacket& out) {
+    static UObject* staticComponent = FindClass("StaticMeshComponent");
+    auto none = [&] { return EncodeGear(g_session, kGearNone, {}, 0, {}, nullptr, nullptr, nullptr, out); };
+    UObject* body = IsA(pawn, C.character) ? Prop(pawn, "Mesh") : nullptr;
+    Call held(pawn, "GetEquippedItemCurrentlyInHand");
+    UObject* item = held.invoke() ? held.get<UObject*>("ReturnValue") : nullptr;
+    if (!IsLive(item) || !IsLive(body)) {
+        if (g_localGear.loggedItem) Log("gear: hands empty");
+        g_localGear.loggedItem = nullptr;
+        return none();
+    }
+    Call meshCall(item, "GetItemMesh");
+    UObject* mesh = meshCall.invoke() ? meshCall.get<UObject*>("ReturnValue") : nullptr;
+    if (!IsLive(mesh)) mesh = Prop(item, "Mesh");
+    uint8_t kind = kGearNone;
+    UObject* asset = nullptr;
+    if (IsLive(mesh) && IsA(mesh, C.skelMeshComponent)) {
+        kind = kGearSkeletal;
+        asset = Prop(mesh, "SkeletalMesh");
+    } else if (IsLive(mesh) && staticComponent && IsA(mesh, staticComponent)) {
+        kind = kGearStatic;
+        asset = Prop(mesh, "StaticMesh");
+    }
+    std::string path = AssetPath(asset);
+    FName socket{};
+    FTransform socketWorld{}, itemWorld{};
+    bool ok = kind != kGearNone && !path.empty() && GearSocket(mesh, body, socket) && socket.index &&
+              WorldTransform(body, socket, socketWorld) && WorldTransform(mesh, FName{0, 0}, itemWorld);
+    if (item != g_localGear.loggedItem || ok != g_localGear.loggedOk || socket.index != g_localGear.loggedSocket) {
+        g_localGear.loggedItem = item;
+        g_localGear.loggedOk = ok;
+        g_localGear.loggedSocket = socket.index;
+        Log("gear: holding %s mesh=%s socket=%s%s", Name(item).c_str(), path.empty() ? "-" : path.c_str(),
+            socket.index ? NameString(socket.index).c_str() : "-", ok ? "" : " (not mirrored)");
+    }
+    if (!ok) return none();
+    BonePose offset = RelativePose(AsPose(itemWorld), AsPose(socketWorld));
+    float t[3] = {offset.t.x, offset.t.y, offset.t.z};
+    auto ratio = [](float a, float b) { return std::fabs(b) > 1e-4f ? std::fabs(a / b) : 1.f; };
+    float scale[3] = {ratio(itemWorld.scale.x, socketWorld.scale.x), ratio(itemWorld.scale.y, socketWorld.scale.y),
+                      ratio(itemWorld.scale.z, socketWorld.scale.z)};
+    return EncodeGear(g_session, kind, NameString(socket.index), static_cast<uint32_t>(socket.number), path, offset.q, t,
+                      scale, out);
+}
+
+void SendGear(UObject* pawn, double now) {
+    GearPacket packet;
+    if (!DescribeGear(pawn, packet)) return;
+    bool changed = !g_localGear.valid || !SameGear(packet, g_localGear.packet);
+    if (!changed && now - g_localGear.lastSent < kGearInterval) return;
+    g_localGear.packet = packet;
+    g_localGear.valid = true;
+    g_localGear.lastSent = now;
+    g_net.SendRaw(&packet, sizeof packet);
+}
+
+void ReceiveGear(const char* data, int len, double now) {
+    GearPacket packet;
+    if (!DecodeGear(data, len, packet) || packet.session != g_peer.session || !g_peer.session) return;
+    if (!g_gear.have || !SameGear(packet, g_gear.desc)) {
+        bool sameAsset = g_gear.have && g_gear.desc.kind == packet.kind && !std::strcmp(g_gear.desc.path, packet.path);
+        if (!sameAsset) {
+            DestroyGear();
+            g_gear.missingLogged = false;
+            g_gear.lastAttempt = -10;
+            if (packet.kind != kGearNone) Log("gear: peer holds %s at %s", packet.path, packet.socket);
+        }
+        g_gear.parent = nullptr; // re-mount with the new offset
+    }
+    g_gear.desc = packet;
+    g_gear.have = true;
+    g_gear.lastInfo = now;
+}
+
+// Days Gone fades fresh meshes in through per-instance materials, so asset defaults can stay invisible. Borrow
+// the materials of a live component that already shows the same asset (usually the local player's own copy).
+// The scan walks the whole object array (~80 ms), so remember each asset's donor while it stays valid.
+UObject* LiveMeshUser(UObject* asset, bool skeletal, UObject* exclude) {
+    static std::unordered_map<UObject*, UObject*> donors;
+    const char* property = skeletal ? "SkeletalMesh" : "StaticMesh";
+    if (auto cached = donors.find(asset); cached != donors.end()) {
+        UObject* o = cached->second;
+        if (o != exclude && IsLive(o) && Prop(o, property) == asset) return o;
+        donors.erase(cached);
+    }
+    static UObject* staticComponent = FindClass("StaticMeshComponent");
+    UObject* cls = skeletal ? C.skelMeshComponent : staticComponent;
+    UObject* found = nullptr;
+    for (int32_t i = 0, n = ObjectCount(); i < n && !found; ++i) {
+        auto o = ObjectAt(i);
+        if (!o || o == exclude || !IsLive(o) || IsDefaultOrArchetype(o) || !IsA(o, cls) || Prop(o, property) != asset) continue;
+        Call visible(o, "IsVisible");
+        if (visible.invoke() && visible.get<bool>("ReturnValue")) found = o;
+    }
+    if (found) donors[asset] = found;
+    return found;
+}
+
+int CopyMaterials(UObject* from, UObject* to) {
+    Call count(from, "GetNumMaterials");
+    int n = count.invoke() ? count.get<int32_t>("ReturnValue") : 0, copied = 0;
+    for (int i = 0; i < n && i < 64; ++i) {
+        Call get(from, "GetMaterial");
+        if (!get.set("ElementIndex", i).invoke()) continue;
+        auto material = get.get<UObject*>("ReturnValue");
+        if (IsLive(material) && Call(to, "SetMaterial").set("ElementIndex", i).set("Material", material).invoke()) ++copied;
+    }
+    return copied;
+}
+
+bool SpawnGear(UObject* context, const FVector& at) {
+    static UObject* skeletalClass = FindClass("SkeletalMesh");
+    static UObject* staticClass = FindClass("StaticMesh");
+    bool skeletal = g_gear.desc.kind == kGearSkeletal;
+    UObject* asset = FindObject(g_gear.desc.path, skeletal ? skeletalClass : staticClass);
+    if (!IsLive(asset)) {
+        if (!g_gear.missingLogged) Log("gear: %s is not loaded here; not shown", g_gear.desc.path);
+        g_gear.missingLogged = true;
+        return false;
+    }
+    g_gear.actor = SpawnMeshActor(context, at);
+    UObject* carrier = Prop(g_gear.actor, "SkeletalMeshComponent");
+    if (skeletal) {
+        if (Call(carrier, "SetSkeletalMesh").set("NewMesh", asset).invoke()) g_gear.component = carrier;
+    } else {
+        UObject* component = CreateRuntimeComponent(g_gear.actor, "StaticMeshComponent");
+        if (IsLive(component) && Call(component, "SetStaticMesh").set("NewMesh", asset).invoke()) g_gear.component = component;
+        Call(g_gear.actor, "SetActorEnableCollision").setBool("bNewActorEnableCollision", false).invoke();
+    }
+    if (!IsLive(g_gear.component) || Prop(g_gear.component, skeletal ? "SkeletalMesh" : "StaticMesh") != asset) {
+        if (!g_gear.missingLogged) Log("gear: could not build %s", g_gear.desc.path);
+        g_gear.missingLogged = true;
+        DestroyGear();
+        return false;
+    }
+    double started = Now();
+    UObject* donor = LiveMeshUser(asset, skeletal, g_gear.component);
+    int copied = donor ? CopyMaterials(donor, g_gear.component) : 0;
+    Call first(g_gear.component, "GetMaterial");
+    UObject* material = first.set("ElementIndex", 0).invoke() ? first.get<UObject*>("ReturnValue") : nullptr;
+    Log("gear: showing %s; %d materials from %s (%.1f ms), slot 0 %s", g_gear.desc.path, copied,
+        donor ? FullName(donor).c_str() : "asset defaults", (Now() - started) * 1000, FullName(material).c_str());
+    return true;
+}
+
+void UpdateGear(UObject* localPawn, double now) {
+    UObject* body = AvatarBody();
+    bool want = g_gear.have && g_gear.desc.kind != kGearNone && now - g_gear.lastInfo < kPeerTimeout &&
+                IsLive(g_avatar.actor) && IsLive(body) && IsLive(localPawn);
+    if (!want) {
+        if (g_gear.actor) DestroyGear();
+        return;
+    }
+    if (!IsLive(g_gear.actor)) {
+        g_gear.actor = nullptr;
+        if (now - g_gear.lastAttempt < kGearRetry) return;
+        g_gear.lastAttempt = now;
+        Call location(g_avatar.actor, "K2_GetActorLocation");
+        if (!location.invoke() || !SpawnGear(localPawn, location.get<FVector>("ReturnValue"))) return;
+        g_gear.parent = nullptr;
+    }
+    if (g_gear.parent != body) {
+        int32_t index = FindNameIndex(g_gear.desc.socket);
+        FName socket{index, static_cast<int32_t>(g_gear.desc.socketNumber)};
+        float pitch = 0, yaw = 0, roll = 0;
+        QuatToRotator(g_gear.desc.q, pitch, yaw, roll);
+        bool mounted = index >= 0 &&
+            Call(g_gear.actor, "K2_AttachRootComponentTo").set("InParent", body).set("InSocketName", socket)
+                .set("AttachLocationType", static_cast<uint8_t>(2)).invoke() &&
+            Call(g_gear.actor, "K2_SetActorRelativeLocation")
+                .set("NewRelativeLocation", FVector{g_gear.desc.t[0], g_gear.desc.t[1], g_gear.desc.t[2]}).invoke() &&
+            Call(g_gear.actor, "K2_SetActorRelativeRotation").set("NewRelativeRotation", FRotator{pitch, yaw, roll}).invoke() &&
+            Call(g_gear.actor, "SetActorRelativeScale3D")
+                .set("NewRelativeScale", FVector{g_gear.desc.scale[0], g_gear.desc.scale[1], g_gear.desc.scale[2]}).invoke();
+        if (!mounted) {
+            Log("gear: could not mount %s at %s", g_gear.desc.path, g_gear.desc.socket);
+            DestroyGear();
+            g_gear.lastAttempt = now;
+            return;
+        }
+        g_gear.parent = body;
+    }
+    BonePose offset;
+    std::memcpy(offset.q, g_gear.desc.q, sizeof offset.q);
+    offset.t = {g_gear.desc.t[0], g_gear.desc.t[1], g_gear.desc.t[2]};
+    if (int32_t index = FindNameIndex(g_gear.desc.socket); index >= 0)
+        FollowSocket(g_gear.actor, body, FName{index, static_cast<int32_t>(g_gear.desc.socketNumber)}, offset);
+    if (g_gear.hidden != g_avatar.hidden) {
+        g_gear.hidden = g_avatar.hidden;
+        Call(g_gear.actor, "SetActorHiddenInGame").setBool("bNewHidden", g_gear.hidden).invoke();
+    }
+}
+
+// Walks the object array in slices so finding enemies never stalls a frame.
+struct EnemyScan {
+    int32_t cursor = 0;
+    std::vector<UObject*> pawns;
+    std::unordered_map<UObject*, std::vector<UObject*>> components;
+    std::unordered_map<UObject*, uint8_t> kinds; // class -> 0 other, 1 skeletal mesh component, 2 AI pawn
+    double time = 0;
+} g_enemyScan;
+
+bool ClassIsA(UObject* cls, UObject* base) {
+    for (auto c = cls; c && base; c = Super(c))
+        if (c == base) return true;
+    return false;
+}
+
+uint8_t EnemyClassKind(UObject* cls) {
+    static UObject* aiClass = FindClass("BendAIPawn");
+    auto [it, added] = g_enemyScan.kinds.try_emplace(cls, 0);
+    if (added) it->second = ClassIsA(cls, C.skelMeshComponent) ? 1 : ClassIsA(cls, aiClass) ? 2 : 0;
+    return it->second;
+}
+
+void FinishEnemyScan(UObject* pawn) {
+    Call me(pawn, "K2_GetActorLocation");
+    if (!me.invoke()) return;
+    FVector origin = WorldOrigin(pawn), at = me.get<FVector>("ReturnValue");
+    std::vector<FVector> players{{at.x + origin.x, at.y + origin.y, at.z + origin.z}};
+    if (g_peer.flags & kHasPawn) players.push_back({g_peer.pos[0], g_peer.pos[1], g_peer.pos[2]});
+    struct Candidate { UObject* pawn; float distance; };
+    std::vector<Candidate> found;
+    for (auto o : g_enemyScan.pawns) {
+        if (!IsLive(o) || !IsLive(Prop(Prop(o, "Mesh"), "SkeletalMesh"))) continue;
+        // Pooled pawns parked near the world origin are alive but have no controller.
+        Call alive(o, "IsAlive");
+        bool living = alive.invoke() && alive.get<bool>("ReturnValue");
+        if (living && !IsLive(Prop(o, "Controller"))) continue;
+        Call where(o, "K2_GetActorLocation");
+        if (!where.invoke()) continue;
+        auto p = where.get<FVector>("ReturnValue");
+        FVector world{p.x + origin.x, p.y + origin.y, p.z + origin.z};
+        float best = 1e30f;
+        for (const auto& player : players) {
+            float dx = world.x - player.x, dy = world.y - player.y, dz = world.z - player.z;
+            best = std::min(best, dx * dx + dy * dy + dz * dz);
+        }
+        if (best <= kEnemyRadius * kEnemyRadius) found.push_back({o, best});
+    }
+    std::sort(found.begin(), found.end(), [](const Candidate& a, const Candidate& b) { return a.distance < b.distance; });
+    if (found.size() > kEnemyMaxStreamed) found.resize(kEnemyMaxStreamed);
+    std::vector<EnemySource> next;
+    for (const auto& candidate : found) {
+        auto existing = std::find_if(g_enemySources.begin(), g_enemySources.end(),
+            [&](const EnemySource& e) { return e.pawn == candidate.pawn; });
+        EnemySource source;
+        if (existing != g_enemySources.end()) source = std::move(*existing);
+        else {
+            source.pawn = candidate.pawn;
+            source.entity = g_nextEnemyEntity++;
+            if (!g_nextEnemyEntity) g_nextEnemyEntity = 1;
+        }
+        auto mesh = Prop(candidate.pawn, "Mesh");
+        std::vector<std::string> paths{AssetPath(Prop(mesh, "SkeletalMesh"))};
+        for (auto part : g_enemyScan.components[candidate.pawn]) {
+            if (part == mesh || paths.size() == kEnemyMeshPaths || !IsLive(part) || !IsCharacterPart(part, mesh)) continue;
+            auto path = AssetPath(Prop(part, "SkeletalMesh"));
+            if (!path.empty() && std::find(paths.begin(), paths.end(), path) == paths.end()) paths.push_back(path);
+        }
+        if (paths[0].empty()) continue;
+        if (paths != source.paths) source.lastInfo = -10;
+        source.paths = std::move(paths);
+        next.push_back(std::move(source));
+    }
+    if (next.size() != g_enemySources.size())
+        Log("enemies: streaming %d of the host's AI pawns", static_cast<int>(next.size()));
+    g_enemySources = std::move(next);
+}
+
+void StepEnemyScan(UObject* pawn) {
+    double start = Now();
+    int32_t count = ObjectCount();
+    // A full pass takes about two seconds at 60 Hz; new enemies appear within that window.
+    int32_t end = std::min(count, g_enemyScan.cursor + std::max<int32_t>(2048, count / 120));
+    UObject* lastClass = nullptr;
+    uint8_t lastKind = 0;
+    for (int32_t i = g_enemyScan.cursor; i < end; ++i) {
+        auto o = ObjectAt(i);
+        if (!o || !o->cls || !o->outer || IsDefaultOrArchetype(o)) continue;
+        if (o->cls != lastClass) {
+            lastClass = o->cls;
+            lastKind = EnemyClassKind(lastClass);
+        }
+        uint8_t kind = lastKind;
+        if (kind == 1 && o->outer->cls && EnemyClassKind(o->outer->cls) == 2 && IsLive(o))
+            g_enemyScan.components[o->outer].push_back(o);
+        else if (kind == 2 && IsLive(o))
+            g_enemyScan.pawns.push_back(o);
+    }
+    g_enemyScan.cursor = end;
+    if (end >= count) {
+        FinishEnemyScan(pawn);
+        g_enemyScan.cursor = 0;
+        g_enemyScan.pawns.clear();
+        g_enemyScan.components.clear();
+    }
+    g_enemyScan.time += Now() - start;
+}
+
+void SendEnemy(EnemySource& e, const FVector& origin, uint32_t timeMs, double now) {
+    auto mesh = Prop(e.pawn, "Mesh");
+    auto asset = Prop(mesh, "SkeletalMesh");
+    if (!IsLive(e.pawn) || !IsLive(mesh) || !IsLive(asset)) return;
+    if (mesh != e.mesh || asset != e.asset || !e.table.Valid()) {
+        e.table = BoneTable{};
+        e.reader = PoseReader{};
+        if (!ReadBoneTable(mesh, e.table)) return;
+        e.mesh = mesh;
+        e.asset = asset;
+        std::vector<std::string> names;
+        for (auto name : e.table.names) names.push_back(NameString(name.index));
+        e.subset = EnemyBoneSubset(names, e.table.parents);
+        e.names.clear();
+        for (int i : e.subset) e.names.push_back(e.table.hashes[i]);
+        e.lastInfo = -10;
+        Log("enemies: %s streams %d of %d bones", Name(asset).c_str(), static_cast<int>(e.subset.size()),
+            static_cast<int>(names.size()));
+    }
+    if (e.subset.empty()) return;
+    if (now - e.lastInfo >= kEnemyInfoInterval) {
+        EnemyInfoPacket info;
+        if (EncodeEnemyInfo(g_session, e.entity, e.paths, info)) {
+            g_net.SendRaw(&info, sizeof info);
+            ++g_enemyStats.infos;
+            g_enemyStats.bytes += sizeof info;
+        }
+        e.lastInfo = now;
+    }
+    double start = Now();
+    bool read = e.reader.Read(mesh, e.table, static_cast<size_t>(e.subset.back()) + 1, e.all);
+    g_enemyStats.readTime += Now() - start;
+    ++g_enemyStats.reads;
+    Call location(mesh, "K2_GetComponentLocation"), rotation(mesh, "K2_GetComponentRotation");
+    if (!read || !location.invoke() || !rotation.invoke()) return;
+    e.bones.clear();
+    for (int i : e.subset) e.bones.push_back(e.all[i]);
+    auto at = location.get<FVector>("ReturnValue");
+    auto r = rotation.get<FRotator>("ReturnValue");
+    BonePose root;
+    RotatorToQuat(r.pitch, r.yaw, r.roll, root.q);
+    e.names.push_back(kRootBoneHash);
+    e.bones.push_back(root);
+    PoseHeader header{};
+    header.kind = kPoseEnemy;
+    header.session = g_session;
+    header.timeMs = timeMs;
+    header.entity = e.entity;
+    header.root[0] = at.x + origin.x;
+    header.root[1] = at.y + origin.y;
+    header.root[2] = at.z + origin.z;
+    header.yaw = r.yaw;
+    float health = 0;
+    GetProp(e.pawn, "Health", health);
+    header.health = std::isfinite(health) ? std::clamp(health, 0.f, 100000.f) : 0.f;
+    Call alive(e.pawn, "IsAlive");
+    if (alive.invoke() && alive.get<bool>("ReturnValue")) header.flags |= kPoseAlive;
+    EncodePose(header, e.names, e.bones, [](const PosePacket& packet, size_t size) {
+        g_net.SendRaw(&packet, static_cast<int>(size));
+        ++g_enemyStats.sent;
+        g_enemyStats.bytes += size;
+    });
+    e.names.pop_back();
+}
+
+void SendEnemies(UObject* pawn, double now) {
+    if (!g_cfg.peerHost.empty() || !pawn || !EnemyReplicationActive(now) || !(g_peer.flags & kSyncEnemies)) {
+        if (!g_enemySources.empty()) Log("enemies: stopped streaming");
+        g_enemySources.clear();
+        g_enemyScan.cursor = 0;
+        g_enemyScan.pawns.clear();
+        g_enemyScan.components.clear();
+        if (!pawn) g_enemyScan.kinds.clear();
+        return;
+    }
+    StepEnemyScan(pawn);
+    if (now < g_nextEnemySend) return;
+    g_nextEnemySend += kEnemySendInterval;
+    if (g_nextEnemySend <= now) g_nextEnemySend = now + kEnemySendInterval;
+    FVector origin = WorldOrigin(pawn);
+    auto timeMs = static_cast<uint32_t>(static_cast<uint64_t>(now * 1000.0));
+    for (auto& e : g_enemySources) SendEnemy(e, origin, timeMs, now);
+}
+
+void DestroyReplica(EnemyReplica& r) {
+    if (IsLive(r.actor)) Call(r.actor, "K2_DestroyActor").invoke();
+    r.actor = r.pose = nullptr;
+    r.parts.clear();
+    r.writer.Reset();
+}
+
+void DestroyEnemyReplicas() {
+    for (auto& [entity, replica] : g_enemyReplicas) DestroyReplica(replica);
+    if (!g_enemyReplicas.empty()) Log("enemies: removed %d replicas", static_cast<int>(g_enemyReplicas.size()));
+    g_enemyReplicas.clear();
+}
+
+bool AcceptEnemies(double now) {
+    return !g_cfg.peerHost.empty() && g_pawn && EnemyReplicationActive(now);
+}
+
+EnemyReplica* ReplicaFor(uint32_t entity) {
+    auto it = g_enemyReplicas.find(entity);
+    if (it != g_enemyReplicas.end()) return &it->second;
+    if (g_enemyReplicas.size() >= kEnemyMaxReplicas) return nullptr;
+    return &g_enemyReplicas[entity];
+}
+
+void ReceiveEnemyInfo(const char* data, int len, double now) {
+    EnemyInfoPacket info;
+    if (!DecodeEnemyInfo(data, len, info) || info.session != g_peer.session || !g_peer.session) {
+        ++g_enemyStats.rejected;
+        return;
+    }
+    if (!AcceptEnemies(now)) return;
+    auto replica = ReplicaFor(info.entity);
+    if (!replica) return;
+    std::vector<std::string> paths;
+    for (int i = 0; i < info.paths; ++i) paths.emplace_back(info.path[i]);
+    if (paths != replica->paths) {
+        DestroyReplica(*replica);
+        replica->paths = std::move(paths);
+        replica->missingLogged = false;
+        replica->lastSpawnAttempt = -10;
+    }
+    replica->lastInfo = now;
+}
+
+void ReceiveEnemyPose(const PosePacket& packet, double now) {
+    if (!AcceptEnemies(now)) return;
+    if (auto replica = ReplicaFor(packet.header.entity)) replica->poses.Push(packet, now);
+}
+
+bool SpawnReplica(UObject* context, EnemyReplica& r, uint32_t entity, const FVector& at) {
+    static UObject* meshClass = FindClass("SkeletalMesh");
+    std::vector<UObject*> assets;
+    for (const auto& path : r.paths) {
+        auto asset = FindObject(path.c_str(), meshClass);
+        if (!asset) {
+            if (!r.missingLogged) Log("enemies: replica %u skipped; %s is not loaded on this machine", entity, path.c_str());
+            r.missingLogged = true;
+            if (assets.empty()) return false;
+            continue;
+        }
+        assets.push_back(asset);
+    }
+    r.actor = SpawnMeshActor(context, at);
+    if (!r.actor) return false;
+    r.pose = CreatePoseableComponent(r.actor);
+    bool ok = r.pose && Call(r.pose, "SetSkeletalMesh").set("NewMesh", assets[0]).invoke() && r.writer.Attach(r.pose);
+    if (!ok) {
+        Log("enemies: replica %u could not create a poseable %s", entity, Name(assets[0]).c_str());
+        DestroyReplica(r);
+        return false;
+    }
+    for (size_t i = 1; i < assets.size(); ++i) {
+        auto part = CreatePoseableComponent(r.actor);
+        if (part && Call(part, "SetSkeletalMesh").set("NewMesh", assets[i]).invoke() &&
+            Call(part, "SetMasterPoseComponent").set("NewMasterBoneComponent", r.pose).invoke())
+            r.parts.push_back(part);
+    }
+    Log("enemies: replica %u %s with %d bones and %d parts", entity, Name(assets[0]).c_str(),
+        static_cast<int>(r.writer.Table().names.size()), static_cast<int>(r.parts.size()));
+    return true;
+}
+
+void UpdateEnemyReplicas(UObject* pawn, double now) {
+    if (!AcceptEnemies(now) || !pawn) {
+        DestroyEnemyReplicas();
+        return;
+    }
+    FVector origin = WorldOrigin(pawn);
+    double senderMs = g_motion.SenderMs();
+    for (auto it = g_enemyReplicas.begin(); it != g_enemyReplicas.end();) {
+        auto& r = it->second;
+        if (now - std::max(r.poses.LastArrival(), r.lastInfo) > kEnemyTimeout) {
+            if (IsLive(r.actor)) Log("enemies: replica %u expired", it->first);
+            DestroyReplica(r);
+            it = g_enemyReplicas.erase(it);
+            continue;
+        }
+        PoseFrame frame;
+        if (r.paths.empty() || !r.poses.Sample(senderMs, frame)) {
+            ++it;
+            continue;
+        }
+        FVector at{frame.root[0] - origin.x, frame.root[1] - origin.y, frame.root[2] - origin.z};
+        if (!IsLive(r.actor) && now - r.lastSpawnAttempt >= 1.0) {
+            r.lastSpawnAttempt = now;
+            SpawnReplica(pawn, r, it->first, at);
+        }
+        if (IsLive(r.actor)) {
+            FRotator facing{0, frame.yaw, 0};
+            if (auto root = FindBone(frame, kRootBoneHash)) QuatToRotator(root->q, facing.pitch, facing.yaw, facing.roll);
+            Call move(r.actor, "K2_SetActorLocationAndRotation");
+            move.set("NewLocation", at).set("NewRotation", facing).setBool("bSweep", false).setBool("bTeleport", true).invoke();
+            if (r.writer.Apply(frame)) ++g_enemyStats.applied;
+        }
+        ++it;
     }
 }
 
@@ -2054,6 +3129,7 @@ void Tick(bool hudFrame) {
         // The avatar may belong to the previous pawn's world; respawn it next to the new one.
         DestroyAvatar();
         DestroyBike();
+        DestroyEnemyReplicas();
         g_localBike = nullptr;
         g_localAppearance.Clear();
         ++g_consent;
@@ -2087,6 +3163,9 @@ void Tick(bool hudFrame) {
         SendLocalState(g_pawn, now);
     }
     UpdateAvatar(g_pawn, now);
+    UpdateGear(g_pawn, now);
+    SendEnemies(g_pawn, now);
+    UpdateEnemyReplicas(g_pawn, now);
     auto actions = g_menu.Update(g_controller, OwnWindowFocused(), g_settings);
     if (actions.passenger || actions.teleport) g_menu.Close(g_controller);
     if (actions.passenger) TogglePassenger(now);
@@ -2138,6 +3217,20 @@ void Tick(bool hudFrame) {
             static_cast<unsigned long long>(g_motion.Stats().held),
             static_cast<unsigned long long>(g_motion.Stats().resets), g_frameClock.Resyncs(),
             g_frameClock.Fallbacks());
+        Log("perf: pose sent=%.1f pkt/s %.1f kB/s recv=%.1f pkt/s rejected=%llu read mean=%.3fms avatar=%s bike=%s",
+            g_poseStats.sent / seconds, g_poseStats.bytes / seconds / 1024, g_poseStats.received / seconds,
+            static_cast<unsigned long long>(g_poseStats.rejected),
+            g_poseStats.reads ? g_poseStats.readTime * 1000 / g_poseStats.reads : 0,
+            g_avatar.posing ? "streamed" : "clips", g_bike.posing ? "streamed" : IsLive(g_bike.actor) ? "neutral" : "none");
+        if (!g_enemySources.empty() || !g_enemyReplicas.empty() || g_enemyStats.rejected)
+            Log("perf: enemies streamed=%d replicas=%d sent=%.1f pkt/s %.1f kB/s infos=%.1f/s applied=%.1f/s rejected=%llu read mean=%.3fms scan=%.2fms/s",
+                static_cast<int>(g_enemySources.size()), static_cast<int>(g_enemyReplicas.size()), g_enemyStats.sent / seconds,
+                g_enemyStats.bytes / seconds / 1024, g_enemyStats.infos / seconds, g_enemyStats.applied / seconds,
+                static_cast<unsigned long long>(g_enemyStats.rejected),
+                g_enemyStats.reads ? g_enemyStats.readTime * 1000 / g_enemyStats.reads : 0, g_enemyScan.time * 1000 / seconds);
+        g_enemyStats = {};
+        g_enemyScan.time = 0;
+        g_poseStats = {};
         profileStart = now;
         previousSent = g_seq;
         previousReceived = g_receivedStates;
@@ -2264,6 +3357,7 @@ bool Install(const std::wstring& basePath) {
     g_settings.capColor = palette(L"CapColor");
     g_settings.cap = GetPrivateProfileIntW(L"Coop", L"ShowCap", 1, ini.c_str()) != 0;
     g_settings.motorcycles = GetPrivateProfileIntW(L"Coop", L"SyncMotorcycles", 1, ini.c_str()) != 0;
+    g_settings.enemies = GetPrivateProfileIntW(L"Coop", L"SyncEnemies", 1, ini.c_str()) != 0;
     g_settings.passengers = GetPrivateProfileIntW(L"Coop", L"AllowPassenger", 1, ini.c_str()) != 0;
     if (g_cfg.port == 0 || g_cfg.port > 65535 || g_cfg.peerPort == 0 || g_cfg.peerPort > 65535) {
         Log("FATAL: Port and PeerPort must be between 1 and 65535");

@@ -14,6 +14,7 @@ struct MenuSettings {
     bool motorcycles = true;
     bool passengers = true;
     bool friendlyFire = false;
+    bool enemies = true;
 };
 
 struct MenuActions {

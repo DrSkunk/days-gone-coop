@@ -118,6 +118,30 @@ template <typename T> bool GetProp(UObject* obj, const char* name, T& out) {
     return true;
 }
 
+bool ReadableMemory(const void* p, size_t len);
+
+// Resolves a UFunction and its parameter offsets once, then reuses one parameter buffer.
+class BoundFunction {
+public:
+    bool Bind(UObject* cls, const char* function, std::initializer_list<const char*> params);
+    bool Ready() const { return fn_ != nullptr; }
+    template <typename T> void Set(size_t param, const T& value) {
+        std::memcpy(buf_.data() + offsets_[param], &value, sizeof(T));
+    }
+    template <typename T> T Get(size_t param) const {
+        T value{};
+        std::memcpy(&value, buf_.data() + offsets_[param], sizeof(T));
+        return value;
+    }
+    bool Invoke(UObject* target);
+
+private:
+    UObject* cls_ = nullptr;
+    UObject* fn_ = nullptr;
+    std::vector<uint8_t> buf_;
+    std::vector<int> offsets_;
+};
+
 // Builds a parameter buffer for a UFunction and calls it through ProcessEvent.
 class Call {
 public:

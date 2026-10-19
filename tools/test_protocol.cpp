@@ -4,11 +4,16 @@
 #include "../src/coop/motion.hpp"
 #include "../src/coop/frameclock.hpp"
 #include "../src/coop/debug_commands.hpp"
+#include "../src/coop/pose.hpp"
+#include "../src/coop/enemy.hpp"
+#include "../src/coop/gear.hpp"
 
 #include <cassert>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 #include <cstddef>
+#include <string>
 #include <vector>
 
 coop::StatePacket MovingPacket(uint32_t milliseconds, float speed = 1000) {
@@ -239,7 +244,247 @@ void TestDamageChannel() {
     assert(outgoing.Pending() == 0);
 }
 
+bool Near(float a, float b, float eps) { return std::fabs(a - b) <= eps; }
+
+bool SameRotation(const float a[4], const float b[4], float eps) {
+    float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    return std::fabs(std::fabs(dot) - 1.f) <= eps;
+}
+
+void TestPose() {
+    using namespace coop;
+    static_assert(sizeof(PosePacket) == 44 + 80 * 17 && sizeof(PosePacket) <= 1472, "pose packets fit one Ethernet frame");
+    assert(BoneHash("Spine") == BoneHash("spine") && BoneHash("spine") != BoneHash("spine1") && BoneHash("") != 0);
+    assert(kRootBoneHash == BoneHash("@ROOT"));
+
+    // Quantisation keeps translation within 0.01 cm and rotation within a tiny fraction of a degree.
+    for (int i = 0; i < 2000; ++i) {
+        BonePose bone;
+        float pitch = static_cast<float>((i * 37) % 360 - 180), yaw = static_cast<float>((i * 53) % 360 - 180),
+              roll = static_cast<float>((i * 71) % 360 - 180);
+        RotatorToQuat(pitch, yaw, roll, bone.q);
+        bone.t = {i * 0.317f - 300.f, 250.f - i * 0.21f, (i % 97) * 1.37f};
+        BonePose decoded;
+        assert(DecodeBone(EncodeBone(BoneHash("b"), bone), decoded));
+        assert(SameRotation(bone.q, decoded.q, 2e-6f));
+        assert(Near(decoded.t.x, bone.t.x, 0.0101f) && Near(decoded.t.y, bone.t.y, 0.0101f) && Near(decoded.t.z, bone.t.z, 0.0101f));
+    }
+    BonePose far;
+    far.t = {5000, -5000, 0};
+    BonePose clamped;
+    DecodeBone(EncodeBone(1, far), clamped);
+    assert(Near(clamped.t.x, 655.34f, 0.01f) && Near(clamped.t.y, -655.34f, 0.01f));
+
+    // Rotator <-> quaternion match Unreal's conventions away from gimbal lock.
+    for (float pitch : {-80.f, -30.f, 0.f, 45.f, 85.f})
+        for (float yaw : {-170.f, -90.f, 0.f, 33.f, 179.f})
+            for (float roll : {-120.f, 0.f, 15.f, 175.f}) {
+                float q[4], p, y, r;
+                RotatorToQuat(pitch, yaw, roll, q);
+                QuatToRotator(q, p, y, r);
+                assert(Near(p, pitch, 0.01f) && Near(std::remainder(y - yaw, 360.f), 0, 0.01f) &&
+                       Near(std::remainder(r - roll, 360.f), 0, 0.01f));
+            }
+    {
+        float q[4];
+        RotatorToQuat(0, 90, 0, q);
+        auto v = QuatRotate(q, {1, 0, 0});
+        assert(Near(v.x, 0, 1e-5f) && Near(v.y, 1, 1e-5f) && Near(v.z, 0, 1e-5f)); // +90 yaw turns X into Y
+    }
+
+    // Parent-relative poses recompose into component space.
+    BonePose parent, child;
+    RotatorToQuat(10, 40, -5, parent.q);
+    parent.t = {10, 20, 30};
+    RotatorToQuat(-25, 5, 60, child.q);
+    child.t = {-4, 50, 7};
+    auto local = RelativePose(child, parent);
+    auto composed = ComposePose(local, parent);
+    assert(SameRotation(composed.q, child.q, 1e-5f));
+    assert(Near(composed.t.x, child.t.x, 1e-3f) && Near(composed.t.y, child.t.y, 1e-3f) && Near(composed.t.z, child.t.z, 1e-3f));
+    auto mid = BlendPose(parent, child, 0.5f);
+    assert(Near(mid.t.x, 3, 1e-4f) && Near(mid.t.y, 35, 1e-4f));
+
+    // A 529-bone frame splits into seven validated chunks that reassemble regardless of arrival order.
+    std::vector<uint32_t> names;
+    std::vector<BonePose> bones;
+    for (int i = 0; i < 529; ++i) {
+        names.push_back(BoneHash("bone" + std::to_string(i)));
+        BonePose b;
+        b.t = {static_cast<float>(i), 0, 0};
+        bones.push_back(b);
+    }
+    auto make = [&](uint32_t timeMs, float offset, std::vector<std::vector<char>>& out) {
+        PoseHeader header{};
+        header.kind = kPoseBody;
+        header.session = 7;
+        header.timeMs = timeMs;
+        header.yaw = offset;
+        auto shifted = bones;
+        for (auto& b : shifted) b.t.y = offset;
+        out.clear();
+        assert(EncodePose(header, names, shifted, [&](const PosePacket& packet, size_t size) {
+            const char* bytes = reinterpret_cast<const char*>(&packet);
+            out.emplace_back(bytes, bytes + size);
+        }));
+    };
+    std::vector<std::vector<char>> a, b;
+    make(1000, 0, a);
+    make(1033, 10, b);
+    assert(a.size() == 7 && a.back().size() == PosePacketSize(529 - 6 * 80));
+    PoseBuffer buffer;
+    PosePacket packet;
+    for (auto it = a.rbegin(); it != a.rend(); ++it) {
+        assert(DecodePose(it->data(), static_cast<int>(it->size()), packet));
+        assert(buffer.Push(packet, 1.0));
+    }
+    assert(!buffer.Push(packet, 1.0)); // duplicate chunk
+    PoseFrame frame;
+    assert(buffer.Sample(1000, frame) && frame.Complete());
+    assert(FindBone(frame, names[528]) && Near(FindBone(frame, names[528])->t.x, 528, 0.02f));
+    // An incomplete newer frame is never sampled.
+    for (size_t i = 0; i + 1 < b.size(); ++i) {
+        assert(DecodePose(b[i].data(), static_cast<int>(b[i].size()), packet));
+        assert(buffer.Push(packet, 1.03));
+    }
+    assert(buffer.Sample(1020, frame) && Near(FindBone(frame, names[3])->t.y, 0, 0.02f));
+    assert(DecodePose(b.back().data(), static_cast<int>(b.back().size()), packet));
+    assert(buffer.Push(packet, 1.04));
+    assert(buffer.Sample(1016.5, frame) && Near(FindBone(frame, names[3])->t.y, 5, 0.03f) && Near(frame.yaw, 5, 0.01f));
+    assert(buffer.Sample(5000, frame) && Near(FindBone(frame, names[3])->t.y, 10, 0.02f));
+
+    // Malformed packets are rejected.
+    auto bad = a[0];
+    assert(!DecodePose(bad.data(), static_cast<int>(bad.size()) - 1, packet));
+    reinterpret_cast<PoseHeader*>(bad.data())->magic ^= 1;
+    assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
+    bad = a[0];
+    reinterpret_cast<PoseHeader*>(bad.data())->kind = kPoseEnemy; // enemies need an entity id
+    assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
+    bad = a[0];
+    reinterpret_cast<PoseHeader*>(bad.data())->chunk = 7;
+    assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
+    bad = a[0];
+    reinterpret_cast<PoseHeader*>(bad.data())->health = std::numeric_limits<float>::quiet_NaN();
+    assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
+    bad = a[0];
+    reinterpret_cast<PoseBoneWire*>(bad.data() + sizeof(PoseHeader))->largest = 4;
+    assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
+    std::vector<uint32_t> tooMany(kPoseBonesPerPacket * kPoseMaxChunks + 1, 1);
+    std::vector<BonePose> tooManyBones(tooMany.size());
+    assert(!EncodePose(PoseHeader{}, tooMany, tooManyBones, [](const PosePacket&, size_t) { assert(false); }));
+}
+
+void TestEnemy() {
+    using namespace coop;
+    // Descriptors round-trip and reject malformed paths, sizes and counts.
+    EnemyInfoPacket info, decoded;
+    std::vector<std::string> paths{"/Game/Characters/Freaker/Swarmer/parts_combo/swarmer_horde_c.swarmer_horde_c",
+                                   "/Game/Characters/Human/hat.hat"};
+    assert(EncodeEnemyInfo(3, 9, paths, info));
+    const char* raw = reinterpret_cast<const char*>(&info);
+    assert(DecodeEnemyInfo(raw, sizeof info, decoded) && decoded.entity == 9 && decoded.paths == 2 &&
+           std::string(decoded.path[0]) == paths[0] && std::string(decoded.path[1]) == paths[1]);
+    assert(!DecodeEnemyInfo(raw, sizeof info - 1, decoded));
+    auto bad = info;
+    bad.entity = 0;
+    assert(!DecodeEnemyInfo(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    bad = info;
+    bad.path[0][0] = 'G'; // not an object path
+    assert(!DecodeEnemyInfo(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    bad = info;
+    std::memset(bad.path[1], 'a', kEnemyPathLength); // unterminated
+    assert(!DecodeEnemyInfo(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    bad = info;
+    bad.path[2][0] = '/'; // data past the declared count
+    assert(!DecodeEnemyInfo(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    bad = info;
+    bad.path[0][5] = '\n';
+    assert(!DecodeEnemyInfo(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    assert(!EncodeEnemyInfo(3, 9, {}, info));
+    assert(!EncodeEnemyInfo(3, 0, paths, info));
+
+    // Face/finger subtrees are dropped without orphaning any streamed bone.
+    std::vector<std::string> names{"Align", "hips", "spine", "neck", "Head", "face_root", "face_lip_l", "jaw",
+                                   "l_hand", "l_index_01", "l_index_02", "l_thumb_01", "r_leg", "r_foot", "cam01"};
+    std::vector<int> parents{-1, 0, 1, 2, 3, 4, 5, 4, 2, 8, 9, 8, 1, 12, 0};
+    auto subset = EnemyBoneSubset(names, parents);
+    std::vector<int> expected{0, 1, 2, 3, 4, 7, 8, 12, 13};
+    assert(subset == expected);
+    std::vector<bool> kept(names.size());
+    for (int i : subset) {
+        kept[i] = true;
+        assert(parents[i] < 0 || kept[parents[i]]);
+    }
+    // Large rigs are capped so a frame never exceeds two packets including the root.
+    std::vector<std::string> many(400, "bone");
+    std::vector<int> chain(400);
+    for (int i = 0; i < 400; ++i) chain[i] = i - 1;
+    assert(EnemyBoneSubset(many, chain).size() == kEnemyMaxBones);
+
+    // An enemy frame carries its entity and absolute root through the pose buffer.
+    PoseHeader header{};
+    header.kind = kPoseEnemy;
+    header.session = 3;
+    header.timeMs = 500;
+    header.entity = 9;
+    header.root[0] = 250000.f;
+    header.flags = kPoseAlive;
+    std::vector<uint32_t> hashes{BoneHash("hips"), kRootBoneHash};
+    std::vector<BonePose> bones(2);
+    PoseBuffer buffer;
+    assert(EncodePose(header, hashes, bones, [&](const PosePacket& packet, size_t size) {
+        PosePacket in;
+        assert(DecodePose(reinterpret_cast<const char*>(&packet), static_cast<int>(size), in) && in.header.entity == 9);
+        assert(buffer.Push(in, 1.0));
+    }));
+    PoseFrame frame;
+    assert(buffer.Sample(500, frame) && frame.root[0] == 250000.f && (frame.flags & kPoseAlive) && FindBone(frame, kRootBoneHash));
+}
+
+void TestGear() {
+    static_assert(sizeof(coop::GearPacket) == 240, "gear wire size");
+    using namespace coop;
+    GearPacket packet, decoded;
+    float q[4] = {0, 0, 0.7071068f, 0.7071068f}, t[3] = {1, -2, 3}, scale[3] = {1, 1, 1};
+    const std::string path = "/Game/Weapons/Pistol/pistol_a.pistol_a";
+    assert(EncodeGear(7, kGearSkeletal, "weapon_r", 0, path, q, t, scale, packet));
+    assert(DecodeGear(reinterpret_cast<const char*>(&packet), sizeof packet, decoded));
+    assert(decoded.kind == kGearSkeletal && decoded.session == 7 && !std::strcmp(decoded.socket, "weapon_r"));
+    assert(path == decoded.path && decoded.t[1] == -2 && SameGear(packet, decoded));
+    assert(!DecodeGear(reinterpret_cast<const char*>(&packet), sizeof packet - 1, decoded));
+    // Empty hands carry no socket or path; anything else must be a rooted object path and a sane transform.
+    GearPacket empty;
+    assert(EncodeGear(7, kGearNone, {}, 0, {}, nullptr, nullptr, nullptr, empty) && !SameGear(empty, packet));
+    auto bad = [&](auto mutate) {
+        GearPacket copy = packet;
+        mutate(copy);
+        return !DecodeGear(reinterpret_cast<const char*>(&copy), sizeof copy, decoded);
+    };
+    assert(bad([](GearPacket& p) { p.kind = 3; }));
+    assert(bad([](GearPacket& p) { p.socket[0] = 0; }));
+    assert(bad([](GearPacket& p) { p.path[0] = 'G'; }));
+    assert(bad([](GearPacket& p) { p.path[5] = ' '; }));
+    assert(bad([](GearPacket& p) { std::memset(p.socket, 'a', sizeof p.socket); }));
+    assert(bad([](GearPacket& p) { p.q[3] = 2; }));
+    assert(bad([](GearPacket& p) { p.t[0] = std::numeric_limits<float>::quiet_NaN(); }));
+    assert(bad([](GearPacket& p) { p.t[2] = 900; }));
+    assert(bad([](GearPacket& p) { p.scale[1] = 0; }));
+    assert(bad([](GearPacket& p) { p.kind = kGearNone; }));
+    assert(!EncodeGear(7, kGearStatic, "", 0, path, q, t, scale, packet));
+    // Sub-millimetre jitter is the same mount; a moved item is not.
+    GearPacket jitter = decoded;
+    jitter.t[0] += 0.05f;
+    assert(SameGear(jitter, decoded));
+    jitter.t[0] += 1;
+    assert(!SameGear(jitter, decoded));
+    std::puts("gear ok");
+}
+
 int main() {
+    TestPose();
+    TestEnemy();
+    TestGear();
     using coop::DebugCommand;
     for (auto text : {"", "God", "god", "god-on extra", "spawn", "DestroyAll", "begin\n", "spawn-pack; end"})
         assert(coop::ParseDebugCommand(text) == DebugCommand::unknown);
@@ -252,6 +497,8 @@ int main() {
     assert(coop::ParseDebugCommand("cleanup") == DebugCommand::cleanup);
     assert(coop::ParseDebugCommand("probe-player") == DebugCommand::probePlayer);
     assert(coop::ParseDebugCommand("probe-enemy") == DebugCommand::probeEnemy);
+    assert(coop::ParseDebugCommand("time-shift") == DebugCommand::timeShift);
+    assert(coop::ParseDebugCommand("weather-next") == DebugCommand::weatherNext);
     assert(coop::ParseDebugCommand("inspect") == DebugCommand::inspect);
     assert(coop::ParseDebugCommand("status") == DebugCommand::status);
     coop::DebugRequestGate gate;

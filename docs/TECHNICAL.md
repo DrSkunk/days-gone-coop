@@ -167,7 +167,12 @@ Source layout:
 | [`src/coop/dllmain.cpp`](../src/coop/dllmain.cpp) | `DllMain` / exported `InitializeASI`; finds the plugin's `.ini`, `.log` and `-anims.txt` paths |
 | [`src/coop/coop.cpp`](../src/coop/coop.cpp) | Build check, hook, tick loop, player tracking, avatar, teleport, config |
 | [`src/coop/ue.hpp`](../src/coop/ue.hpp) / [`ue.cpp`](../src/coop/ue.cpp) | Minimal UE 4.10 reflection layer |
-| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 144-byte v4 wire format and validation |
+| [`src/coop/protocol.hpp`](../src/coop/protocol.hpp) | 144-byte v5 state packet and validation |
+| [`src/coop/pose.hpp`](../src/coop/pose.hpp) | Compressed skeleton datagrams (`DPOS`) for body, bike and enemies |
+| [`src/coop/skeleton.hpp`](../src/coop/skeleton.hpp) / [`skeleton.cpp`](../src/coop/skeleton.cpp) | Reads evaluated bone arrays, writes poseable copies, creates runtime components |
+| [`src/coop/enemy.hpp`](../src/coop/enemy.hpp) | Enemy appearance descriptors (`DMEN`) and replica limits |
+| [`src/coop/gear.hpp`](../src/coop/gear.hpp) | Held-item descriptors (`DMGR`) |
+| [`src/coop/debug_commands.hpp`](../src/coop/debug_commands.hpp) | Allowlisted opt-in debug commands |
 | [`src/coop/combat.hpp`](../src/coop/combat.hpp) | Consent-scoped reliable damage queue |
 | [`src/coop/appearance.cpp`](../src/coop/appearance.cpp) | Private garment materials and texture tinting |
 | [`src/coop/menu.cpp`](../src/coop/menu.cpp) / [`overlay.cpp`](../src/coop/overlay.cpp) | Settings input and Direct3D 11 overlay |
@@ -359,6 +364,9 @@ built from engine primitives:
 
 The partner therefore looks like *your* Deacon in *your* current outfit.
 
+Speed-picked clips were later replaced by streaming the partner's real skeleton
+(§3.13). The clip logic above is kept only as the fallback when no pose arrives.
+
 ### 3.7 Network protocol
 
 [`protocol.hpp`](../src/coop/protocol.hpp) defines one fixed 144-byte,
@@ -367,7 +375,7 @@ little-endian UDP packet:
 | Field | Type | Notes |
 |---|---|---|
 | magic | u32 | `"DGCO"` (`0x4F434744`) |
-| version | u16 | 4; both clients must upgrade together |
+| version | u16 | 5; both clients must upgrade together |
 | flags | u16 | HasPawn, InVehicle, HasBike, Passenger, FriendlyFire, AcceptPassengers, Alive, SyncBikes, WorldState |
 | seq | u32 | wraps; compared with serial-number arithmetic |
 | timeMs | u32 | sender clock |
@@ -392,8 +400,20 @@ client's original time/weather and restores them after timeout or when the host
 stops sending WorldState. These calls change the current game session only;
 they do not write save data. In a two-game test the Deck time was corrected
 from 10.651 to the host's 10.232, and a later host timeout logged restoration
-from 10.724 to the captured local 10.241. Both clients reported weather value 0,
-so no actual weather transition was tested.
+from 10.724 to the captured local 10.241.
+
+Weather needed a fix. The native `GetWorldWeather()` getter returned 0 even right
+after a successful `SelectWorldWeather`, while the `WorldWeather` byte property
+showed the new value. Earlier builds therefore always sent weather 0. The
+snapshot now reads the property. With the opt-in `weather-next` command the
+Deck followed the host 0 -> 1 -> 2 within 0.5 s, and `time-shift` moved the Deck
+from 10.789 to 16.827 within a second. The client's own clock did not advance
+between corrections, so corrections are now applied above 0.02 h (72 game
+seconds) instead of 0.1 h to avoid visible lighting steps.
+
+Version 5 also sends three further datagram types on the same socket, each
+recognised by its own magic: `DPOS` skeleton poses, `DMEN` enemy appearance
+and `DMGR` held items (§3.13). The state packet stays fixed at 144 bytes.
 
 Peering is symmetric. In **host** mode (`PeerHost` empty) the plugin learns
 the partner from the first valid packet. In **join** mode it sends to the
@@ -620,6 +640,72 @@ The native save blocker is not full save isolation. Saves were backed up on cach
 before the encounter tests. Indirect gameplay/progression effects and ordinary
 autosaves outside the test session remain possible; disposable saves are required.
 
+### 3.13 Skeleton streaming, held items and enemy replicas
+
+"Perfect mirroring" cannot come from guessing animations, because Days Gone
+mixes hundreds of state-machine clips, additive layers and IK. Instead the
+sender reads the **evaluated** bone array of a skinned mesh after the game has
+animated it, and the receiver writes those transforms into a
+`PoseableMeshComponent` copy:
+
+- **Reading.** `PoseReader` takes the component-space bone transforms that the
+  engine already computed for rendering and converts them to parent-relative
+  transforms. Bones are identified by a hash of their name, not by index, so
+  meshes with different bone orders still match.
+- **Wire format.** A `DPOS` datagram has a 44-byte header (kind, session,
+  sender time, entity, chunk, flags, root, yaw, health) and up to 80 bones of
+  17 bytes each. Translations are 16-bit at 0.02 cm; rotations use
+  "smallest-three" quaternion compression. A full body takes two or three chunks.
+  Body and bike poses go out with each state packet (~30 Hz), enemies at 15 Hz.
+- **Writing.** `PoseWriter` interpolates two received poses on the same
+  sender-time timeline as movement (§3.5) and writes them into the poseable copy.
+  Clothing, hair and accessories stay slaved with `SetMasterPoseComponent`, so
+  they follow automatically.
+- **Bike.** The partner's bike is rebuilt from its chassis plus its modular
+  parts. Seven parts share the chassis skeleton and are slaved to it; six hang
+  from named sockets on other parts. The chassis skeleton is streamed as a
+  `kPoseBike` pose, so steering, fork compression and wheel spin come from the
+  partner's real bike.
+
+**Socket-follow fix.** Writing the bone array directly skips Unreal's normal
+"update children" step. Anything attached to a *socket* on a posed mesh therefore
+stayed where it was when the parent actor last moved, and on a standing avatar
+it froze entirely. This hit both the held weapon and the six socket-mounted bike
+parts (one cause of the "bike seems incomplete" report). Every frame,
+`FollowSocket` now composes the live socket transform with the recorded offset
+and places the child in world space. In the log, the held item then matched
+`r_hand_socket` to within 1 cm.
+
+**Held items (`DMGR`).** The sender asks the pawn for
+`GetEquippedItemCurrentlyInHand`, takes the item's mesh asset, walks
+`AttachParent` up to the character mesh to find the socket name, and records the
+item's transform relative to that socket. It sends a 240-byte descriptor
+whenever this changes and every 0.5 s otherwise. The receiver looks up the same
+asset by path (`FindObject`, which never loads from disk), puts it on a
+`SkeletalMeshActor`, or a runtime `StaticMeshComponent` for static items, and
+attaches it to the avatar's socket.
+
+Days Gone fades fresh meshes in through per-instance dynamic materials, so the
+asset's default materials can stay invisible. The receiver therefore borrows the
+materials of a live, visible component that shows the same asset, usually the
+local player's own copy of that weapon. Finding it scans the object array (40-80 ms
+the first time), so the donor is cached per asset. If the receiver doesn't
+have the asset loaded, nothing is shown; that is logged once.
+
+**Enemy replicas.** The host walks the object array in time-sliced batches to
+find `BendAIPawn`s within 80 m of either player, at most 16. For each one it
+streams the evaluated skeleton as `kPoseEnemy` (at most two chunks, carrying the
+world root and health) plus a `DMEN` descriptor with up to four skeletal-mesh
+asset paths (body and modular parts) every second. The client builds a poseable
+replica the first time it sees an entity, keeps it in step with the stream, and
+destroys it after 1.5 s of silence or when health reaches zero. The replicas
+have no AI, collision or damage on the client, and the client's own enemies
+still exist independently. Bandwidth is roughly 140 kB/s per eight enemies.
+
+**Debug spawns.** The opt-in `spawn-single`/`spawn-pack` commands give a
+repeatable enemy source for this. On the Deck, host-spawned swarmers appeared,
+were posed, and expired once cleaned up on the host.
+
 ## 4. Safety measures
 
 - Exact build check (timestamp + image size) and prologue byte check before
@@ -676,8 +762,8 @@ with about 0.1 cm stationary visual-root variation. Short rolling/braking,
 manual exit/reboarding, driver dismount and disconnect cleanup were checked.
 The latter restored the native body, movement, collision and saving.
 
-The current suite passes 35 Python tests plus native C++ tests for the v4 wire
-format, serial ordering, mutual consent, scope invalidation, retransmission and
+The current suite passes 44 Python tests plus native C++ tests for the v5 wire
+format, pose/enemy/held-item datagram round trips and rejection rules, serial ordering, mutual consent, scope invalidation, retransmission and
 deduplication, plus bone-to-socket alignment across yaw and translation changes.
 Motion tests cover timestamp wrap, teleport/gap recovery, role transitions,
 bounded bike/player extrapolation and paused stale velocity. A deterministic
@@ -706,28 +792,33 @@ Movement and visual motorcycle replication do not establish shared-world gamepla
 
 The Snyk code-scan tool was unavailable in this environment; no Snyk scan was
 performed. Unit tests and live gameplay checks are not a security assessment.
-The v3 presentation-state extension passes packet, validation and motion-buffer
-tests. Crouch replication was confirmed, but live aim/fire behavior remains
-unverified. The v4 session time/weather synchronization passes protocol tests,
-is deployed to both clients, and has been checked for host-time application and
-disconnect restoration. A weather transition and mission/cinematic behavior
-still need validation. The world-sync build deployed to both machines had SHA-256
-`8916da86c3a955ba5e7876cdec5c93a6df85cee8c7a38f0b468b5faa00da7349`.
-The opt-in debug build on cachy is newer and remains protocol-v4 compatible;
-the Deck has not been upgraded with the debug controls.
+Live checks for the v5 build (2026-10-19, both machines on the same build):
+
+- **Pose mirroring.** The streamed body showed the partner's real stride and
+  strafe and a crossbow/rifle aim pose on the other screen.
+- **Held weapon.** The weapon rendered in the avatar's hands while aiming.
+  Firing itself (projectile, muzzle flash) is not replicated.
+- **Enemies.** Host enemies were replicated and expired on the Deck.
+- **Time and weather.** Time and weather values followed the host, as described
+  in §3.7.
+- **Bike.** The rebuilt bike rendered complete. The socket-mounted parts' new
+  per-frame follow is the code path validated for held items, but it has not
+  been visually re-checked while riding.
+- **Not yet checked.** Mission/cinematic pausing of world sync has not been
+  exercised live.
 
 Further runtime reflection identified the open-world `BP_BendWorldManagerV3_C`
 instance and its native `BendWorldManager` base. The base exposes `WorldTime`,
 `WorldWeather`, mission/cinematic state, `SetWorldTimeOfDay(float, bool)` and
-`SelectWorldWeather(byte, byte, float)`. The host sends these values in v4;
+`SelectWorldWeather(byte, byte, float)`. The host sends these values;
 the joining client applies them only outside mission/cinematic state and
-restores its prior session values after disconnect. A real weather transition
-still needs validation. The same scan found `BendFreakerPawn`,
+restores its prior session values after disconnect. See §3.7 for the
+`GetWorldWeather()` quirk. The same scan found `BendFreakerPawn`,
 `BendAIPawn` and `BendFreakerController` classes, including health/death and
 awareness surfaces. The original name-only scan did not establish whether active
 freakers were present; the later inheritance scan found pooled and controlled AI
-objects, and controlled tests successfully spawned native swarmers. This does not
-implement host-authoritative enemy replication or validate an enemy proxy lifecycle.
+objects, and controlled tests successfully spawned native swarmers. Those spawns
+are now used to exercise the visual enemy replicas in §3.13.
 
 ## 6. Limitations and next steps
 
@@ -735,11 +826,12 @@ This is a **ghost co-op prototype with experimental gameplay extensions**. Each
 player runs their own single-player world. Full shared-world co-op would
 also need:
 
-- syncing enemies (freakers, NPCs) with one authoritative host;
-- complete combat/projectile/animation replication and native damage parity;
+- authoritative enemies: the replicas in §3.13 are visual, so the client cannot
+  fight the host's enemies and still has its own;
+- projectile/muzzle-flash replication and native damage parity;
 - authoritative motorcycle physics, upgrades, fuel and damage;
 - syncing missions and saves, plus world state beyond session time/weather;
-- matching animations to the partner's actual state instead of speed tiers.
+- reducing pose bandwidth (delta or keyframe compression) before any non-LAN use.
 
 The shipped single-player gameplay does not provide a usable campaign co-op
 mode. Shared-world sync must use the game's gameplay APIs and respect mission
