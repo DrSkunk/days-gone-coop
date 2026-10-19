@@ -389,25 +389,32 @@ void Discover(UObject* pawn) {
             if (text.find(term) != std::string::npos) return true;
         return false;
     };
+    auto classClass = FindClass("Class");
     auto actorClass = FindClass("Actor");
+    auto componentClass = FindClass("ActorComponent");
     std::vector<UObject*> emittedClasses;
     int reportedObjects = 0;
     for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
         auto obj = ObjectAt(i);
         if (!IsLive(obj) || IsDefaultOrArchetype(obj) || !IsLive(obj->cls)) continue;
-        const std::string className = Name(obj->cls);
+        bool classObject = classClass && IsA(obj, classClass);
+        bool actorObject = actorClass && IsA(obj, actorClass);
+        bool componentObject = componentClass && IsA(obj, componentClass);
+        if (!classObject && !actorObject && !componentObject) continue;
+        const std::string className = Name(classObject ? obj : obj->cls);
         const std::string objectName = Name(obj);
         if (!matches(className) && !matches(objectName)) continue;
         if (reportedObjects < 512) {
             std::fprintf(f, "\nDISCOVERY_MATCH %s class=%s\n", FullName(obj).c_str(), FullName(obj->cls).c_str());
             ++reportedObjects;
         }
-        if (actorClass && IsA(obj, actorClass))
+        if (actorObject)
             std::fprintf(f, "  ACTOR %s\n", FullName(obj).c_str());
+        UObject* candidateClass = classObject ? obj : obj->cls;
         if (emittedClasses.size() < 64 &&
-            std::find(emittedClasses.begin(), emittedClasses.end(), obj->cls) == emittedClasses.end()) {
-            emittedClasses.push_back(obj->cls);
-            DumpClass(f, obj->cls);
+            std::find(emittedClasses.begin(), emittedClasses.end(), candidateClass) == emittedClasses.end()) {
+            emittedClasses.push_back(candidateClass);
+            DumpClass(f, candidateClass);
         }
     }
     Log("discovery: wrote %d time/weather/enemy candidate objects and %d candidate classes",
