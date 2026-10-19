@@ -1,12 +1,12 @@
-# Days Gone Co-op
+![Days Gone Together](./docs/days_gone_together.avif)
 
-[![CI](https://github.com/DrSkunk/days-gone-coop/actions/workflows/ci.yml/badge.svg)](https://github.com/DrSkunk/days-gone-coop/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/DrSkunk/days-gone-coop?include_prereleases&sort=semver)](https://github.com/DrSkunk/days-gone-coop/releases)
+[![CI](https://github.com/DrSkunk/days-gone-together/actions/workflows/ci.yml/badge.svg)](https://github.com/DrSkunk/days-gone-together/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/DrSkunk/days-gone-together?include_prereleases&sort=semver)](https://github.com/DrSkunk/days-gone-together/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-An experimental two-player **LAN co-op mod for Days Gone (PC)**. It runs as an
-ASI plugin inside the game and shows your partner, their motorcycle and the
-host's nearby enemies in your world.
+**Days Gone Together** is an experimental two-player **LAN co-op mod for Days
+Gone (PC)**. It runs as an ASI plugin inside the game and shows your partner,
+their motorcycle and the host's nearby enemies in your world.
 
 > [!IMPORTANT]
 > This is **not** full campaign co-op. Each player still runs their own
@@ -60,12 +60,12 @@ host's nearby enemies in your world.
 1. **Back up your saves.** They are in `%LOCALAPPDATA%\BendGame\Saved\` on
    Windows. Under Proton they are in
    `steamapps/compatdata/1259420/pfx/drive_c/users/steamuser/AppData/Local/BendGame/Saved/`.
-2. Download `DaysGoneCoop-<version>.zip` from
-   [Releases](https://github.com/DrSkunk/days-gone-coop/releases).
+2. Download `DaysGoneTogether-<version>.zip` from
+   [Releases](https://github.com/DrSkunk/days-gone-together/releases).
 3. Install Ultimate ASI Loader x64 as `version.dll` in the game's
    `BendGame/Binaries/Win64/` folder, next to `DaysGone.exe`. Skip this step if
    you already have an ASI loader there, and don't overwrite other mods.
-4. Copy `DaysGoneCoop.asi` and `DaysGoneCoop.ini` from the zip into that same
+4. Copy `DaysGoneTogether.asi` and `DaysGoneTogether.ini` from the zip into that same
    folder. Both files must stay side by side.
 5. **Linux / Steam Deck only:** Wine must load the proxy `version.dll`. In
    Steam, open the game's *Properties → Launch Options* and set:
@@ -79,14 +79,14 @@ host's nearby enemies in your world.
 To verify a download:
 
 ```sh
-gh attestation verify DaysGoneCoop-<version>.zip --repo DrSkunk/days-gone-coop
+gh attestation verify DaysGoneTogether-<version>.zip --repo DrSkunk/days-gone-together
 ```
 
 The release also includes a `.sha256` checksum file.
 
 ## Set up a session
 
-Edit `DaysGoneCoop.ini` on both PCs, then start the game.
+Edit `DaysGoneTogether.ini` on both PCs, then start the game.
 
 **Host:** leave `PeerHost` empty. The first player who connects becomes your
 partner for the rest of the session.
@@ -160,7 +160,7 @@ when there is no safe ground to stand on.
 
 ## Configuration reference
 
-All keys are in the `[Coop]` section of `DaysGoneCoop.ini`.
+All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -180,10 +180,10 @@ All keys are in the `[Coop]` section of `DaysGoneCoop.ini`.
 
 ## Troubleshooting
 
-The plugin writes `DaysGoneCoop.log` next to itself. A healthy start looks like this:
+The plugin writes `DaysGoneTogether.log` next to itself. A healthy start looks like this:
 
 ```text
-Days Gone Co-op 0.1.0 starting (protocol v5)
+Days Gone Together 0.1.0 starting (protocol v5)
 ProcessEvent hook installed
 GNames via pointer at rva 0x…, … names
 network: listening on UDP 27777, …
@@ -203,8 +203,8 @@ normally.
 
 ## Uninstall
 
-Close the game and delete `DaysGoneCoop.asi`, `DaysGoneCoop.ini` and the
-`DaysGoneCoop*.log`/`.txt` files. Remove `version.dll`, and the launch option,
+Close the game and delete `DaysGoneTogether.asi`, `DaysGoneTogether.ini` and the
+`DaysGoneTogether*.log`/`.txt` files. Remove `version.dll`, and the launch option,
 only if no other mod uses the ASI loader.
 
 ## How it was built

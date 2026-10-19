@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simulated co-op partner for testing DaysGoneCoop.asi with a single game instance.
+"""Simulated co-op partner for testing DaysGoneTogether.asi with a single game instance.
 
 It speaks the plugin's UDP protocol, waits for the game's first state packet and
 then walks a ghost partner in a circle near the real player.

@@ -12,13 +12,13 @@ and play, see the [README](../README.md). To build and test, see
 ## Overview
 
 Days Gone runs on Bend Studio's fork of **Unreal Engine 4.10.1**. The mod is a
-Windows DLL (`DaysGoneCoop.asi`) that runs inside the game process.
+Windows DLL (`DaysGoneTogether.asi`) that runs inside the game process.
 
 ```text
 DaysGone.exe
   └─ version.dll (Ultimate ASI Loader proxy)
-       └─ DaysGoneCoop.asi → DllMain / InitializeASI
-            ├─ load DaysGoneCoop.ini next to the .asi
+       └─ DaysGoneTogether.asi → DllMain / InitializeASI
+            ├─ load DaysGoneTogether.ini next to the .asi
             ├─ check the executable (PE timestamp + image size)
             ├─ check the ProcessEvent prologue bytes
             ├─ install an inline hook on UObject::ProcessEvent
@@ -107,7 +107,7 @@ Structure offsets used by the reflection layer ([`ue.hpp`](../src/coop/ue.hpp)):
 
 Some facts only exist at runtime. With `Discovery=1` the plugin logs the local
 pawn's class chain and components, writes loaded `AnimSequence`s to
-`DaysGoneCoop-anims.txt` and lists classes related to world state, AI and
+`DaysGoneTogether-anims.txt` and lists classes related to world state, AI and
 spawning. F6 dumps the current pawn again. This revealed, for example:
 
 - the player is `BendDefaultPlayerPawn_C` with `BendDefaultPlayerController_C`;

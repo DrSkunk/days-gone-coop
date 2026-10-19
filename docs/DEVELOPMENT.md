@@ -14,8 +14,8 @@
 ```sh
 poetry install
 make test     # C++ protocol/motion/combat tests + Python unit tests
-make build    # package/DaysGoneCoop.asi + DaysGoneCoop.ini
-make dist     # dist/DaysGoneCoop-<version>.zip + .sha256
+make build    # package/DaysGoneTogether.asi + DaysGoneTogether.ini
+make dist     # dist/DaysGoneTogether-<version>.zip + .sha256
 ```
 
 The build downloads the pinned Dear ImGui release into `.deps/` and checks its
@@ -72,7 +72,7 @@ test with a single game.
 ```
 
 `start-test.sh` backs up the INI and points it at `127.0.0.1:27778`. It runs
-the simulator as the `dg-coop-fakepeer` user service and launches the game.
+the simulator as the `dg-together-fakepeer` user service and launches the game.
 `DAYS_GONE_DIR` overrides the game folder. Restart the game after stopping.
 
 **By hand,** against a game in host mode:
@@ -115,9 +115,9 @@ poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/
 | `end` | Clean up and restore damage and saving state |
 
 Commands go through a file mailbox. The helper atomically writes
-`DaysGoneCoop-debug.ini` (`[Debug] Command=…, Request=<new number>`) next to
+`DaysGoneTogether-debug.ini` (`[Debug] Command=…, Request=<new number>`) next to
 the ASI. The plugin polls it every 0.5 s on the game thread and writes
-`DaysGoneCoop-debug-result.ini`. Requests already present at startup are
+`DaysGoneTogether-debug-result.ini`. Requests already present at startup are
 ignored. Only the commands above are accepted, and nothing can be sent over
 the network.
 
@@ -160,7 +160,7 @@ Releases are automated with
 2. Merge the release PR. release-please tags `vX.Y.Z` and creates the GitHub
    release.
 3. The same workflow builds the ASI with that version, packages
-   `DaysGoneCoop-X.Y.Z.zip` with a SHA-256 file, creates a signed build
+   `DaysGoneTogether-X.Y.Z.zip` with a SHA-256 file, creates a signed build
    provenance attestation and uploads both files to the release.
 
 The **CI** workflow runs the tests and uploads a development build as a

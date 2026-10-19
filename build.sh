@@ -20,10 +20,10 @@ if [ ! -f "$source/imgui.cpp" ]; then
 fi
 "$CXX" -std=c++20 -O2 -Wall -Wextra -Werror -shared -static -s \
   -DCOOP_VERSION="\"${coop_version}\"" \
-  -I"$source" -o package/DaysGoneCoop.asi src/coop/*.cpp \
+  -I"$source" -o package/DaysGoneTogether.asi src/coop/*.cpp \
   "$source"/imgui.cpp "$source"/imgui_draw.cpp "$source"/imgui_tables.cpp "$source"/imgui_widgets.cpp \
   "$source"/backends/imgui_impl_dx11.cpp \
   -lws2_32 -lbcrypt -ld3d11 -ld3dcompiler -ldxgi -Wl,--subsystem,windows -Wl,--no-insert-timestamp
-cp config/DaysGoneCoop.ini package/DaysGoneCoop.ini
+cp config/DaysGoneTogether.ini package/DaysGoneTogether.ini
 cp "$source/LICENSE.txt" package/LICENSE-Dear-ImGui.txt
-echo "built package/DaysGoneCoop.asi ($coop_version)"
+echo "built package/DaysGoneTogether.asi ($coop_version)"

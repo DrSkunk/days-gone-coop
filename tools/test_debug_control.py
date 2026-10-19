@@ -12,7 +12,7 @@ class DebugControlTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
-        (self.directory / "DaysGoneCoop.asi").touch()
+        (self.directory / "DaysGoneTogether.asi").touch()
 
     def test_allowlist_and_directory_validation(self):
         for command in ("God", "god-on extra", "spawn-pack;end", ""):
@@ -25,57 +25,57 @@ class DebugControlTests(unittest.TestCase):
                 debug_control.send(self.directory, "begin", timeout)
 
     def test_acknowledgement_and_error(self):
-        result = self.directory / "DaysGoneCoop-debug-result.ini"
+        result = self.directory / "DaysGoneTogether-debug-result.ini"
         for state in ("ok", "error"):
             def respond(_):
-                request = debug_control.read_ini(self.directory / "DaysGoneCoop-debug.ini")
+                request = debug_control.read_ini(self.directory / "DaysGoneTogether-debug.ini")
                 number = request.getint("Debug", "Request")
                 result.write_text(f"[Result]\nState={state}\nMessage=measured\nRequest={number}\n")
             with patch.object(debug_control.time, "sleep", side_effect=respond):
                 self.assertEqual(debug_control.send(self.directory, "status"), (state == "ok", "measured"))
-        self.assertFalse((self.directory / "DaysGoneCoop-debug.lock").exists())
+        self.assertFalse((self.directory / "DaysGoneTogether-debug.lock").exists())
 
     def test_stale_ack_does_not_succeed_and_lock_is_cleaned(self):
-        (self.directory / "DaysGoneCoop-debug-result.ini").write_text("[Result]\nRequest=1\nState=ok\n")
+        (self.directory / "DaysGoneTogether-debug-result.ini").write_text("[Result]\nRequest=1\nState=ok\n")
         with patch.object(debug_control.time, "monotonic", side_effect=(0, 0, 21)):
             with self.assertRaises(TimeoutError):
                 debug_control.send(self.directory, "god-on")
-        self.assertEqual(debug_control.read_ini(self.directory / "DaysGoneCoop-debug.ini").getint("Debug", "Request"), 2)
-        self.assertFalse((self.directory / "DaysGoneCoop-debug.lock").exists())
+        self.assertEqual(debug_control.read_ini(self.directory / "DaysGoneTogether-debug.ini").getint("Debug", "Request"), 2)
+        self.assertFalse((self.directory / "DaysGoneTogether-debug.lock").exists())
 
     def test_bad_input_is_explicit_and_preserves_existing_request(self):
-        mailbox = self.directory / "DaysGoneCoop-debug.ini"
+        mailbox = self.directory / "DaysGoneTogether-debug.ini"
         for text in ("[Debug]\nRequest=-1\n", "[Debug]\nRequest=invalid\n", "not an ini\n"):
             mailbox.write_text(text)
             with self.assertRaises((ValueError, configparser.Error)):
                 debug_control.send(self.directory, "end")
             self.assertEqual(mailbox.read_text(), text)
-            self.assertFalse((self.directory / "DaysGoneCoop-debug.lock").exists())
+            self.assertFalse((self.directory / "DaysGoneTogether-debug.lock").exists())
 
     def test_parallel_writer_is_refused(self):
-        lock = self.directory / "DaysGoneCoop-debug.lock"
+        lock = self.directory / "DaysGoneTogether-debug.lock"
         lock.touch()
         with self.assertRaises(FileExistsError):
             debug_control.send(self.directory, "begin")
         self.assertTrue(lock.exists())
 
     def test_wrapping_identifier_cannot_accept_a_stale_ack(self):
-        (self.directory / "DaysGoneCoop-debug.ini").write_text("[Debug]\nRequest=2147483647\n")
-        (self.directory / "DaysGoneCoop-debug-result.ini").write_text("[Result]\nRequest=1\nState=ok\n")
+        (self.directory / "DaysGoneTogether-debug.ini").write_text("[Debug]\nRequest=2147483647\n")
+        (self.directory / "DaysGoneTogether-debug-result.ini").write_text("[Result]\nRequest=1\nState=ok\n")
         with patch.object(debug_control.time, "monotonic", side_effect=(0, 0, 21)):
             with self.assertRaises(TimeoutError):
                 debug_control.send(self.directory, "status")
-        self.assertEqual(debug_control.read_ini(self.directory / "DaysGoneCoop-debug.ini").getint("Debug", "Request"), 2)
+        self.assertEqual(debug_control.read_ini(self.directory / "DaysGoneTogether-debug.ini").getint("Debug", "Request"), 2)
 
     def test_invalid_ack_is_not_success(self):
-        result = self.directory / "DaysGoneCoop-debug-result.ini"
+        result = self.directory / "DaysGoneTogether-debug-result.ini"
         def respond(_):
-            request = debug_control.read_ini(self.directory / "DaysGoneCoop-debug.ini").getint("Debug", "Request")
+            request = debug_control.read_ini(self.directory / "DaysGoneTogether-debug.ini").getint("Debug", "Request")
             result.write_text(f"[Result]\nState=unknown\nRequest={request}\n")
         with patch.object(debug_control.time, "sleep", side_effect=respond):
             with self.assertRaises(ValueError):
                 debug_control.send(self.directory, "begin")
-        self.assertFalse((self.directory / "DaysGoneCoop-debug.lock").exists())
+        self.assertFalse((self.directory / "DaysGoneTogether-debug.lock").exists())
 
 
 if __name__ == "__main__":

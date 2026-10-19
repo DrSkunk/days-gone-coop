@@ -6,8 +6,8 @@ package/
 .deps/
 *.exe
 *.log
-DaysGoneCoop-debug.ini
-DaysGoneCoop-debug-result.ini
-DaysGoneCoop-debug.lock
-.DaysGoneCoop-debug-*
+DaysGoneTogether-debug.ini
+DaysGoneTogether-debug-result.ini
+DaysGoneTogether-debug.lock
+.DaysGoneTogether-debug-*
 dist/
