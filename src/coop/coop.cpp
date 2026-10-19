@@ -380,6 +380,38 @@ void Discover(UObject* pawn) {
             }
         }
     }
+    const char* terms[] = {"time", "weather", "climate", "daynight", "freaker", "enemy",
+                           "infected", "aicontroller", "spawner"};
+    auto matches = [&](std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        for (const auto* term : terms)
+            if (text.find(term) != std::string::npos) return true;
+        return false;
+    };
+    auto actorClass = FindClass("Actor");
+    std::vector<UObject*> emittedClasses;
+    int reportedObjects = 0;
+    for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+        auto obj = ObjectAt(i);
+        if (!IsLive(obj) || IsDefaultOrArchetype(obj) || !IsLive(obj->cls)) continue;
+        const std::string className = Name(obj->cls);
+        const std::string objectName = Name(obj);
+        if (!matches(className) && !matches(objectName)) continue;
+        if (reportedObjects < 512) {
+            std::fprintf(f, "\nDISCOVERY_MATCH %s class=%s\n", FullName(obj).c_str(), FullName(obj->cls).c_str());
+            ++reportedObjects;
+        }
+        if (actorClass && IsA(obj, actorClass))
+            std::fprintf(f, "  ACTOR %s\n", FullName(obj).c_str());
+        if (emittedClasses.size() < 64 &&
+            std::find(emittedClasses.begin(), emittedClasses.end(), obj->cls) == emittedClasses.end()) {
+            emittedClasses.push_back(obj->cls);
+            DumpClass(f, obj->cls);
+        }
+    }
+    Log("discovery: wrote %d time/weather/enemy candidate objects and %d candidate classes",
+        reportedObjects, static_cast<int>(emittedClasses.size()));
     std::fclose(f);
     Log("discovery: reflection report written to %s", Narrow(path).c_str());
 }

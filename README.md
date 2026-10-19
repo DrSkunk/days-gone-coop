@@ -172,6 +172,8 @@ sudo ufw delete allow in on eno1 from 192.168.1.0/24 to any port 27777 proto udp
 The other settings are documented in [the template](config/DaysGoneCoop.ini).
 `TeleportKey=118` means F7 (decimal Windows virtual-key code). `Discovery=1`
 writes component details and a list of loaded animations for investigation.
+It also records loaded actor/component classes matching time, weather, enemy,
+Freaker, AI-controller and spawner terms to help map shared-world APIs.
 Animation names refer to already loaded assets; the mod does not ship game assets.
 
 ### Steam Deck joining cachy
