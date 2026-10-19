@@ -1,7 +1,7 @@
 [project]
 name = "days-gone-coop"
-version = "0.1.0"
-description = "Build-specific investigation tools for a Days Gone co-op mod"
+version = "0.0.0"
+description = "LAN co-op ASI mod for Days Gone: build and research tooling"
 requires-python = ">=3.11,<4"
 dependencies = ["capstone>=5.0.6,<6"]
 

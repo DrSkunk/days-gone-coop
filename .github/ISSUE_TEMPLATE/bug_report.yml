@@ -1,0 +1,33 @@
+name: Bug report
+description: Something doesn't work as described
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Mod version
+      description: First line of DaysGoneCoop.log, e.g. "Days Gone Co-op 0.1.0 starting"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [Windows, Linux (Proton), Steam Deck, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: log
+    attributes:
+      label: DaysGoneCoop.log (both players if possible)
+      render: text
