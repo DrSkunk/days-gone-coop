@@ -418,6 +418,12 @@ void SendLocalState(UObject* pawn, double now) {
             else if (melee.invoke() && melee.get<bool>("ReturnValue")) p.weaponType = kWeaponMelee;
         }
         p.shotSequence = g_localShotSequence;
+        static uint8_t lastActions = 0xff, lastWeaponType = 0xff;
+        if (g_cfg.discovery && (p.actions != lastActions || p.weaponType != lastWeaponType)) {
+            Log("presentation: local actions=0x%x weapon=%u", p.actions, p.weaponType);
+            lastActions = p.actions;
+            lastWeaponType = p.weaponType;
+        }
         UObject* mesh = g_passenger.pawn == pawn && IsLive(g_passengerAvatar.component) ?
             g_passengerAvatar.component : IsA(pawn, C.character) ? Prop(pawn, "Mesh") : nullptr;
         FVector pos{};
@@ -1333,9 +1339,9 @@ void UpdateAvatar(UObject* localPawn, double now) {
         Call visible(g_avatar.component, "IsVisible");
         int vis = visible.invoke() ? visible.get<bool>("ReturnValue") : -1;
         Log("status: partner %s at (%.0f %.0f %.0f) moved=%d, avatar at (%.0f %.0f %.0f), you at (%.0f %.0f %.0f) "
-            "origin (%.0f %.0f %.0f) anim=%s screen=(%.0f %.0f) visible=%d",
+            "origin (%.0f %.0f %.0f) anim=%s actions=0x%x weapon=%u shot=%u screen=(%.0f %.0f) visible=%d",
             g_remoteName.c_str(), local.x, local.y, local.z, moved, a.x, a.y, a.z, m.x, m.y, m.z, origin.x, origin.y,
-            origin.z, Name(g_avatar.currentAnim).c_str(), screen.x, screen.y, vis);
+            origin.z, Name(g_avatar.currentAnim).c_str(), s.actions, s.weaponType, s.shotSequence, screen.x, screen.y, vis);
     }
 }
 

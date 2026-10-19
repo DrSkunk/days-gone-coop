@@ -547,7 +547,9 @@ checks, not cryptographic authentication.
   line records the avatar's world position, its projected screen position
   (`ProjectWorldLocationToScreen`) and component visibility. This separates
   "not rendered" from "rendered but off-camera"; that check found a 90° yaw
-  convention bug in the simulator.
+  convention bug in the simulator. It also records the remote action bits,
+  weapon category, shot sequence and selected animation. With `Discovery=1`,
+  local action/weapon changes are logged as `presentation:` lines.
 - **LAN check**: a second machine exchanged packets with the game through the
   firewall, including the host-mode handshake and reconnect.
 - **Two real games (2026-10-18)**: Days Gone on a Steam Deck joined cachy over
