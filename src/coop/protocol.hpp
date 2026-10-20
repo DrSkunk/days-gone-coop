@@ -7,7 +7,7 @@
 namespace coop {
 
 constexpr uint32_t kMagic = 0x4F434744; // "DGCO"
-constexpr uint16_t kProtocolVersion = 5;
+constexpr uint16_t kProtocolVersion = 6;
 
 enum StateFlags : uint16_t {
     kHasPawn = 1 << 0,

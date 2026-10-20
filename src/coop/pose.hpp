@@ -3,30 +3,42 @@
 #include "ue.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace coop {
 
 constexpr uint32_t kPoseMagic = 0x534F5044; // "DPOS"
-constexpr uint16_t kPoseVersion = 1;
-constexpr size_t kPoseBonesPerPacket = 80;
-constexpr uint8_t kPoseMaxChunks = 8;
+constexpr uint16_t kPoseVersion = 2;
+constexpr size_t kPoseBonesPerPacket = 64;    // worst case 1132 bytes: below the ~1200-byte safe internet payload
+constexpr uint8_t kPoseMaxChunks = 10;
 constexpr float kPoseTranslationScale = 50.f; // 0.02 cm steps, +-655 cm range
+// Bones carry a translation only in keyframes or shortly after it changed; most animated bones only rotate.
+constexpr uint8_t kBoneLargestMask = 0x03;
+constexpr uint8_t kBoneHasTranslation = 0x04;
+constexpr size_t kPoseBoneRotationBytes = 11;  // name, info, three quaternion components
+constexpr size_t kPoseBoneFullBytes = 17;      // plus three translation components
+constexpr uint32_t kPoseKeyframeMs = 1000;
+constexpr uint32_t kPoseTranslationHoldMs = 250; // repeats a changed translation so one lost datagram heals
 
 enum PoseKind : uint8_t { kPoseBody = 0, kPoseBike = 1, kPoseEnemy = 2 };
 enum PoseFlags : uint16_t { kPoseAlive = 1 << 0 };
 
 #pragma pack(push, 1)
+// Decoded bone; on the wire it is name, largest, q and, only with kBoneHasTranslation, t.
 struct PoseBoneWire {
     uint32_t name;    // BoneHash of the bone name; meshes are matched by name, not index
     int16_t t[3];     // parent-relative translation
     int16_t q[3];     // parent-relative rotation, smallest-three
-    uint8_t largest;  // index of the omitted quaternion component
+    uint8_t largest;  // index of the omitted quaternion component, plus kBoneHasTranslation
 };
 struct PoseHeader {
     uint32_t magic;
@@ -64,9 +76,9 @@ constexpr uint32_t BoneHash(std::string_view name) {
 // Pseudo-bone carrying the sender mesh's world rotation (lean, slope pitch); never matches a real bone.
 constexpr uint32_t kRootBoneHash = BoneHash("@root");
 
-inline size_t PosePacketSize(uint8_t count) {
-    return sizeof(PoseHeader) + static_cast<size_t>(count) * sizeof(PoseBoneWire);
-}
+constexpr size_t kPosePacketMaxBytes = sizeof(PoseHeader) + kPoseBonesPerPacket * kPoseBoneFullBytes;
+
+inline bool BoneHasTranslation(const PoseBoneWire& wire) { return (wire.largest & kBoneHasTranslation) != 0; }
 
 inline void NormalizeQuat(float q[4]) {
     float n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
@@ -100,41 +112,66 @@ inline PoseBoneWire EncodeBone(uint32_t name, const BonePose& bone) {
         if (i == largest) continue;
         wire.q[j++] = static_cast<int16_t>(std::clamp(std::round(q[i] * sign * scale), -32767.f, 32767.f));
     }
-    wire.largest = static_cast<uint8_t>(largest);
+    wire.largest = static_cast<uint8_t>(largest) | kBoneHasTranslation;
     return wire;
 }
 
+// Leaves bone.t untouched when the wire bone carries no translation.
 inline bool DecodeBone(const PoseBoneWire& wire, BonePose& bone) {
-    if (wire.largest > 3 || !wire.name) return false;
+    if ((wire.largest & ~(kBoneLargestMask | kBoneHasTranslation)) || !wire.name) return false;
+    int largest = wire.largest & kBoneLargestMask;
     constexpr float scale = 1.f / (32767.f * 1.41421356f);
     float sum = 0;
     for (int i = 0, j = 0; i < 4; ++i) {
-        if (i == wire.largest) continue;
+        if (i == largest) continue;
         bone.q[i] = wire.q[j++] * scale;
         sum += bone.q[i] * bone.q[i];
     }
-    bone.q[wire.largest] = std::sqrt(std::max(0.f, 1.f - sum));
+    bone.q[largest] = std::sqrt(std::max(0.f, 1.f - sum));
     NormalizeQuat(bone.q);
-    bone.t = {wire.t[0] / kPoseTranslationScale, wire.t[1] / kPoseTranslationScale, wire.t[2] / kPoseTranslationScale};
+    if (BoneHasTranslation(wire))
+        bone.t = {wire.t[0] / kPoseTranslationScale, wire.t[1] / kPoseTranslationScale, wire.t[2] / kPoseTranslationScale};
     return true;
 }
 
+inline size_t WriteBone(const PoseBoneWire& wire, char* out) {
+    std::memcpy(out, &wire.name, 4);
+    out[4] = static_cast<char>(wire.largest);
+    std::memcpy(out + 5, wire.q, 6);
+    if (!BoneHasTranslation(wire)) return kPoseBoneRotationBytes;
+    std::memcpy(out + 11, wire.t, 6);
+    return kPoseBoneFullBytes;
+}
+
 inline bool DecodePose(const char* data, int len, PosePacket& out) {
-    if (len < static_cast<int>(sizeof(PoseHeader)) || len > static_cast<int>(sizeof(PosePacket))) return false;
+    if (len < static_cast<int>(sizeof(PoseHeader)) || len > static_cast<int>(kPosePacketMaxBytes)) return false;
     std::memcpy(&out.header, data, sizeof out.header);
     const auto& h = out.header;
     if (h.magic != kPoseMagic || h.version != kPoseVersion || h.kind > kPoseEnemy || !h.count ||
         h.count > kPoseBonesPerPacket || !h.chunks || h.chunks > kPoseMaxChunks || h.chunk >= h.chunks ||
-        (h.flags & ~kPoseAlive) || len != static_cast<int>(PosePacketSize(h.count)))
+        (h.flags & ~kPoseAlive))
         return false;
     if ((h.kind == kPoseEnemy) != (h.entity != 0)) return false;
     for (float f : {h.root[0], h.root[1], h.root[2], h.yaw, h.health})
         if (!std::isfinite(f) || std::fabs(f) > 1e8f) return false;
     if (h.health < 0 || h.health > 100000) return false;
-    std::memcpy(out.bones, data + sizeof(PoseHeader), static_cast<size_t>(h.count) * sizeof(PoseBoneWire));
-    for (uint8_t i = 0; i < h.count; ++i)
-        if (out.bones[i].largest > 3 || !out.bones[i].name) return false;
-    return true;
+    size_t at = sizeof(PoseHeader), size = static_cast<size_t>(len);
+    for (uint8_t i = 0; i < h.count; ++i) {
+        if (at + kPoseBoneRotationBytes > size) return false;
+        auto& bone = out.bones[i];
+        bone = PoseBoneWire{};
+        std::memcpy(&bone.name, data + at, 4);
+        bone.largest = static_cast<uint8_t>(data[at + 4]);
+        std::memcpy(bone.q, data + at + 5, 6);
+        at += kPoseBoneRotationBytes;
+        if ((bone.largest & ~(kBoneLargestMask | kBoneHasTranslation)) || !bone.name) return false;
+        if (BoneHasTranslation(bone)) {
+            if (at + 6 > size) return false;
+            std::memcpy(bone.t, data + at, 6);
+            at += 6;
+        }
+    }
+    return at == size;
 }
 
 // Quaternion helpers using Unreal's convention: (a * b) applies b first, then a.
@@ -213,23 +250,66 @@ inline void QuatToRotator(const float q[4], float& pitch, float& yaw, float& rol
     }
 }
 
-// Splits a pose into chunk packets; `send` receives each packet and its byte size.
+// Sender-side memory of which translations the receiver already has, per streamed mesh.
+struct PoseTranslationTracker {
+    std::vector<uint32_t> names;
+    std::vector<std::array<int16_t, 3>> sent;
+    std::vector<uint32_t> changedMs;
+    uint32_t keyMs = 0;
+    bool keyed = false;
+    void Reset() { *this = PoseTranslationTracker{}; }
+};
+
+// Splits a pose into chunk datagrams; `send` receives each datagram's bytes and size.
+// Without a tracker every bone carries its translation.
 template <typename Send>
-bool EncodePose(PoseHeader header, const std::vector<uint32_t>& names, const std::vector<BonePose>& bones, Send&& send) {
+bool EncodePose(PoseHeader header, const std::vector<uint32_t>& names, const std::vector<BonePose>& bones, Send&& send,
+                PoseTranslationTracker* tracker = nullptr) {
     size_t count = std::min(names.size(), bones.size());
     size_t chunks = (count + kPoseBonesPerPacket - 1) / kPoseBonesPerPacket;
     if (!count || chunks > kPoseMaxChunks) return false;
     header.magic = kPoseMagic;
     header.version = kPoseVersion;
     header.chunks = static_cast<uint8_t>(chunks);
-    PosePacket packet{};
+    bool key = true;
+    if (tracker) {
+        if (tracker->names.size() != count || !std::equal(tracker->names.begin(), tracker->names.end(), names.begin())) {
+            tracker->Reset();
+            tracker->names.assign(names.begin(), names.begin() + static_cast<std::ptrdiff_t>(count));
+            tracker->sent.assign(count, {});
+            tracker->changedMs.assign(count, header.timeMs);
+        }
+        int32_t sinceKey = static_cast<int32_t>(header.timeMs - tracker->keyMs);
+        key = !tracker->keyed || sinceKey < 0 || sinceKey >= static_cast<int32_t>(kPoseKeyframeMs);
+        if (key) {
+            tracker->keyMs = header.timeMs;
+            tracker->keyed = true;
+        }
+    }
+    char packet[kPosePacketMaxBytes];
     for (size_t c = 0; c < chunks; ++c) {
         size_t first = c * kPoseBonesPerPacket, n = std::min(kPoseBonesPerPacket, count - first);
-        packet.header = header;
-        packet.header.chunk = static_cast<uint8_t>(c);
-        packet.header.count = static_cast<uint8_t>(n);
-        for (size_t i = 0; i < n; ++i) packet.bones[i] = EncodeBone(names[first + i], bones[first + i]);
-        send(packet, PosePacketSize(packet.header.count));
+        PoseHeader h = header;
+        h.chunk = static_cast<uint8_t>(c);
+        h.count = static_cast<uint8_t>(n);
+        std::memcpy(packet, &h, sizeof h);
+        size_t at = sizeof h;
+        for (size_t i = first; i < first + n; ++i) {
+            PoseBoneWire wire = EncodeBone(names[i], bones[i]);
+            bool withTranslation = key;
+            if (tracker) {
+                std::array<int16_t, 3> t{wire.t[0], wire.t[1], wire.t[2]};
+                if (t != tracker->sent[i]) {
+                    tracker->sent[i] = t;
+                    tracker->changedMs[i] = header.timeMs;
+                }
+                withTranslation = withTranslation ||
+                    static_cast<uint32_t>(header.timeMs - tracker->changedMs[i]) < kPoseTranslationHoldMs;
+            }
+            if (!withTranslation) wire.largest &= ~kBoneHasTranslation;
+            at += WriteBone(wire, packet + at);
+        }
+        send(static_cast<const char*>(packet), at);
     }
     return true;
 }
@@ -249,7 +329,10 @@ struct PoseFrame {
 // Collects chunked pose frames and samples them at a sender timestamp.
 class PoseBuffer {
 public:
-    void Clear() { frames_.clear(); }
+    void Clear() {
+        frames_.clear();
+        translations_.clear();
+    }
     bool Empty() const { return frames_.empty(); }
     double LastArrival() const { return lastArrival_; }
 
@@ -272,16 +355,27 @@ public:
         }
         if (frame->chunks != h.chunks || (frame->chunkMask & (1u << h.chunk))) return false;
         for (uint8_t i = 0; i < h.count; ++i)
-            if (packet.bones[i].largest > 3 || !packet.bones[i].name) return false;
+            if ((packet.bones[i].largest & ~(kBoneLargestMask | kBoneHasTranslation)) || !packet.bones[i].name) return false;
         frame->chunkMask |= 1u << h.chunk;
         frame->flags = h.flags;
         std::memcpy(frame->root, h.root, sizeof frame->root);
         frame->yaw = h.yaw;
         frame->health = h.health;
         size_t base = static_cast<size_t>(h.chunk) * kPoseBonesPerPacket;
+        if (translations_.size() > 4096) translations_.clear();
         for (uint8_t i = 0; i < h.count; ++i) {
-            DecodeBone(packet.bones[i], frame->bones[base + i]);
-            frame->names[base + i] = packet.bones[i].name;
+            const auto& wire = packet.bones[i];
+            auto& bone = frame->bones[base + i];
+            if (BoneHasTranslation(wire)) {
+                DecodeBone(wire, bone);
+                translations_[wire.name] = bone.t;
+            } else if (auto known = translations_.find(wire.name); known != translations_.end()) {
+                bone.t = known->second;
+                DecodeBone(wire, bone);
+            } else {
+                continue; // translation unknown until the next keyframe: leave the bone to the receiver's mesh
+            }
+            frame->names[base + i] = wire.name;
         }
         while (frames_.size() > 16) frames_.pop_front();
         lastArrival_ = arrival;
@@ -336,6 +430,7 @@ private:
         return d;
     }
     std::deque<PoseFrame> frames_;
+    std::unordered_map<uint32_t, ue::FVector> translations_;
     double lastArrival_ = -100;
 };
 
@@ -343,6 +438,35 @@ inline const BonePose* FindBone(const PoseFrame& frame, uint32_t name) {
     for (size_t i = frame.names.size(); i-- > 0;)
         if (frame.names[i] == name) return &frame.bones[i];
     return nullptr;
+}
+
+// The player's face rig (everything under the head, plus face-named helpers) is not streamed; the receiver's
+// mesh keeps its neutral face. Hands and fingers stay so weapons are gripped correctly.
+inline bool BodyBoneSkipped(std::string_view name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const char* term : {"face", "tongue", "palate", "eye", "lip", "brow", "cheek", "jaw", "teeth", "nose", "mouth"})
+        if (lower.find(term) != std::string::npos) return true;
+    return false;
+}
+
+// Bones to stream for a player body; a skipped bone drops its whole subtree so every sent bone's parent is sent.
+inline std::vector<int> BodyBoneSubset(const std::vector<std::string>& names, const std::vector<int>& parents, bool full) {
+    std::vector<int> subset;
+    std::vector<bool> kept(names.size(), false);
+    size_t limit = kPoseBonesPerPacket * kPoseMaxChunks - 1; // room for @root
+    for (size_t i = 0; i < names.size() && subset.size() < limit; ++i) {
+        int parent = i < parents.size() ? parents[i] : -1;
+        bool parentKept = parent < 0 || (static_cast<size_t>(parent) < i && kept[parent]);
+        if (!parentKept) continue;
+        if (!full && BodyBoneSkipped(names[i])) continue;
+        kept[i] = true;
+        subset.push_back(static_cast<int>(i));
+        std::string lower(names[i]);
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!full && lower == "head") kept[i] = false; // keep the head itself, drop everything below it
+    }
+    return subset;
 }
 
 } // namespace coop

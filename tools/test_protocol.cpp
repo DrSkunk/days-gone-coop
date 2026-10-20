@@ -253,7 +253,7 @@ bool SameRotation(const float a[4], const float b[4], float eps) {
 
 void TestPose() {
     using namespace coop;
-    static_assert(sizeof(PosePacket) == 44 + 80 * 17 && sizeof(PosePacket) <= 1472, "pose packets fit one Ethernet frame");
+    static_assert(kPosePacketMaxBytes == 44 + 64 * 17 && kPosePacketMaxBytes <= 1200, "pose datagrams stay below the safe internet payload");
     assert(BoneHash("Spine") == BoneHash("spine") && BoneHash("spine") != BoneHash("spine1") && BoneHash("") != 0);
     assert(kRootBoneHash == BoneHash("@ROOT"));
 
@@ -305,7 +305,7 @@ void TestPose() {
     auto mid = BlendPose(parent, child, 0.5f);
     assert(Near(mid.t.x, 3, 1e-4f) && Near(mid.t.y, 35, 1e-4f));
 
-    // A 529-bone frame splits into seven validated chunks that reassemble regardless of arrival order.
+    // A 529-bone frame splits into nine validated chunks that reassemble regardless of arrival order.
     std::vector<uint32_t> names;
     std::vector<BonePose> bones;
     for (int i = 0; i < 529; ++i) {
@@ -323,15 +323,14 @@ void TestPose() {
         auto shifted = bones;
         for (auto& b : shifted) b.t.y = offset;
         out.clear();
-        assert(EncodePose(header, names, shifted, [&](const PosePacket& packet, size_t size) {
-            const char* bytes = reinterpret_cast<const char*>(&packet);
+        assert(EncodePose(header, names, shifted, [&](const char* bytes, size_t size) {
             out.emplace_back(bytes, bytes + size);
         }));
     };
     std::vector<std::vector<char>> a, b;
     make(1000, 0, a);
     make(1033, 10, b);
-    assert(a.size() == 7 && a.back().size() == PosePacketSize(529 - 6 * 80));
+    assert(a.size() == 9 && a.back().size() == 44 + (529 - 8 * 64) * kPoseBoneFullBytes);
     PoseBuffer buffer;
     PosePacket packet;
     for (auto it = a.rbegin(); it != a.rend(); ++it) {
@@ -362,17 +361,74 @@ void TestPose() {
     reinterpret_cast<PoseHeader*>(bad.data())->kind = kPoseEnemy; // enemies need an entity id
     assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
     bad = a[0];
-    reinterpret_cast<PoseHeader*>(bad.data())->chunk = 7;
+    reinterpret_cast<PoseHeader*>(bad.data())->chunk = 9;
     assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
     bad = a[0];
     reinterpret_cast<PoseHeader*>(bad.data())->health = std::numeric_limits<float>::quiet_NaN();
     assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
     bad = a[0];
-    reinterpret_cast<PoseBoneWire*>(bad.data() + sizeof(PoseHeader))->largest = 4;
+    bad[sizeof(PoseHeader) + 4] = 8; // unknown bone flag
+    assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
+    bad = a[0];
+    bad[sizeof(PoseHeader) + 4] &= ~kBoneHasTranslation; // the declared bones no longer fill the datagram
     assert(!DecodePose(bad.data(), static_cast<int>(bad.size()), packet));
     std::vector<uint32_t> tooMany(kPoseBonesPerPacket * kPoseMaxChunks + 1, 1);
     std::vector<BonePose> tooManyBones(tooMany.size());
-    assert(!EncodePose(PoseHeader{}, tooMany, tooManyBones, [](const PosePacket&, size_t) { assert(false); }));
+    assert(!EncodePose(PoseHeader{}, tooMany, tooManyBones, [](const char*, size_t) { assert(false); }));
+
+    // With a tracker, unchanged translations are omitted between keyframes and restored by the receiver.
+    {
+        std::vector<uint32_t> hashes{BoneHash("hips"), BoneHash("spine"), BoneHash("hand")};
+        std::vector<BonePose> pose(3);
+        pose[0].t = {1, 2, 3};
+        pose[1].t = {0, 0, 40};
+        pose[2].t = {5, 0, 0};
+        PoseTranslationTracker tracker;
+        PoseBuffer receiver, late;
+        auto send = [&](uint32_t timeMs, PoseBuffer& to, size_t& bytes) {
+            PoseHeader header{};
+            header.kind = kPoseBody;
+            header.timeMs = timeMs;
+            bytes = 0;
+            assert(EncodePose(header, hashes, pose, [&](const char* data, size_t size) {
+                PosePacket in;
+                bytes += size;
+                assert(DecodePose(data, static_cast<int>(size), in));
+                assert(to.Push(in, timeMs / 1000.0));
+            }, &tracker));
+        };
+        size_t bytes = 0;
+        send(0, receiver, bytes);
+        assert(bytes == 44 + 3 * kPoseBoneFullBytes); // first frame is a keyframe
+        send(300, receiver, bytes);
+        assert(bytes == 44 + 3 * kPoseBoneRotationBytes); // nothing moved for longer than the hold time
+        pose[0].t = {10, 2, 3};
+        send(350, receiver, bytes);
+        assert(bytes == 44 + kPoseBoneFullBytes + 2 * kPoseBoneRotationBytes);
+        send(500, receiver, bytes); // still inside the hold window: repeated in case the last datagram was lost
+        assert(bytes == 44 + kPoseBoneFullBytes + 2 * kPoseBoneRotationBytes);
+        send(650, receiver, bytes);
+        assert(bytes == 44 + 3 * kPoseBoneRotationBytes);
+        PoseFrame got;
+        assert(receiver.Sample(650, got) && Near(FindBone(got, hashes[0])->t.x, 10, 0.02f) &&
+               Near(FindBone(got, hashes[1])->t.z, 40, 0.02f));
+        // A receiver that missed the keyframe leaves rotation-only bones alone until the next keyframe.
+        send(700, late, bytes);
+        assert(late.Sample(700, got) && !FindBone(got, hashes[1]));
+        send(1000, late, bytes);
+        assert(bytes == 44 + 3 * kPoseBoneFullBytes);
+        assert(late.Sample(1000, got) && Near(FindBone(got, hashes[1])->t.z, 40, 0.02f));
+    }
+
+    // The player stream drops the face rig below the head but keeps the head, hands and fingers.
+    {
+        std::vector<std::string> body{"root", "hips", "spine", "neck", "Head", "face_root", "jaw", "hair_01",
+                                      "r_hand", "r_index_01", "l_eye_helper", "r_thumb_01"};
+        std::vector<int> parents{-1, 0, 1, 2, 3, 4, 4, 4, 2, 8, 2, 8};
+        std::vector<int> expected{0, 1, 2, 3, 4, 8, 9, 11};
+        assert(BodyBoneSubset(body, parents, false) == expected);
+        assert(BodyBoneSubset(body, parents, true).size() == body.size());
+    }
 }
 
 void TestEnemy() {
@@ -416,7 +472,7 @@ void TestEnemy() {
         kept[i] = true;
         assert(parents[i] < 0 || kept[parents[i]]);
     }
-    // Large rigs are capped so a frame never exceeds two packets including the root.
+    // Large rigs are capped so a frame never exceeds three packets including the root.
     std::vector<std::string> many(400, "bone");
     std::vector<int> chain(400);
     for (int i = 0; i < 400; ++i) chain[i] = i - 1;
@@ -433,9 +489,9 @@ void TestEnemy() {
     std::vector<uint32_t> hashes{BoneHash("hips"), kRootBoneHash};
     std::vector<BonePose> bones(2);
     PoseBuffer buffer;
-    assert(EncodePose(header, hashes, bones, [&](const PosePacket& packet, size_t size) {
+    assert(EncodePose(header, hashes, bones, [&](const char* data, size_t size) {
         PosePacket in;
-        assert(DecodePose(reinterpret_cast<const char*>(&packet), static_cast<int>(size), in) && in.header.entity == 9);
+        assert(DecodePose(data, static_cast<int>(size), in) && in.header.entity == 9);
         assert(buffer.Push(in, 1.0));
     }));
     PoseFrame frame;

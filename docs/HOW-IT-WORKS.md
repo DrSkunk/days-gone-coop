@@ -206,14 +206,14 @@ then pinned until the game restarts. A peer that has been silent for 5 s
 counts as disconnected. A new session ID (from `BCryptGenRandom`) counts as a
 reconnect.
 
-### 4.2 State packet (protocol v5)
+### 4.2 State packet (protocol v6)
 
 [`protocol.hpp`](../src/coop/protocol.hpp) defines a fixed 144-byte
 little-endian packet, sent at 30 Hz:
 
 | Field | Type | Notes |
 |---|---|---|
-| magic, version | u32, u16 | `"DGCO"`, 5 |
+| magic, version | u32, u16 | `"DGCO"`, 6 |
 | flags | u16 | HasPawn, InVehicle, HasBike, Passenger, FriendlyFire, AcceptPassengers, Alive, SyncBikes, WorldState |
 | seq, timeMs | u32 each | wrapping sequence; sender's frame clock |
 | pos[3], yaw, pitch, vel[3] | f32 | finite, within ±1e8 |
@@ -228,7 +228,8 @@ little-endian packet, sent at 30 Hz:
 
 Decoding rejects a packet with the wrong size, magic, version or flags, or
 with non-finite or out-of-range values. Each frame processes at most 64
-packets.
+packets. A state packet with the right magic but another version is logged
+once, so a version mismatch is visible in the log.
 
 ### 4.3 Additional datagrams
 
@@ -236,16 +237,35 @@ The same socket carries three more types, each identified by its own magic:
 
 | Magic | Content | Rate |
 |---|---|---|
-| `DPOS` | Compressed skeleton pose: body, bike or enemy | with each state packet; enemies 15 Hz |
+| `DPOS` | Compressed skeleton pose: body, bike or enemy | body and bike 20 Hz (`PoseRate`); enemies 15 Hz |
 | `DMGR` | Held item: mesh asset path, socket and offset | on change and every 0.5 s |
 | `DMEN` | Enemy appearance: up to four mesh asset paths | every 1 s per enemy |
 
-A pose datagram carries up to 80 bones, 17 bytes each: 16-bit translations in
-0.02 cm steps and "smallest-three" compressed quaternions. Bones are matched by
-a hash of their name, not by index.
+A pose datagram (version 2) carries up to 64 bones, so it never exceeds
+1,132 bytes. Each bone has a 32-bit hash of its name (bones are matched by
+name, not by index), a "smallest-three" compressed quaternion and, only when
+needed, a 16-bit translation in 0.02 cm steps. A bone is 11 bytes without a
+translation and 17 bytes with one.
 
-Bandwidth is about 300 kB/s each way for body and bike, plus about 140 kB/s
-per eight enemies. That's fine on a LAN but not designed for the Internet.
+Most animated bones only rotate, so the sender includes a translation only:
+
+- in a keyframe, once per second per stream;
+- for 250 ms after that bone's translation changed, so a single lost datagram
+  heals.
+
+The receiver remembers the last translation per bone. A bone whose translation
+it has never received is skipped until the next keyframe, and the receiving mesh
+keeps its current value for it.
+
+The player body skips its face rig: every bone below `head` and any bone with a
+face-related name (eye, jaw, lip, brow and similar). Hands and fingers are
+still streamed. The partner therefore shows a neutral face. `PoseFace=1`
+streams the full skeleton again.
+
+These measures replace the earlier format, which sent all 529 body bones with
+translations at 30 Hz (about 300 kB/s each way, measured). The new expected
+cost is well under 100 kB/s per direction for body and bike. That estimate
+still has to be confirmed in a live session with the `perf:` log lines.
 
 ### 4.4 Motion smoothing
 

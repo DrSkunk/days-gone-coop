@@ -84,6 +84,17 @@ bool UdpPeer::Receive(StatePacket& out, const std::function<void(const char*, in
         lastReceiveError_ = 0;
         if (hasPeer_ && (from.sin_addr.s_addr != peer_.sin_addr.s_addr ||
                         from.sin_port != peer_.sin_port)) continue;
+        if (n == static_cast<int>(sizeof(StatePacket))) {
+            uint32_t magic = 0;
+            uint16_t version = 0;
+            std::memcpy(&magic, buf, sizeof magic);
+            std::memcpy(&version, buf + sizeof magic, sizeof version);
+            if (magic == kMagic && version != kProtocolVersion && version != lastForeignVersion_) {
+                Log("network: ignoring a partner on protocol v%u; this build speaks v%u (both players need the same mod version)",
+                    version, kProtocolVersion);
+                lastForeignVersion_ = version;
+            }
+        }
         if (!DecodeState(buf, n, out)) {
             if (hasPeer_ && other) other(buf, n);
             continue;

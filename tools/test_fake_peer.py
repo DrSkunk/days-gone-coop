@@ -31,12 +31,19 @@ class ProtocolTest(unittest.TestCase):
         path = b'/Game/Characters/Freaker/Swarmer/parts_combo/swarmer_horde_c.swarmer_horde_c'
         info = struct.pack(fake_peer.ENEMY_INFO, fake_peer.ENEMY_INFO_MAGIC, 1, 1, 0, 7, 3, path, b'', b'', b'')
         self.assertEqual(fake_peer.decode_enemy_datagram(info), ('info', 3, [path.decode()]))
-        header = struct.pack(fake_peer.POSE_HEADER, fake_peer.POSE_MAGIC, 1, fake_peer.POSE_ENEMY, 2, 7, 500, 3,
-                             0, 1, 1, 1.0, 2.0, 3.0, 90.0, 50.0)
-        self.assertEqual(fake_peer.decode_enemy_datagram(header + b'\0' * 34), ('pose', 3, 2, (1.0, 2.0, 3.0), True))
-        self.assertIsNone(fake_peer.decode_enemy_datagram(header + b'\0' * 33))
+        header = struct.pack(fake_peer.POSE_HEADER, fake_peer.POSE_MAGIC, fake_peer.POSE_VERSION,
+                             fake_peer.POSE_ENEMY, 2, 7, 500, 3, 0, 1, 1, 1.0, 2.0, 3.0, 90.0, 50.0)
+        full = struct.pack('<IB3h3h', 11, fake_peer.POSE_HAS_TRANSLATION, 0, 0, 0, 1, 2, 3)
+        rotation = struct.pack('<IB3h', 12, 1, 0, 0, 0)
+        self.assertEqual(fake_peer.decode_enemy_datagram(header + full + rotation),
+                         ('pose', 3, 2, (1.0, 2.0, 3.0), True))
+        self.assertIsNone(fake_peer.decode_enemy_datagram(header + full + rotation[:-1]))
+        self.assertIsNone(fake_peer.decode_enemy_datagram(header + full + rotation + b'\0'))
+        self.assertIsNone(fake_peer.decode_enemy_datagram(header + full + struct.pack('<IB3h', 12, 8, 0, 0, 0)))
         body = header[:6] + bytes([0]) + header[7:]
-        self.assertIsNone(fake_peer.decode_enemy_datagram(body + b'\0' * 34))
+        self.assertIsNone(fake_peer.decode_enemy_datagram(body + full + rotation))
+        old = header[:4] + struct.pack('<H', 1) + header[6:]
+        self.assertIsNone(fake_peer.decode_enemy_datagram(old + full + rotation))
 
     def test_gear_datagrams(self):
         self.assertEqual(struct.calcsize(fake_peer.GEAR), 240)

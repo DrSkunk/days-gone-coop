@@ -11,7 +11,7 @@ import struct
 import time
 
 MAGIC = 0x4F434744
-VERSION = 5
+VERSION = 6
 HAS_PAWN = 1
 WORLD_STATE = 1 << 8
 SYNC_ENEMIES = 1 << 9
@@ -24,6 +24,10 @@ ENEMY_INFO_MAGIC = 0x4E454D44
 POSE_HEADER = '<IHBBIIIBBH3fff'
 ENEMY_INFO = '<IHBBII' + '120s' * 4
 POSE_ENEMY = 2
+POSE_VERSION = 2
+POSE_BONE_ROTATION = 11
+POSE_LARGEST_MASK = 0x03
+POSE_HAS_TRANSLATION = 0x04
 GEAR_MAGIC = 0x52474D44
 GEAR = '<IHBBII4f3f3f64s120s'
 GEAR_KINDS = {0: 'none', 1: 'skeletal', 2: 'static'}
@@ -50,7 +54,17 @@ def decode_enemy_datagram(data):
     if len(data) >= struct.calcsize(POSE_HEADER) and struct.unpack_from('<I', data)[0] == POSE_MAGIC:
         (magic, version, kind, count, session, time_ms, entity, chunk, chunks, flags,
          x, y, z, yaw, health) = struct.unpack_from(POSE_HEADER, data)
-        if kind != POSE_ENEMY or not entity or len(data) != struct.calcsize(POSE_HEADER) + 17 * count:
+        if kind != POSE_ENEMY or not entity or version != POSE_VERSION:
+            return None
+        offset = struct.calcsize(POSE_HEADER)
+        for _ in range(count):
+            if offset + POSE_BONE_ROTATION > len(data):
+                return None
+            info = data[offset + 4]
+            if info & ~(POSE_LARGEST_MASK | POSE_HAS_TRANSLATION):
+                return None
+            offset += POSE_BONE_ROTATION + (6 if info & POSE_HAS_TRANSLATION else 0)
+        if offset != len(data):
             return None
         return ('pose', entity, count, (x, y, z), bool(flags & 1))
     return None

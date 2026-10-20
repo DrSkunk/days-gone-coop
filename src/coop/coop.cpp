@@ -84,12 +84,14 @@ struct PoseSource {
     UObject* asset = nullptr;
     BoneTable table;
     PoseReader reader;
+    PoseTranslationTracker tracker;
+    std::vector<int> subset; // streamed bone indices; empty streams every bone
     std::vector<uint32_t> names;
-    std::vector<BonePose> bones;
+    std::vector<BonePose> all, bones;
 };
 PoseSource g_bodySource, g_bikeSource;
 PoseBuffer g_bodyPoses, g_bikePoses;
-double g_lastBodyPose = -10, g_lastBikePose = -10;
+double g_lastBodyPose = -10, g_lastBikePose = -10, g_nextPoseSend = 0;
 constexpr double kPoseFresh = 0.5;
 struct PoseStats {
     uint64_t sent = 0, bytes = 0, received = 0, rejected = 0, reads = 0;
@@ -914,7 +916,7 @@ bool DiscoverDebug(UObject* pawn) {
     return true;
 }
 
-bool ReadPoseSource(PoseSource& source, UObject* mesh) {
+bool ReadPoseSource(PoseSource& source, UObject* mesh, bool body) {
     if (!IsLive(mesh)) return false;
     auto asset = Prop(mesh, "SkeletalMesh");
     if (mesh != source.mesh || asset != source.asset || !source.table.Valid()) {
@@ -922,11 +924,28 @@ bool ReadPoseSource(PoseSource& source, UObject* mesh) {
         if (!ReadBoneTable(mesh, source.table)) return false;
         source.mesh = mesh;
         source.asset = asset;
-        source.names = source.table.hashes;
-        Log("pose: streaming %d bones of %s", static_cast<int>(source.names.size()), Name(asset).c_str());
+        if (body) {
+            std::vector<std::string> names;
+            for (auto name : source.table.names) names.push_back(NameString(name.index));
+            source.subset = BodyBoneSubset(names, source.table.parents, g_cfg.poseFace);
+            for (int i : source.subset) source.names.push_back(source.table.hashes[i]);
+        } else {
+            source.names = source.table.hashes;
+        }
+        Log("pose: streaming %d of %d bones of %s", static_cast<int>(source.names.size()),
+            static_cast<int>(source.table.hashes.size()), Name(asset).c_str());
     }
+    if (source.names.empty()) return false;
     double start = Now();
-    bool read = source.reader.Read(mesh, source.table, source.names.size(), source.bones);
+    bool read;
+    if (source.subset.empty()) {
+        read = source.reader.Read(mesh, source.table, source.names.size(), source.bones);
+    } else {
+        read = source.reader.Read(mesh, source.table, static_cast<size_t>(source.subset.back()) + 1, source.all);
+        source.bones.clear();
+        if (read)
+            for (int i : source.subset) source.bones.push_back(source.all[i]);
+    }
     g_poseStats.readTime += Now() - start;
     ++g_poseStats.reads;
     return read;
@@ -934,7 +953,7 @@ bool ReadPoseSource(PoseSource& source, UObject* mesh) {
 
 // Streams the evaluated local pose of `mesh`; the receiver drives a poseable copy with it.
 void SendPose(PoseKind kind, PoseSource& source, UObject* mesh, uint32_t timeMs, float health, bool withRoot) {
-    if (!ReadPoseSource(source, mesh)) return;
+    if (!ReadPoseSource(source, mesh, kind == kPoseBody)) return;
     PoseHeader header{};
     header.kind = kind;
     header.session = g_session;
@@ -952,11 +971,11 @@ void SendPose(PoseKind kind, PoseSource& source, UObject* mesh, uint32_t timeMs,
             source.bones.push_back(root);
         }
     }
-    EncodePose(header, source.names, source.bones, [](const PosePacket& packet, size_t size) {
-        g_net.SendRaw(&packet, static_cast<int>(size));
+    EncodePose(header, source.names, source.bones, [](const char* packet, size_t size) {
+        g_net.SendRaw(packet, static_cast<int>(size));
         ++g_poseStats.sent;
         g_poseStats.bytes += size;
-    });
+    }, &source.tracker);
     source.names.resize(real);
     source.bones.resize(real);
 }
@@ -1066,11 +1085,15 @@ void SendLocalState(UObject* pawn, double now) {
     }
     g_net.Send(p);
     if (!(p.flags & kHasPawn) || now - g_lastRecv >= kPeerTimeout) return;
+    SendGear(pawn, now);
+    if (now < g_nextPoseSend) return;
+    double poseInterval = 1.0 / g_cfg.poseRate;
+    g_nextPoseSend += poseInterval;
+    if (g_nextPoseSend <= now) g_nextPoseSend = now + poseInterval;
     UObject* mesh = g_passenger.pawn == pawn && IsLive(g_passengerAvatar.component) ? g_passengerAvatar.component :
         IsA(pawn, C.character) ? Prop(pawn, "Mesh") : nullptr;
     if (mesh) SendPose(kPoseBody, g_bodySource, mesh, p.timeMs, p.health, true);
     if (p.flags & kHasBike) SendPose(kPoseBike, g_bikeSource, Prop(g_localBike, "VehicleMesh"), p.timeMs, 0, false);
-    SendGear(pawn, now);
 }
 
 void ReceivePose(const char* data, int len, double now) {
@@ -2447,6 +2470,7 @@ struct EnemySource {
     UObject* asset = nullptr;
     BoneTable table;
     PoseReader reader;
+    PoseTranslationTracker tracker;
     std::vector<int> subset;
     std::vector<uint32_t> names;
     std::vector<BonePose> all, bones;
@@ -2838,6 +2862,7 @@ void SendEnemy(EnemySource& e, const FVector& origin, uint32_t timeMs, double no
     if (mesh != e.mesh || asset != e.asset || !e.table.Valid()) {
         e.table = BoneTable{};
         e.reader = PoseReader{};
+        e.tracker.Reset();
         if (!ReadBoneTable(mesh, e.table)) return;
         e.mesh = mesh;
         e.asset = asset;
@@ -2888,11 +2913,11 @@ void SendEnemy(EnemySource& e, const FVector& origin, uint32_t timeMs, double no
     header.health = std::isfinite(health) ? std::clamp(health, 0.f, 100000.f) : 0.f;
     Call alive(e.pawn, "IsAlive");
     if (alive.invoke() && alive.get<bool>("ReturnValue")) header.flags |= kPoseAlive;
-    EncodePose(header, e.names, e.bones, [](const PosePacket& packet, size_t size) {
-        g_net.SendRaw(&packet, static_cast<int>(size));
+    EncodePose(header, e.names, e.bones, [](const char* packet, size_t size) {
+        g_net.SendRaw(packet, static_cast<int>(size));
         ++g_enemyStats.sent;
         g_enemyStats.bytes += size;
-    });
+    }, &e.tracker);
     e.names.pop_back();
 }
 
@@ -3332,6 +3357,8 @@ Config LoadConfig(const std::wstring& ini) {
     c.animRun = IniString(ini, L"AnimRun", c.animRun.c_str());
     c.animSprint = IniString(ini, L"AnimSprint", c.animSprint.c_str());
     c.teleportKey = GetPrivateProfileIntW(L"Coop", L"TeleportKey", c.teleportKey, ini.c_str());
+    c.poseRate = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Coop", L"PoseRate", c.poseRate, ini.c_str())), 10, 30);
+    c.poseFace = GetPrivateProfileIntW(L"Coop", L"PoseFace", 0, ini.c_str()) != 0;
     return c;
 }
 

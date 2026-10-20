@@ -26,6 +26,7 @@ private:
     bool hasPeer_ = false;
     int lastSendError_ = 0;
     int lastReceiveError_ = 0;
+    uint16_t lastForeignVersion_ = 0;
 };
 
 } // namespace coop

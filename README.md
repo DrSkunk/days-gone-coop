@@ -180,13 +180,15 @@ All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 | `Discovery` | `0` | Developers: log engine details; F6 dumps the local pawn |
 | `DebugTools` | `0` | Developers: enable test tools (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
 | `AnimIdle`, `AnimWalk`, `AnimRun`, `AnimSprint` | Deacon clips | Fallback animations used when no pose stream arrives |
+| `PoseRate` | `20` | Player and bike pose updates per second (10-30). Lower saves bandwidth |
+| `PoseFace` | `0` | `1` also streams the face rig (about 280 more bones, much more bandwidth) |
 
 ## Troubleshooting
 
 The plugin writes `DaysGoneTogether.log` next to itself. A healthy start looks like this:
 
 ```text
-Days Gone Together 0.1.0 starting (protocol v5)
+Days Gone Together … starting (protocol v6)
 ProcessEvent hook installed
 GNames via pointer at rva 0x…, … names
 network: listening on UDP 27777, …

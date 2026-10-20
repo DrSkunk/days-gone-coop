@@ -22,6 +22,8 @@ struct Config {
     std::string animRun = "/Game/Animation/Deacon/run/run.Run";
     std::string animSprint = "/Game/Animation/Deacon/run/sprint.Sprint";
     int teleportKey = 0x76; // VK_F7
+    int poseRate = 20;      // player and bike pose updates per second (10-30)
+    bool poseFace = false;  // also stream the face rig (about 280 extra bones)
 };
 
 Config LoadConfig(const std::wstring& iniPath);
