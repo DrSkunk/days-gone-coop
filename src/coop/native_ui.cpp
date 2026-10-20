@@ -875,6 +875,19 @@ UObject* FindHud() {
     return nullptr;
 }
 
+// The title menu (and its font) is gone during gameplay, so style the log like the HUD's warning text.
+UObject* HudFontSource(UObject* hud) {
+    auto tree = ObjectField(hud, "WidgetTree");
+    auto textClass = FindClass("TextBlock");
+    if (!tree || !textClass) return nullptr;
+    for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+        auto obj = ObjectAt(i);
+        if (obj && obj->cls == textClass && obj->outer == tree && IsLive(obj) && Name(obj) == "WarningText") return obj;
+    }
+    Log("native ui: HUD WarningText not found; using the title font");
+    return nullptr;
+}
+
 } // namespace
 
 void Configure(bool trace) {
@@ -944,8 +957,10 @@ bool Notify(const std::string& title, const std::string& body) {
         g_hudLogOwner = hud;
         g_hudLogLines.clear();
     }
+    // Left edge, below the mission objective tracker and above the weapon/health widgets.
+    auto font = IsLive(g_hudLogText.get()) ? nullptr : HudFontSource(hud);
     ShowLogPanel(true, ObjectField(hud, "CanvasWrapper"), ObjectField(hud, "WidgetTree"),
-                 ObjectField(g_main.widget, "TextEntry0"), {0, 0, 0, 0, 0.05f, 0.12f, 0.48f, 0.35f, 0, 0},
+                 font ? font : ObjectField(g_main.widget, "TextEntry0"), {0, 0, 0, 0, 0.02f, 0.34f, 0.31f, 0.57f, 0, 0},
                  g_hudLogText, g_hudLogBackground);
     if (!IsLive(g_hudLogText.get())) return false;
     if (g_now >= g_hudLogUntil) g_hudLogLines.clear();

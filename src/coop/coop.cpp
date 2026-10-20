@@ -50,6 +50,8 @@ constexpr uint8_t kPrologue[19] = {0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x5
 constexpr double kTickInterval = 1.0 / 60.0;
 constexpr double kSendInterval = 1.0 / 30.0;
 constexpr double kPeerTimeout = 5.0;
+// Who was reported as connected without a matching disconnect yet (empty: nobody).
+std::string g_announcedPartner;
 
 std::wstring g_basePath;
 Config g_cfg;
@@ -1302,7 +1304,9 @@ void ReceiveRemote(double now) {
             g_bikePoses.Clear();
             Log("peer %s (%s) connected", p.name, g_net->PeerText().c_str());
             std::string name = g_kind == session::Kind::Steam ? g_steam.PartnerName() : std::string(p.name);
+            if (name.empty()) name = "Your partner";
             g_events.Add(name + " connected");
+            g_announcedPartner = name;
             DestroyAvatar();  // Rebuild from the player's current look; also a manual "respawn" lever.
             DestroyBike();
             DestroyEnemyReplicas();
@@ -3316,11 +3320,11 @@ void ResetPartner() {
 
 void LeaveSession(bool announce) {
     if (g_kind == session::Kind::None && !g_steam.InLobby()) return;
-    bool wasConnected = PartnerConnected(g_tickNow);
-    std::string partner = PartnerName();
+    std::string partner = std::move(g_announcedPartner);
+    g_announcedPartner.clear();
     if (g_steam.InLobby()) g_steam.Leave();
     else if (announce && g_kind != session::Kind::Steam) g_events.Add("Left the LAN session");
-    if (wasConnected) g_events.Add(partner + " disconnected");
+    if (!partner.empty()) g_events.Add(partner + " disconnected");
     g_udp.SetIdle();
     g_kind = session::Kind::None;
     g_net = &g_udp;
@@ -3456,6 +3460,8 @@ void RunMenuCommand(const ui::Command& command) {
     }
 }
 
+uint64_t g_logged = 0;
+
 void UpdateSession(double now) {
     for (auto& text : g_steam.TakeEvents()) g_events.Add(std::move(text));
     SyncSessionKind();
@@ -3470,6 +3476,10 @@ void UpdateSession(double now) {
     // Session events also appear as native HUD notifications during gameplay.
     if (now < g_notifyRetryAt) return;
     for (const auto& entry : g_events.Since(g_notified)) {
+        if (entry.serial > g_logged) {
+            g_logged = entry.serial;
+            Log("session event: %s", entry.text.c_str());
+        }
         if (g_pawn && !ui::MenuOpen() && !ui::Notify("CO-OP", entry.text)) {
             g_notifyRetryAt = now + 1;
             break;
@@ -3642,8 +3652,9 @@ void Tick(bool hudFrame) {
     static bool wasAlive = false, wasConnected = false;
     bool alive = g_pawn && Alive(g_pawn), connected = now - g_lastRecv < kPeerTimeout;
     if (alive != wasAlive || (wasConnected && !connected)) ++g_consent;
-    if (wasConnected && !connected) {
-        g_events.Add(PartnerName() + " disconnected");
+    if (wasConnected && !connected && !g_announcedPartner.empty()) {
+        g_events.Add(g_announcedPartner + " disconnected");
+        g_announcedPartner.clear();
         // A LAN host forgets the silent partner so the next player can take the slot.
         if (g_kind == session::Kind::LanHost) g_udp.DropPartner();
     }

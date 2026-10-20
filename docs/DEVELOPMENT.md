@@ -189,7 +189,10 @@ menu uses its existing status-text widget. The gameplay log expires after
 six seconds. This is not a typed chat protocol.
 
 The title panel is attached to `Menu_Layout`; the gameplay panel is attached
-to `UI_HudWidget_C.CanvasWrapper`. Widgets are constructed with reflected
+to `UI_HudWidget_C.CanvasWrapper` on the left edge, between the objective
+tracker and the health/weapon widgets, and copies the font of the HUD's own
+`WarningText`. Every event is also written to the log as `session event: ...`.
+Disconnects are reported once, for the name that was announced as connected. Widgets are constructed with reflected
 `GameplayStatics.SpawnObject`, owned by the respective WidgetTree, attached
 with `AddChildToCanvas`, and retained against garbage collection. Calling the
 stock HUD `AddNotification` wrapper did not visibly display these messages,
@@ -201,11 +204,16 @@ visibility changes and invite-overlay activation have been exercised live on
 build 19221447 under Proton. LAN discovery/join selection, local Continue
 from Start Game, the shifted title Quit to Desktop row, restoring vanilla
 pause labels, both vanilla pause quit confirmations, and visible gameplay connect/disconnect events against the
-simulated peer were also verified. Public search completed with no compatible
-lobbies found; that does not verify joining one. If the original Steam host
-leaves, the session ends instead of migrating campaign authority.
-Two-account Steam joining/gameplay, controller
-navigation and every mouse target still require acceptance testing. There
+simulated peer were also verified. Two Steam accounts on two machines (a Proton desktop and a Steam Deck) were
+used to verify: friends-only hosting from the title and pause menus, JOIN A
+FRIEND from the title and pause menus, public visibility with FIND PUBLIC
+GAMES, START GAME into shared gameplay over SteamNetworkingMessages, guest
+LEAVE SESSION, host CLOSE SESSION, and rejoining mid-game. LAN hosting from
+the pause menu and JOIN LAN GAME were verified between the same machines.
+If the original Steam host leaves, the session ends instead of migrating
+campaign authority. Steam invite acceptance (`GameLobbyJoinRequested` /
+`+connect_lobby`), controller navigation and every mouse target still
+require acceptance testing. There
 is no synchronized ready/start handshake or host-authoritative mission
 replication yet. Save transfer is optional and not required to open a lobby.
 
