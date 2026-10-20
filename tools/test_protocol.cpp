@@ -9,6 +9,7 @@
 #include "../src/coop/gear.hpp"
 #include "../src/coop/steam_abi.hpp"
 #include "../src/coop/save_policy.hpp"
+#include "../src/coop/savesync.hpp"
 
 #include <cassert>
 #include <cstring>
@@ -580,8 +581,109 @@ void TestSavePolicy() {
     std::puts("save policy ok");
 }
 
+std::string Hex(const coop::Sha256::Digest& digest) {
+    std::string out;
+    char buffer[3];
+    for (auto byte : digest) {
+        std::snprintf(buffer, sizeof buffer, "%02x", byte);
+        out += buffer;
+    }
+    return out;
+}
+
+void TestSaveSync() {
+    using namespace coop::savesync;
+    assert(Hex(coop::Sha256::Of("", 0)) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert(Hex(coop::Sha256::Of("abc", 3)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    std::string longer = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    assert(Hex(coop::Sha256::Of(longer.data(), longer.size())) ==
+           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    coop::Sha256 split;
+    std::string million(1000000, 'a');
+    for (size_t i = 0; i < million.size(); i += 777) split.Update(million.data() + i, std::min<size_t>(777, million.size() - i));
+    assert(Hex(split.Finish()) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+
+    for (auto name : {"autosave01.sav", "profile.sav", "slot-1_A.SAV", "console.sav", "com10.sav", "nul_.sav"}) assert(ValidName(name));
+    for (auto name : {"", ".sav", "..\\x.sav", "a/b.sav", "a\\b.sav", ".hidden.sav", "x.txt", "a..sav", "C:x.sav",
+                      "abcdefghijklmnopqrstuvwxyz12.sav", "nul.sav", "CON.sav", "com1.sav", "Lpt9.x.sav", "aux.backup.sav"})
+        assert(!ValidName(name));
+
+    std::vector<File> files{{"profile.sav", std::vector<uint8_t>(10114, 7)}, {"autosave01.sav", {}},
+                            {"checkpoint.sav", std::vector<uint8_t>(3000)}};
+    for (size_t i = 0; i < files[2].data.size(); ++i) files[2].data[i] = static_cast<uint8_t>(i * 31);
+    auto bundle = BuildBundle(files);
+    assert(!bundle.empty());
+    std::vector<File> parsed;
+    assert(ParseBundle(bundle, parsed) && parsed.size() == 3);
+    for (size_t i = 0; i < files.size(); ++i) assert(parsed[i].name == files[i].name && parsed[i].data == files[i].data);
+    auto tampered = bundle;
+    tampered.back() ^= 1;
+    assert(!ParseBundle(tampered, parsed) && parsed.empty());
+    auto truncated = bundle;
+    truncated.pop_back();
+    assert(!ParseBundle(truncated, parsed));
+    auto extended = bundle;
+    extended.push_back(0);
+    assert(!ParseBundle(extended, parsed));
+    assert(BuildBundle({}).empty() && BuildBundle({{"../x.sav", {1}}}).empty());
+    assert(BuildBundle({{"a.sav", {1}}, {"A.SAV", {2}}}).size() > 0);
+    assert(!ParseBundle(BuildBundle({{"a.sav", {1}}, {"A.SAV", {2}}}), parsed)); // case-insensitive duplicate
+
+    // Same bytes as tools/test_fake_peer.py BUNDLE_DIGEST, so the Python test peer stays compatible.
+    auto shared = BuildBundle({{"profile.sav", {1, 2, 3}}, {"autosave01.sav", {}}});
+    assert(shared.size() == 143 && Hex(coop::Sha256::Of(shared.data(), shared.size())) ==
+                                       "0f03dc917d9011dc65edf488090f15183862dceb586457648ad1c0453a017163");
+
+    auto digest = coop::Sha256::Of(bundle.data(), bundle.size());
+    Receiver receiver;
+    assert(!receiver.Offer(0, 10, digest.data()) && !receiver.Offer(5, 0, digest.data()));
+    assert(!receiver.Offer(5, kMaxBundleBytes + 1, digest.data()));
+    assert(receiver.Offer(9, static_cast<uint32_t>(bundle.size()), digest.data()));
+    uint32_t chunks = ChunkCount(static_cast<uint32_t>(bundle.size()));
+    assert(chunks == (bundle.size() + kChunkBytes - 1) / kChunkBytes);
+    double now = 0;
+    int rounds = 0, sent = 0;
+    while (!receiver.Complete() && rounds < 1000) {
+        for (uint32_t index : receiver.NextPull(now, 4)) {
+            if (++sent % 3 == 0) continue; // drop every third chunk
+            size_t offset = index * kChunkBytes, size = std::min(kChunkBytes, bundle.size() - offset);
+            assert(receiver.Chunk(9, index, bundle.data() + offset, size));
+            assert(!receiver.Chunk(9, index, bundle.data() + offset, size));
+        }
+        now += 0.1;
+        ++rounds;
+    }
+    assert(receiver.Complete() && receiver.Verified() && receiver.Bundle() == bundle);
+    assert(receiver.NextPull(now, 4).empty());
+    assert(receiver.Offer(9, static_cast<uint32_t>(bundle.size()), digest.data()) && receiver.Complete());
+    Receiver wrong;
+    assert(wrong.Offer(3, static_cast<uint32_t>(bundle.size()), digest.data()));
+    assert(!wrong.Chunk(4, 0, bundle.data(), kChunkBytes));
+    assert(!wrong.Chunk(3, 0, bundle.data(), kChunkBytes - 1));
+    assert(!wrong.Chunk(3, chunks, bundle.data(), 1));
+    for (uint32_t index = 0; index < chunks; ++index) {
+        size_t offset = index * kChunkBytes, size = std::min(kChunkBytes, bundle.size() - offset);
+        std::vector<uint8_t> piece(bundle.begin() + offset, bundle.begin() + offset + size);
+        if (index == 1) piece[0] ^= 0xff;
+        assert(wrong.Chunk(3, index, piece.data(), piece.size()));
+    }
+    assert(wrong.Complete() && !wrong.Verified());
+
+    Header header = MakeHeader(kRequest, 77, 0), decoded{};
+    assert(DecodeHeader(reinterpret_cast<const char*>(&header), sizeof header, decoded) && decoded.session == 77);
+    header = MakeHeader(kOffer, 77, 0);
+    assert(!DecodeHeader(reinterpret_cast<const char*>(&header), sizeof header, decoded));
+    header = MakeHeader(kChunk, 0, 5);
+    assert(!DecodeHeader(reinterpret_cast<const char*>(&header), sizeof header, decoded));
+    header = MakeHeader(static_cast<Type>(9), 1, 5);
+    assert(!DecodeHeader(reinterpret_cast<const char*>(&header), sizeof header, decoded));
+    assert(!DecodeHeader(reinterpret_cast<const char*>(&header), sizeof header - 1, decoded));
+    std::puts("save sync ok");
+}
+
 int main() {
     TestSavePolicy();
+    TestSaveSync();
     TestPose();
     TestSteamAbi();
     TestEnemy();

@@ -284,13 +284,14 @@ once, so a version mismatch is visible in the log.
 
 ### 4.3 Additional datagrams
 
-The same socket carries three more types, each identified by its own magic:
+The same socket carries four more types, each identified by its own magic:
 
 | Magic | Content | Rate |
 |---|---|---|
 | `DPOS` | Compressed skeleton pose: body, bike or enemy | body and bike 20 Hz (`PoseRate`); enemies 15 Hz |
 | `DMGR` | Held item: mesh asset path, socket and offset | on change and every 0.5 s |
 | `DMEN` | Enemy appearance: up to four mesh asset paths | every 1 s per enemy |
+| `DGSV` | Experimental save transfer: request, offer, chunk pull, 1 KB chunk | only while a guest downloads the host's save |
 
 A pose datagram (version 2) carries up to 64 bones, so it never exceeds
 1,132 bytes. Each bone has a 32-bit hash of its name (bones are matched by
@@ -455,11 +456,17 @@ authoritative enemy model, which doesn't exist yet.
   running.
 - Debug tools are off by default, local only, and limited to an allowlist of
   commands (see [DEVELOPMENT.md](DEVELOPMENT.md#debug-tools)).
+- The experimental guest save sandbox (`GuestSaveGuard=1`) hooks the game's
+  file imports so no write can reach the real `SaveGames` folder. Saves received
+  from the host are checked with SHA-256 and strict file-name rules before the
+  game can see them (see
+  [DEVELOPMENT.md](DEVELOPMENT.md#host-to-guest-save-transfer-sharesave--guestsaveguard-experimental)).
 
 ## 7. Limitations
 
 - Each player runs their own single-player world. Missions, saves, inventory
-  and loot are not shared.
+  and loot are not shared. The experimental save transfer only lets the guest
+  start from a copy of the host's last save.
 - Enemy replicas are visual. The joining player can't fight the host's enemies
   and still has their own.
 - No projectile or muzzle-flash replication. Friendly-fire damage is an

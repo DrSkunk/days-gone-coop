@@ -2,10 +2,16 @@
 """Simulated co-op partner for testing DaysGoneTogether.asi with a single game instance.
 
 It speaks the plugin's UDP protocol, waits for the game's first state packet and
-then walks a ghost partner in a circle near the real player.
+then walks a ghost partner in a circle near the real player. With --serve-save it
+also acts as a host sharing a SaveGames folder; with --fetch-save it acts as a
+guest downloading the game's saves (the experimental save transfer).
 """
 import argparse
+import hashlib
 import math
+import os
+import random
+import re
 import socket
 import struct
 import time
@@ -31,6 +37,157 @@ POSE_HAS_TRANSLATION = 0x04
 GEAR_MAGIC = 0x52474D44
 GEAR = '<IHBBII4f3f3f64s120s'
 GEAR_KINDS = {0: 'none', 1: 'skeletal', 2: 'static'}
+SAVE_MAGIC = 0x56534744
+SAVE_VERSION = 1
+SAVE_HEADER = '<IHBBII'
+SAVE_HEADER_SIZE = struct.calcsize(SAVE_HEADER)
+SAVE_REQUEST, SAVE_OFFER, SAVE_PULL, SAVE_CHUNK = 1, 2, 3, 4
+SAVE_CHUNK_BYTES = 1024
+SAVE_ENTRY = '<32sI32s'
+SAVE_MAX_FILES = 32
+SAVE_MAX_BYTES = 64 << 20
+SAVE_NAME = re.compile(r'^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,26}\.[sS][aA][vV]$')
+
+
+SAVE_DEVICE = re.compile(r'^(con|prn|aux|nul|com[0-9]|lpt[0-9])$', re.IGNORECASE)
+
+
+def valid_save_name(name):
+    return bool(SAVE_NAME.match(name)) and '..' not in name and not SAVE_DEVICE.match(name.split('.', 1)[0])
+
+
+def build_save_bundle(files):
+    """files: list of (name, bytes) -> bundle bytes in the plugin's layout."""
+    if not files or len(files) > SAVE_MAX_FILES or any(not valid_save_name(n) for n, _ in files):
+        raise ValueError('invalid save file list')
+    head = struct.pack('<I', len(files)) + b''.join(
+        struct.pack(SAVE_ENTRY, n.encode(), len(d), hashlib.sha256(d).digest()) for n, d in files)
+    bundle = head + b''.join(d for _, d in files)
+    if len(bundle) > SAVE_MAX_BYTES:
+        raise ValueError('bundle too large')
+    return bundle
+
+
+def parse_save_bundle(bundle):
+    (count,) = struct.unpack_from('<I', bundle)
+    if not 0 < count <= SAVE_MAX_FILES:
+        raise ValueError('bad file count')
+    offset, files = 4 + count * struct.calcsize(SAVE_ENTRY), []
+    for i in range(count):
+        raw, size, digest = struct.unpack_from(SAVE_ENTRY, bundle, 4 + i * struct.calcsize(SAVE_ENTRY))
+        name = raw.split(b'\0', 1)[0].decode('ascii')
+        data = bundle[offset:offset + size]
+        if not valid_save_name(name) or len(data) != size or hashlib.sha256(data).digest() != digest:
+            raise ValueError(f'bad entry {name!r}')
+        files.append((name, data))
+        offset += size
+    if offset != len(bundle):
+        raise ValueError('trailing bytes')
+    return files
+
+
+def save_header(kind, session, transfer):
+    return struct.pack(SAVE_HEADER, SAVE_MAGIC, SAVE_VERSION, kind, 0, session, transfer)
+
+
+def decode_save_datagram(data):
+    if len(data) < SAVE_HEADER_SIZE:
+        return None
+    magic, version, kind, _, session, transfer = struct.unpack_from(SAVE_HEADER, data)
+    if magic != SAVE_MAGIC or version != SAVE_VERSION or not SAVE_REQUEST <= kind <= SAVE_CHUNK:
+        return None
+    return kind, session, transfer, data[SAVE_HEADER_SIZE:]
+
+
+class SaveServer:
+    """Host side: answers requests with an offer and pulls with chunks."""
+
+    def __init__(self, files, session=1):
+        self.bundle = build_save_bundle(files)
+        self.sha = hashlib.sha256(self.bundle).digest()
+        self.transfer = random.randint(1, 0xFFFFFFFF)
+        self.session = session
+        self.chunks_sent = 0
+
+    def offer(self):
+        return save_header(SAVE_OFFER, self.session, self.transfer) + struct.pack('<I', len(self.bundle)) + self.sha
+
+    def handle(self, data, peer_session):
+        packet = decode_save_datagram(data)
+        if not packet or packet[1] != peer_session:
+            return []
+        kind, _, transfer, body = packet
+        if kind == SAVE_REQUEST or (kind == SAVE_PULL and transfer != self.transfer):
+            return [self.offer()]
+        if kind != SAVE_PULL or len(body) < 2:
+            return []
+        (count,) = struct.unpack_from('<H', body)
+        out = []
+        for index in struct.unpack_from(f'<{min(count, (len(body) - 2) // 4)}I', body, 2):
+            chunk = self.bundle[index * SAVE_CHUNK_BYTES:(index + 1) * SAVE_CHUNK_BYTES]
+            if chunk:
+                out.append(save_header(SAVE_CHUNK, self.session, self.transfer) +
+                           struct.pack('<IH', index, len(chunk)) + chunk)
+        self.chunks_sent += len(out)
+        return out
+
+
+class SaveFetcher:
+    """Guest side: requests the host's save and pulls missing chunks until the digest matches."""
+
+    def __init__(self, session=1, per_poll=24, retry=0.5):
+        self.session, self.per_poll, self.retry = session, per_poll, retry
+        self.transfer, self.size, self.sha = 0, 0, b''
+        self.chunks, self.requested, self.next_request, self.files = {}, {}, 0.0, None
+
+    def handle(self, data, peer_session):
+        packet = decode_save_datagram(data)
+        if not packet or packet[1] != peer_session or self.files is not None:
+            return
+        kind, _, transfer, body = packet
+        if kind == SAVE_OFFER and len(body) >= 36 and transfer != self.transfer:
+            self.transfer, self.size = transfer, struct.unpack_from('<I', body)[0]
+            self.sha, self.chunks, self.requested = body[4:36], {}, {}
+        elif kind == SAVE_CHUNK and transfer == self.transfer and len(body) >= 6:
+            index, size = struct.unpack_from('<IH', body)
+            if len(body) == 6 + size:
+                self.chunks[index] = body[6:]
+
+    def count(self):
+        return (self.size + SAVE_CHUNK_BYTES - 1) // SAVE_CHUNK_BYTES
+
+    def poll(self, now):
+        if self.files is not None:
+            return []
+        if not self.transfer:
+            if now < self.next_request:
+                return []
+            self.next_request = now + 1.0
+            return [save_header(SAVE_REQUEST, self.session, 0)]
+        if len(self.chunks) == self.count():
+            bundle = b''.join(self.chunks[i] for i in range(self.count()))
+            if hashlib.sha256(bundle).digest() == self.sha:
+                self.files = parse_save_bundle(bundle)
+            else:
+                self.transfer = 0
+            return []
+        missing = [i for i in range(self.count())
+                   if i not in self.chunks and now - self.requested.get(i, -1e9) >= self.retry][:self.per_poll]
+        for i in missing:
+            self.requested[i] = now
+        if not missing:
+            return []
+        return [save_header(SAVE_PULL, self.session, self.transfer) +
+                struct.pack(f'<H{len(missing)}I', len(missing), *missing)]
+
+
+def load_save_folder(folder):
+    names = sorted(n for n in os.listdir(folder) if n.lower().endswith('.sav') and valid_save_name(n))
+    files = []
+    for name in names:
+        with open(os.path.join(folder, name), 'rb') as f:
+            files.append((name, f.read()))
+    return files
 
 
 def decode_gear_datagram(data):
@@ -171,7 +328,13 @@ def main():
                     help="request the host's enemy streams and report what arrives")
     ap.add_argument('--follow', action='store_true',
                     help='walk after the player instead of circling (--speed is the maximum, e.g. 700)')
+    ap.add_argument('--serve-save', metavar='DIR',
+                    help='act as the host and share the *.sav files in DIR with a GuestSaveGuard=1 game')
+    ap.add_argument('--fetch-save', metavar='DIR',
+                    help='act as the guest and download a ShareSave=1 game host\'s saves into DIR')
     args = ap.parse_args()
+    if args.serve_save and args.fetch_save:
+        ap.error('--serve-save and --fetch-save are exclusive')
     host, port = args.game.rsplit(':', 1)
     if not 0 <= args.port <= 65535 or not 1 <= int(port) <= 65535:
         ap.error('ports must be between 1 and 65535 (local port 0 selects an ephemeral port)')
@@ -190,6 +353,11 @@ def main():
     flags = HAS_PAWN | (SYNC_ENEMIES if args.sync_enemies else 0)
     enemies, enemy_packets, enemy_bones, enemy_paths, last_enemy_log = {}, 0, 0, {}, time.monotonic()
     held = None
+    server = SaveServer(load_save_folder(args.serve_save)) if args.serve_save else None
+    fetcher = SaveFetcher() if args.fetch_save else None
+    if server:
+        print(f'serving {len(server.bundle)} byte save bundle from {args.serve_save}')
+    game_session, last_save_log = 0, 0.0
     while not args.duration or time.monotonic() - start < args.duration:
         while True:
             try:
@@ -197,6 +365,12 @@ def main():
             except BlockingIOError:
                 break
             if sender != game:
+                continue
+            if decode_save_datagram(data):
+                for reply in server.handle(data, game_session) if server else []:
+                    sock.sendto(reply, game)
+                if fetcher:
+                    fetcher.handle(data, game_session)
                 continue
             gear = decode_gear_datagram(data)
             if gear and gear != held:
@@ -214,6 +388,7 @@ def main():
             state = decode(data)
             if not state:
                 continue
+            game_session = state['session']
             # (Re)anchor on first contact and whenever the player jumps far away (save load, fast travel).
             if state['flags'] & HAS_PAWN and (anchor is None or far_from(state['pos'], anchor, args)):
                 x, y, z = state['pos']
@@ -233,6 +408,22 @@ def main():
             print(f'enemies: {len(enemies)} streamed ({alive} alive), {enemy_packets / span:.1f} pose pkt/s, '
                   f'{enemy_bones / max(enemy_packets, 1):.0f} bones/pkt')
             enemies, enemy_packets, enemy_bones, last_enemy_log = {}, 0, 0, time.monotonic()
+        if fetcher and game_session:
+            for packet in fetcher.poll(time.monotonic()):
+                sock.sendto(packet, game)
+            if fetcher.files is not None and fetcher.transfer:
+                os.makedirs(args.fetch_save, exist_ok=True)
+                for name, data in fetcher.files:
+                    with open(os.path.join(args.fetch_save, name), 'wb') as f:
+                        f.write(data)
+                    print(f'fetched {name} {len(data)} bytes sha256={hashlib.sha256(data).hexdigest()}')
+                fetcher.transfer = 0
+            elif time.monotonic() - last_save_log > 2 and fetcher.transfer:
+                last_save_log = time.monotonic()
+                print(f'save transfer {len(fetcher.chunks)}/{fetcher.count()} chunks')
+        if server and server.chunks_sent and time.monotonic() - last_save_log > 2:
+            last_save_log = time.monotonic()
+            print(f'save transfer: {server.chunks_sent} chunks sent')
         t = time.monotonic() - start
         seq += 1
         now = time.monotonic()

@@ -9,6 +9,42 @@ import unittest
 import fake_peer
 
 
+BUNDLE_DIGEST = '0f03dc917d9011dc65edf488090f15183862dceb586457648ad1c0453a017163'  # also in test_protocol.cpp
+
+
+class SaveTransferTest(unittest.TestCase):
+    def test_bundle_matches_plugin_layout(self):
+        import hashlib
+        bundle = fake_peer.build_save_bundle([('profile.sav', b'\x01\x02\x03'), ('autosave01.sav', b'')])
+        self.assertEqual(hashlib.sha256(bundle).hexdigest(), BUNDLE_DIGEST)
+        self.assertEqual(fake_peer.parse_save_bundle(bundle), [('profile.sav', b'\x01\x02\x03'), ('autosave01.sav', b'')])
+        with self.assertRaises(ValueError):
+            fake_peer.parse_save_bundle(bundle[:-1] + b'\x00')
+
+    def test_names(self):
+        for name in ('autosave01.sav', 'slot-1_A.SAV', 'console.sav', 'com10.sav'):
+            self.assertTrue(fake_peer.valid_save_name(name))
+        for name in ('.sav', '../x.sav', 'a/b.sav', '.h.sav', 'x.txt', 'a..sav', 'abcdefghijklmnopqrstuvwxyz12.sav',
+                     'nul.sav', 'CON.sav', 'com1.sav', 'aux.backup.sav'):
+            self.assertFalse(fake_peer.valid_save_name(name), name)
+
+    def test_lossy_transfer(self):
+        files = [('profile.sav', bytes(range(256)) * 40), ('checkpoint.sav', b'x' * 5000)]
+        server, fetcher = fake_peer.SaveServer(files, session=11), fake_peer.SaveFetcher(session=22)
+        now, sent = 0.0, 0
+        for _ in range(500):
+            for packet in fetcher.poll(now):
+                for reply in server.handle(packet, 22):
+                    sent += 1
+                    if sent % 4:
+                        fetcher.handle(reply, 11)
+            if fetcher.files is not None:
+                break
+            now += 0.1
+        self.assertEqual(fetcher.files, files)
+        self.assertEqual(server.handle(fake_peer.save_header(fake_peer.SAVE_REQUEST, 99, 0), 22), [])
+
+
 class ProtocolTest(unittest.TestCase):
     def test_wire_size_matches_plugin(self):
         self.assertEqual(fake_peer.SIZE, 144)

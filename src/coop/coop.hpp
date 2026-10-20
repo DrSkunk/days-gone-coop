@@ -18,6 +18,7 @@ struct Config {
     bool discovery = false;
     bool missionDiscovery = false; // log runtime mission/save UFunction signatures; read-only
     bool guestSaveGuard = false;   // experimental: redirect SaveGames writes to a session sandbox
+    bool shareSave = false;        // experimental: host serves its saves to a GuestSaveGuard partner
     bool debugTools = false;
     std::string animIdle = "dcn_idle_normal";
     std::string animWalk = "dcn_walk";

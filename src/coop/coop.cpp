@@ -4,6 +4,7 @@
 #include "net.hpp"
 #include "steam.hpp"
 #include "save_guard.hpp"
+#include "save_transfer.hpp"
 #include "menu.hpp"
 #include "motion.hpp"
 #include "frameclock.hpp"
@@ -1121,7 +1122,24 @@ void SendLocalState(UObject* pawn, double now) {
     if (p.flags & kHasBike) SendPose(kPoseBike, g_bikeSource, Prop(g_localBike, "VehicleMesh"), p.timeMs, 0, false);
 }
 
+bool g_saveLoading = false, g_loadAfterAdopt = false;
+double g_loadStartedAt = 0;
+
+SaveTransferContext TransferContext(double now) {
+    SaveTransferContext context;
+    context.net = g_net;
+    context.now = now;
+    context.session = g_session;
+    context.connected = now - g_lastRecv < kPeerTimeout;
+    context.peerSession = context.connected ? g_peer.session : 0;
+    context.host = IsHost();
+    context.inGameplay = g_pawn != nullptr;
+    context.loading = g_saveLoading && Now() - g_loadStartedAt < 60;
+    return context;
+}
+
 void ReceivePose(const char* data, int len, double now) {
+    if (SaveTransferHandle(data, len, TransferContext(now))) return;
     uint32_t magic = 0;
     if (len >= 4) std::memcpy(&magic, data, 4);
     if (magic == kEnemyInfoMagic) {
@@ -3206,17 +3224,41 @@ void TraceMissionEvent(UObject* obj, UObject* fn) {
     Log("mission discovery: %s", signature.c_str());
 }
 
+bool g_teleportAfterLoad = false;
+
 void ObserveSaveEvent(UObject* obj, UObject* fn, void* parms) {
     if (!g_cfg.guestSaveGuard || !IsLive(obj) || !IsLive(fn)) return;
-    static std::unordered_map<int32_t, bool> saveNames;
+    enum Kind : uint8_t { kIgnored, kSaveEvent, kLoadStarted, kLoaded };
+    static std::unordered_map<int32_t, Kind> saveNames;
     auto found = saveNames.find(fn->name.index);
     if (found == saveNames.end()) {
         std::string name = Name(fn);
-        bool relevant = name.starts_with("OnGameSaved") || name.starts_with("DisplaySaveGameUI") ||
-                        name == "ReceivePreCheckpointSave";
-        found = saveNames.emplace(fn->name.index, relevant).first;
+        Kind kind = name == "ReceivePreSaveGameLoaded"  ? kLoadStarted :
+                    name == "ReceivePostSaveGameLoaded" ? kLoaded :
+                    name.starts_with("OnGameSaved") || name.starts_with("DisplaySaveGameUI") ||
+                            name == "ReceivePreCheckpointSave" ? kSaveEvent : kIgnored;
+        found = saveNames.emplace(fn->name.index, kind).first;
     }
-    if (!found->second) return;
+    if (found->second == kIgnored) return;
+    // Both are broadcast to every actor around an in-place load. Only a load that started after the host
+    // save was adopted has read it, so only that one may release the pins.
+    if (found->second == kLoadStarted) {
+        if (!g_saveLoading) {
+            g_loadAfterAdopt = SaveGuardAdopted();
+            g_loadStartedAt = Now();
+        }
+        g_saveLoading = true;
+        return;
+    }
+    if (found->second == kLoaded) {
+        bool adoptedLoad = g_saveLoading && g_loadAfterAdopt;
+        g_saveLoading = g_loadAfterAdopt = false;
+        if (adoptedLoad && SaveGuardPinned()) {
+            SaveGuardLoaded();
+            g_teleportAfterLoad = true;
+        }
+        return;
+    }
     std::string name = Name(fn);
     unsigned type = name.starts_with("OnGameSaved") && parms ? *static_cast<const uint8_t*>(parms) : 255u;
     Log("save guard: game event %s.%s type=%u", Name(obj->cls).c_str(), name.c_str(), type);
@@ -3285,6 +3327,20 @@ void Tick(bool hudFrame) {
     wasConnected = connected;
     g_net->Poll(now);
     ReceiveRemote(now);
+    SaveTransferTick(TransferContext(now));
+    static double teleportAt = -1;
+    if (g_teleportAfterLoad) {
+        g_teleportAfterLoad = false;
+        teleportAt = now + 5.0;
+    }
+    if (teleportAt >= 0 && now >= teleportAt && g_pawn && now >= g_localSettledAt && !g_motion.Empty() &&
+        now - g_lastRecv < kPeerTimeout) {
+        teleportAt = -1;
+        Log("save transfer: moving to the host after loading its save");
+        TeleportToPartner(g_pawn, now);
+    } else if (teleportAt >= 0 && now > teleportAt + 60) {
+        teleportAt = -1;
+    }
     UpdateWorldSync(g_pawn, now);
     UpdateDebugTools(now);
     UpdateDamageScope(now);
@@ -3335,6 +3391,7 @@ void Tick(bool hudFrame) {
                                  g_cfg.steam ? g_steam.Status() : "Waiting for a LAN partner";
             if (g_settings.friendlyFire)
                 status += g_peer.flags & kFriendlyFire ? " / friendly fire ACTIVE" : " / partner has not enabled friendly fire";
+            if (auto transfer = SaveTransferStatus(TransferContext(now)); !transfer.empty()) status += " / " + transfer;
             if (!g_settingsError.empty()) status = g_settingsError;
             g_menu.Draw(viewport.get<int>("SizeX"), viewport.get<int>("SizeY"), g_settings, status, online);
         }
@@ -3487,6 +3544,7 @@ Config LoadConfig(const std::wstring& ini) {
     c.discovery = GetPrivateProfileIntW(L"Coop", L"Discovery", 0, ini.c_str()) != 0;
     c.missionDiscovery = GetPrivateProfileIntW(L"Coop", L"MissionDiscovery", 0, ini.c_str()) != 0;
     c.guestSaveGuard = GetPrivateProfileIntW(L"Coop", L"GuestSaveGuard", 0, ini.c_str()) != 0;
+    c.shareSave = GetPrivateProfileIntW(L"Coop", L"ShareSave", 0, ini.c_str()) != 0;
     c.debugTools = GetPrivateProfileIntW(L"Coop", L"DebugTools", 0, ini.c_str()) != 0;
     c.animIdle = IniString(ini, L"AnimIdle", c.animIdle.c_str());
     c.animWalk = IniString(ini, L"AnimWalk", c.animWalk.c_str());
@@ -3553,6 +3611,7 @@ bool Install(const std::wstring& basePath) {
         return false;
     }
     if (g_cfg.guestSaveGuard) InstallSaveGuard(g_basePath + L"-guest-saves");
+    SaveTransferConfigure(g_cfg.shareSave, g_cfg.guestSaveGuard);
     g.objectArray = reinterpret_cast<uint8_t*>(g.imageBase + kObjectArrayRva);
     if (!InstallHook(reinterpret_cast<uint8_t*>(g.imageBase + kProcessEventRva))) return false;
     Log("ProcessEvent hook installed");

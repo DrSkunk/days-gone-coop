@@ -118,8 +118,26 @@ PlayerName=Partner
   **Never** forward this port to the Internet: the protocol has no encryption
   or authentication.
 - Each player loads their own save. Meet up in the same area, or use teleport.
+  To start from the host's progress instead, see below.
 - Settings are read when the game starts. Restart the game after editing the
   INI or to switch partners.
+
+#### Playing on the host's save (experimental)
+
+The guest can load a copy of the host's save instead of their own:
+
+1. Host: set `ShareSave=1`, load your game and quicksave.
+2. Guest: set `GuestSaveGuard=1` and start the game. Once connected, the co-op
+   menu (F8) shows the download progress (a few seconds for about 7 MB on a LAN).
+3. Guest: when it says **Host save ready**, press **Continue** on the main menu
+   (if you are already in the game, quit to the main menu first). You load the
+   host's last save and are moved next to the host.
+
+The guest's real saves are never read or written while `GuestSaveGuard=1` is
+on, and **nothing the guest does in that session is kept**. Missions still run
+separately in each game after loading; only the starting point is shared.
+Verified on one PC against the simulated partner; not yet tested between two
+real players.
 
 ### Online over Steam (experimental, untested)
 
@@ -211,7 +229,8 @@ All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 | `AllowPassenger` | `1` | Allow a passenger on your bike |
 | `Discovery` | `0` | Developers: log engine details; F6 dumps the local pawn |
 | `MissionDiscovery` | `0` | Developers: trace mission/save function names and parameter layouts only; see [DEVELOPMENT.md](docs/DEVELOPMENT.md) |
-| `GuestSaveGuard` | `0` | Experimental: redirect all save writes to a throw-away sandbox; nothing from that session is kept (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
+| `GuestSaveGuard` | `0` | Experimental, guest only: redirect all save writes to a throw-away sandbox and download the host's save into it; nothing from that session is kept (see [Playing on the host's save](#playing-on-the-hosts-save-experimental)) |
+| `ShareSave` | `0` | Experimental, host only: send a copy of your newest saves to a `GuestSaveGuard=1` partner |
 | `DebugTools` | `0` | Developers: enable test tools (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
 | `AnimIdle`, `AnimWalk`, `AnimRun`, `AnimSprint` | Deacon clips | Fallback animations used when no pose stream arrives |
 | `PoseRate` | `20` | Player and bike pose updates per second (10-30). Lower saves bandwidth |

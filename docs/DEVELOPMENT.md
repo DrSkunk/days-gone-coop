@@ -48,6 +48,7 @@ Python simulator and analysis tools. They don't replace testing in the game.
 | [`src/coop/net.cpp`](../src/coop/net.cpp), [`log.cpp`](../src/coop/log.cpp) | Transport interface, UDP socket and log |
 | [`src/coop/steam.cpp`](../src/coop/steam.cpp), [`steam_abi.hpp`](../src/coop/steam_abi.hpp) | Experimental Steam lobby and networking transport (runtime-resolved, no SDK) |
 | [`src/coop/save_guard.cpp`](../src/coop/save_guard.cpp), [`save_policy.hpp`](../src/coop/save_policy.hpp) | Experimental guest save sandbox (import hooks and pure path rules) |
+| [`src/coop/save_transfer.cpp`](../src/coop/save_transfer.cpp), [`savesync.hpp`](../src/coop/savesync.hpp), [`sha256.hpp`](../src/coop/sha256.hpp) | Experimental host-to-guest save transfer (runtime, pure wire/bundle format, SHA-256) |
 | [`src/coop/debug_commands.hpp`](../src/coop/debug_commands.hpp) | Debug command allowlist |
 | [`tools/`](../tools) | Tests, simulator, debug helper, offline analysis |
 
@@ -86,6 +87,11 @@ poetry run python tools/fake_peer.py --game 192.168.1.50:27777 \
 
 Units are centimeters. `--speed 0` gives a stationary partner and `--follow`
 trails the player. Run `--help` for all options.
+
+`--serve-save DIR` makes the simulator a host that shares the `*.sav` files in
+`DIR` with a `GuestSaveGuard=1` game (`PeerHost=127.0.0.1`, `PeerPort=27778`).
+`--fetch-save DIR` makes it a guest that downloads a `ShareSave=1` host game's
+saves into `DIR` and prints their SHA-256.
 
 ## Debug tools
 
@@ -193,13 +199,58 @@ basis for a host-to-guest save transfer.
 
 Known limits:
 
-- Wildcard directory listings (the **Load Game** list) still show only the
-  real folder.
+- Until a host save is adopted, wildcard directory listings (the **Load Game**
+  list) still show only the real folder.
 - Only the executable's own imports are hooked.
 - With the guard on, **nothing you do in that session is kept**, so never enable
   it for normal play.
 
 Back up `SaveGames` before experimenting anyway.
+
+### Host-to-guest save transfer (`ShareSave` + `GuestSaveGuard`, experimental)
+
+The guest starts from a copy of the host's save:
+
+1. A connected `GuestSaveGuard=1` guest sends a `DGSV` request every second.
+2. A `ShareSave=1` host picks the `%LOCALAPPDATA%\BendGame\Saved\<account>\SaveGames`
+   folder with the newest `profile.sav`. It reads every `*.sav` file (retrying
+   if a file changes while being read) into one bundle: a file table with
+   names, sizes and per-file SHA-256, then the contents. A snapshot is reused
+   for 30 s and dropped after 5 idle minutes.
+3. The host answers with an offer (transfer id, size, bundle SHA-256). The guest
+   pulls 1 KB chunks by index, 24 per tick, and pulls missing ones again after
+   0.5 s. Nothing is pushed unasked, so loss and reordering only cost retries.
+4. The guest checks the bundle digest and every file digest and name, then
+   adopts it: the sandbox is replaced with the host's files and the guard
+   switches to **exclusive** mode. Reads no longer fall back to the real
+   folder, and wildcard listings show the sandbox.
+5. Adopted files are **pinned** until a load that started after adoption
+   completes (`ReceivePreSaveGameLoaded` ... `ReceivePostSaveGameLoaded`).
+   Adoption waits while a load is already running. While pinned, game writes to them go to
+   `DaysGoneTogether-guest-saves-discard` and deletes are ignored, so the menu's
+   own `profile.sav`/`checkpoint.sav` writes can't replace the host's files
+   before Continue.
+6. After the load the pins are released, the guest's autosaves go to the
+   sandbox, and the guest is teleported to the host once both are in game.
+
+All datagrams carry the sender's session id and are ignored unless it matches
+the connected partner. File names are limited to `[A-Za-z0-9_.-]` ending in
+`.sav` (reserved device names such as `nul` or `com1` are refused), at most
+32 files and 64 MB.
+
+Verified live on one PC (build 19221447, Proton) with `fake_peer.py`:
+
+- Guest: 7.3 MB of another account's saves arrived at the title screen in about
+  13 s without retransmits and were adopted. The menu's `profile.sav` write
+  went to the discard folder. Continue loaded the host save (the post-load
+  autosave matched that account's save size, not the local one), the guest
+  teleported to the partner, and all 20 real save files kept their SHA-256.
+- Host: the plugin found the right account folder and served a 7.4 MB bundle
+  in about 10 s. Every fetched file matched the snapshot byte for byte.
+
+Not yet tested between two real players or over the Steam transport. The host
+shares its last save on disk, so it should quicksave right before the guest
+loads. Missions still run independently in each game after loading.
 
 ## Offline executable analysis
 

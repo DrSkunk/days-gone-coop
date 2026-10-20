@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <vector>
 
@@ -43,9 +44,11 @@ struct Real {
     SetFileInformationByHandleFn setFileInformationByHandle = SetFileInformationByHandle;
 } real;
 
-std::wstring g_root;
+std::wstring g_root, g_discard;
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::set<std::wstring> g_deleted; // lower-case relative paths deleted during this session
+std::set<std::wstring> g_pinned;  // lower-case adopted names protected until the next load completes
+std::atomic<bool> g_active{false}, g_exclusive{false};
 std::atomic<int> g_notes{0};
 
 struct Mapped {
@@ -62,6 +65,13 @@ bool Deleted(const std::wstring& relative) {
     bool deleted = g_deleted.contains(LowerCopy(relative));
     ReleaseSRWLockShared(&g_lock);
     return deleted;
+}
+
+bool Pinned(const std::wstring& relative) {
+    AcquireSRWLockShared(&g_lock);
+    bool pinned = g_pinned.contains(LowerCopy(relative));
+    ReleaseSRWLockShared(&g_lock);
+    return pinned;
 }
 
 void SetDeleted(const std::wstring& relative, bool deleted) {
@@ -88,7 +98,9 @@ void Note(const char* operation, const std::wstring& relative, const char* detai
 }
 
 // Maps a game path. Writes always land in the sandbox; reads use the sandbox copy if present, a
-// missing path if the file was deleted this session, otherwise the original.
+// missing path if the file was deleted this session, otherwise the original. In exclusive mode (after
+// adopting the host's saves) reads never fall back to the original, and writes to pinned adopted files
+// go to a discard folder.
 Mapped Map(const wchar_t* path, bool write, bool copyOnWrite) {
     Mapped mapped;
     mapped.path = path;
@@ -101,10 +113,16 @@ Mapped Map(const wchar_t* path, bool write, bool copyOnWrite) {
         return mapped;
     }
     std::wstring sandbox = SandboxPath(g_root, *relative);
+    bool exclusive = g_exclusive.load();
     if (!write) {
-        if (Exists(sandbox) || Deleted(*relative)) mapped.path = sandbox;
+        if (exclusive || Exists(sandbox) || Deleted(*relative)) mapped.path = sandbox;
         return mapped;
     }
+    if (exclusive && !relative->empty() && Pinned(*relative)) {
+        mapped.path = SandboxPath(g_discard, *relative);
+        return mapped;
+    }
+    if (exclusive) copyOnWrite = false;
     std::error_code ignored;
     std::filesystem::create_directories(std::filesystem::path(sandbox).parent_path(), ignored);
     if (copyOnWrite && !relative->empty() && !Exists(sandbox) && !Deleted(*relative) && Exists(path) &&
@@ -124,7 +142,8 @@ HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURIT
         SetLastError(ERROR_ACCESS_DENIED);
         return INVALID_HANDLE_VALUE;
     }
-    if (mapped.guarded && write) Note("write", mapped.relative);
+    if (mapped.guarded && write)
+        Note("write", mapped.relative, mapped.path.starts_with(g_discard) ? " (discarded, host save pinned)" : "");
     return real.createFileW(mapped.path.c_str(), access, share, security, disposition, flags, templateFile);
 }
 
@@ -150,7 +169,11 @@ BOOL WINAPI HookDeleteFileW(LPCWSTR name) {
         return FALSE;
     }
     std::wstring sandbox = SandboxPath(g_root, *relative);
-    bool existed = Exists(sandbox) || (!Deleted(*relative) && Exists(name));
+    if (g_exclusive && Pinned(*relative)) {
+        Note("delete", *relative, " (ignored, host save pinned)");
+        return TRUE;
+    }
+    bool existed = Exists(sandbox) || (!g_exclusive && !Deleted(*relative) && Exists(name));
     if (Exists(sandbox)) real.deleteFileW(sandbox.c_str());
     SetDeleted(*relative, true);
     Note("delete", *relative, existed ? "" : " (missing)");
@@ -172,12 +195,14 @@ BOOL WINAPI HookMoveFileW(LPCWSTR from, LPCWSTR to) {
     auto source = Map(from, false, false);
     auto target = toRelative ? Map(to, true, false) : Mapped{false, false, to, {}};
     BOOL ok;
-    // Never move a real save; copy it instead and hide the original for the rest of the session.
-    if (fromRelative && source.path == from)
+    // Never move a real save or a pinned host save; copy it instead and hide the original for the
+    // rest of the session.
+    bool pinnedSource = fromRelative && g_exclusive && Pinned(*fromRelative);
+    if ((fromRelative && source.path == from) || pinnedSource)
         ok = CopyFileW(source.path.c_str(), target.path.c_str(), TRUE);
     else
         ok = real.moveFileW(source.path.c_str(), target.path.c_str());
-    if (ok && fromRelative) SetDeleted(*fromRelative, true);
+    if (ok && fromRelative && !pinnedSource) SetDeleted(*fromRelative, true);
     Note("move", toRelative ? *toRelative : *fromRelative, ok ? "" : " (failed)");
     return ok;
 }
@@ -226,8 +251,9 @@ BOOL WINAPI HookRemoveDirectoryW(LPCWSTR name) {
 HANDLE WINAPI HookFindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
     if (!pattern) return real.findFirstFileW(pattern, data);
     std::wstring value = pattern;
-    // Exact lookups follow the sandbox; wildcard listings still enumerate the real folder.
-    if (value.find_first_of(L"*?") == std::wstring::npos)
+    // Exact lookups follow the sandbox; wildcard listings enumerate the real folder unless the host's
+    // saves were adopted, in which case the sandbox is the only visible SaveGames folder.
+    if (value.find_first_of(L"*?") == std::wstring::npos || g_exclusive)
         return real.findFirstFileW(Map(pattern, false, false).path.c_str(), data);
     return real.findFirstFileW(pattern, data);
 }
@@ -300,9 +326,12 @@ bool Patch(HMODULE module, const char* function, Fn hook, Fn& original) {
 
 bool InstallSaveGuard(const std::wstring& sandboxRoot) {
     g_root = Normalize(sandboxRoot);
+    g_discard = g_root + L"-discard";
     std::error_code error;
+    std::filesystem::remove_all(g_discard, error);
     std::filesystem::remove_all(g_root, error);
-    std::filesystem::create_directories(g_root, error);
+    std::filesystem::create_directories(g_discard, error);
+    if (!error) std::filesystem::create_directories(g_root, error);
     if (error) {
         Log("save guard: cannot prepare sandbox %s (%s); guard disabled", Narrow(g_root).c_str(), error.message().c_str());
         return false;
@@ -324,8 +353,64 @@ bool InstallSaveGuard(const std::wstring& sandboxRoot) {
     Patch(exe, "RemoveDirectoryW", HookRemoveDirectoryW, real.removeDirectoryW);
     Patch(exe, "FindFirstFileW", HookFindFirstFileW, real.findFirstFileW);
     Patch(exe, "SetFileInformationByHandle", HookSetFileInformationByHandle, real.setFileInformationByHandle);
+    g_active = true;
     Log("save guard: EXPERIMENTAL save sandbox active; SaveGames writes go to %s", Narrow(g_root).c_str());
     return true;
+}
+
+bool SaveGuardActive() { return g_active; }
+bool SaveGuardAdopted() { return g_exclusive; }
+
+bool SaveGuardPinned() {
+    AcquireSRWLockShared(&g_lock);
+    bool pinned = !g_pinned.empty();
+    ReleaseSRWLockShared(&g_lock);
+    return pinned;
+}
+
+bool SaveGuardAdopt(const std::vector<AdoptedFile>& files, std::string& error) {
+    if (!g_active) {
+        error = "save guard is not active";
+        return false;
+    }
+    for (const auto& file : files)
+        if (file.name.empty() || file.name.find_first_of(L"\\/:") != std::wstring::npos || !SafeRelative(file.name)) {
+            error = "invalid file name";
+            return false;
+        }
+    // Publish the new contents under the lock so no game read sees a half-written bundle.
+    AcquireSRWLockExclusive(&g_lock);
+    std::error_code code;
+    for (const auto& entry : std::filesystem::directory_iterator(g_root, code)) {
+        std::error_code ignored;
+        std::filesystem::remove_all(entry.path(), ignored);
+    }
+    bool ok = !code;
+    for (const auto& file : files) {
+        if (!ok) break;
+        std::ofstream out(std::filesystem::path(SandboxPath(g_root, file.name)), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(file.data.data()), static_cast<std::streamsize>(file.data.size()));
+        ok = static_cast<bool>(out);
+        if (!ok) error = "cannot write " + Narrow(file.name);
+    }
+    g_deleted.clear();
+    g_pinned.clear();
+    if (ok)
+        for (const auto& file : files) g_pinned.insert(LowerCopy(file.name));
+    g_exclusive = true; // even on failure, never fall back to the guest's own saves
+    ReleaseSRWLockExclusive(&g_lock);
+    if (!ok && error.empty()) error = "cannot clear sandbox";
+    Log("save guard: %s %u host save files; real SaveGames folder hidden%s", ok ? "adopted" : "FAILED to adopt",
+        static_cast<unsigned>(files.size()), ok ? ", pinned until the next load" : "");
+    return ok;
+}
+
+void SaveGuardLoaded() {
+    AcquireSRWLockExclusive(&g_lock);
+    bool had = !g_pinned.empty();
+    g_pinned.clear();
+    ReleaseSRWLockExclusive(&g_lock);
+    if (had) Log("save guard: host save loaded; guest progress now saves into the sandbox");
 }
 
 } // namespace coop
