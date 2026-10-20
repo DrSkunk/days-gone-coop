@@ -3,6 +3,7 @@
 #include "log.hpp"
 #include "net.hpp"
 #include "steam.hpp"
+#include "save_guard.hpp"
 #include "menu.hpp"
 #include "motion.hpp"
 #include "frameclock.hpp"
@@ -31,6 +32,7 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace ue;
@@ -3140,6 +3142,86 @@ bool InGameplay(UObject* pawn) {
 
 double g_lastHudTick = -1;
 
+bool IsMissionDiscoveryName(const std::string& value) {
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    for (const char* token : {"mission", "objective", "checkpoint", "savegame", "loadgame", "playerprofile"})
+        if (lower.find(token) != std::string::npos) return true;
+    return false;
+}
+
+void TraceMissionEvent(UObject* obj, UObject* fn) {
+    if (!g_cfg.missionDiscovery || !IsLive(obj) || !IsLive(obj->cls) || !IsLive(fn)) return;
+    auto relevantName = [](int32_t index) {
+        static std::unordered_map<int32_t, bool> relevantNames;
+        auto found = relevantNames.find(index);
+        if (found != relevantNames.end()) return found->second;
+        bool relevant = IsMissionDiscoveryName(NameString(index));
+        relevantNames.emplace(index, relevant);
+        return relevant;
+    };
+    if (!relevantName(obj->cls->name.index) && !relevantName(fn->name.index)) return;
+    std::string className = Name(obj->cls), functionName = Name(fn);
+
+    std::string key = className + "." + functionName;
+    static std::unordered_set<std::string> emitted;
+    static bool limitReported = false;
+    if (emitted.contains(key)) return;
+    if (emitted.size() >= 512) {
+        if (!limitReported) {
+            Log("mission discovery: stopped after 512 unique signatures");
+            limitReported = true;
+        }
+        return;
+    }
+    emitted.insert(key);
+
+    auto function = reinterpret_cast<const uint8_t*>(fn);
+    uint16_t paramsSize = *reinterpret_cast<const uint16_t*>(function + off::FunctionParmsSize);
+    std::string signature = className + "." + functionName + " parms=" + std::to_string(paramsSize);
+    auto parameter = *reinterpret_cast<UObject* const*>(function + off::StructChildren);
+    size_t parameterCount = 0;
+    for (; parameter;) {
+        if (++parameterCount > 64) {
+            signature += " [parameter list truncated]";
+            break;
+        }
+        if (!IsLive(parameter) || !IsLive(parameter->cls)) {
+            signature += " [invalid parameter metadata]";
+            break;
+        }
+        std::string propertyType = Name(parameter->cls);
+        int offset = -1, size = 0;
+        if (propertyType.ends_with("Property")) {
+            offset = PropertyOffset(parameter);
+            size = *reinterpret_cast<const int32_t*>(
+                reinterpret_cast<const uint8_t*>(parameter) + off::PropertyElementSize);
+        }
+        signature += " [" + Name(parameter) + ":" + propertyType + "@" +
+                     std::to_string(offset) + "+" + std::to_string(size) + "]";
+        parameter = *reinterpret_cast<UObject* const*>(
+            reinterpret_cast<const uint8_t*>(parameter) + off::FieldNext);
+    }
+    Log("mission discovery: %s", signature.c_str());
+}
+
+void ObserveSaveEvent(UObject* obj, UObject* fn, void* parms) {
+    if (!g_cfg.guestSaveGuard || !IsLive(obj) || !IsLive(fn)) return;
+    static std::unordered_map<int32_t, bool> saveNames;
+    auto found = saveNames.find(fn->name.index);
+    if (found == saveNames.end()) {
+        std::string name = Name(fn);
+        bool relevant = name.starts_with("OnGameSaved") || name.starts_with("DisplaySaveGameUI") ||
+                        name == "ReceivePreCheckpointSave";
+        found = saveNames.emplace(fn->name.index, relevant).first;
+    }
+    if (!found->second) return;
+    std::string name = Name(fn);
+    unsigned type = name.starts_with("OnGameSaved") && parms ? *static_cast<const uint8_t*>(parms) : 255u;
+    Log("save guard: game event %s.%s type=%u", Name(obj->cls).c_str(), name.c_str(), type);
+}
+
 void Tick(bool hudFrame) {
     double wall = Now();
     if (!hudFrame && (wall - g_lastHudTick < 0.5 || wall - g_lastTick < kTickInterval)) return;
@@ -3355,6 +3437,10 @@ void HookedProcessEvent(UObject* obj, UObject* fn, void* parms) {
         HandleAppearanceEvent(obj, fn, parms);
         g_inTick = wasInTick;
     }
+    if (g_ready && g_cfg.missionDiscovery && GetCurrentThreadId() == g_gameThread)
+        TraceMissionEvent(obj, fn);
+    if (g_ready && g_cfg.guestSaveGuard && GetCurrentThreadId() == g_gameThread)
+        ObserveSaveEvent(obj, fn, parms);
     g.processEvent(obj, fn, parms);
     if (g_ready && !g_inTick && GetCurrentThreadId() == g_gameThread && fn) {
         g_inTick = true;
@@ -3399,6 +3485,8 @@ Config LoadConfig(const std::wstring& ini) {
     c.peerPort = GetPrivateProfileIntW(L"Coop", L"PeerPort", c.port, ini.c_str());
     c.playerName = IniString(ini, L"PlayerName", c.playerName.c_str());
     c.discovery = GetPrivateProfileIntW(L"Coop", L"Discovery", 0, ini.c_str()) != 0;
+    c.missionDiscovery = GetPrivateProfileIntW(L"Coop", L"MissionDiscovery", 0, ini.c_str()) != 0;
+    c.guestSaveGuard = GetPrivateProfileIntW(L"Coop", L"GuestSaveGuard", 0, ini.c_str()) != 0;
     c.debugTools = GetPrivateProfileIntW(L"Coop", L"DebugTools", 0, ini.c_str()) != 0;
     c.animIdle = IniString(ini, L"AnimIdle", c.animIdle.c_str());
     c.animWalk = IniString(ini, L"AnimWalk", c.animWalk.c_str());
@@ -3453,6 +3541,8 @@ bool Install(const std::wstring& basePath) {
     else
         Log("config: transport=udp port=%u peer=%s:%u name=%s", g_cfg.port,
             g_cfg.peerHost.empty() ? "(host mode)" : g_cfg.peerHost.c_str(), g_cfg.peerPort, g_cfg.playerName.c_str());
+    if (g_cfg.missionDiscovery)
+        Log("mission discovery: read-only signature tracing enabled; parameter values are not logged");
 
     g.imageBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g.imageBase);
@@ -3462,6 +3552,7 @@ bool Install(const std::wstring& basePath) {
             nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
         return false;
     }
+    if (g_cfg.guestSaveGuard) InstallSaveGuard(g_basePath + L"-guest-saves");
     g.objectArray = reinterpret_cast<uint8_t*>(g.imageBase + kObjectArrayRva);
     if (!InstallHook(reinterpret_cast<uint8_t*>(g.imageBase + kProcessEventRva))) return false;
     Log("ProcessEvent hook installed");

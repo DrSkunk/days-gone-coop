@@ -16,6 +16,8 @@ struct Config {
     uint32_t peerPort = 27777;
     std::string playerName = "Deacon";
     bool discovery = false;
+    bool missionDiscovery = false; // log runtime mission/save UFunction signatures; read-only
+    bool guestSaveGuard = false;   // experimental: redirect SaveGames writes to a session sandbox
     bool debugTools = false;
     std::string animIdle = "dcn_idle_normal";
     std::string animWalk = "dcn_walk";

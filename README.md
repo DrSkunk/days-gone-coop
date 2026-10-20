@@ -210,6 +210,8 @@ All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 | `SyncEnemies` | `1` | Host enemy sync |
 | `AllowPassenger` | `1` | Allow a passenger on your bike |
 | `Discovery` | `0` | Developers: log engine details; F6 dumps the local pawn |
+| `MissionDiscovery` | `0` | Developers: trace mission/save function names and parameter layouts only; see [DEVELOPMENT.md](docs/DEVELOPMENT.md) |
+| `GuestSaveGuard` | `0` | Experimental: redirect all save writes to a throw-away sandbox; nothing from that session is kept (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
 | `DebugTools` | `0` | Developers: enable test tools (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
 | `AnimIdle`, `AnimWalk`, `AnimRun`, `AnimSprint` | Deacon clips | Fallback animations used when no pose stream arrives |
 | `PoseRate` | `20` | Player and bike pose updates per second (10-30). Lower saves bandwidth |

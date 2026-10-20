@@ -47,6 +47,7 @@ Python simulator and analysis tools. They don't replace testing in the game.
 | [`src/coop/menu.cpp`](../src/coop/menu.cpp), [`overlay.cpp`](../src/coop/overlay.cpp) | Menu input and DX11 overlay |
 | [`src/coop/net.cpp`](../src/coop/net.cpp), [`log.cpp`](../src/coop/log.cpp) | Transport interface, UDP socket and log |
 | [`src/coop/steam.cpp`](../src/coop/steam.cpp), [`steam_abi.hpp`](../src/coop/steam_abi.hpp) | Experimental Steam lobby and networking transport (runtime-resolved, no SDK) |
+| [`src/coop/save_guard.cpp`](../src/coop/save_guard.cpp), [`save_policy.hpp`](../src/coop/save_policy.hpp) | Experimental guest save sandbox (import hooks and pure path rules) |
 | [`src/coop/debug_commands.hpp`](../src/coop/debug_commands.hpp) | Debug command allowlist |
 | [`tools/`](../tools) | Tests, simulator, debug helper, offline analysis |
 
@@ -128,6 +129,77 @@ cinematic, or after five minutes without a command. Packs are **not** native
 hordes. The game's horde functions are tied to saved horde progress, so they
 are deliberately not used. Blocking saves reduces risk but is not a sandbox:
 use a backed-up or disposable save.
+
+## Mission and save discovery
+
+Set `MissionDiscovery=1` in the INI and restart to trace mission-, objective-,
+checkpoint-, save-game-, load-game-, and player-profile-related Unreal
+`ProcessEvent` calls. The log records each unique class/function signature once,
+including parameter names, reflected types, offsets, and sizes. It does not log
+parameter values, suppress calls, block saves, or change game state. Disable it
+after collecting a bounded log; tracing is for identifying runtime call
+signatures, not proof that a call safely controls campaign loading or saving.
+
+The trace is deliberately diagnostic. Do not test guest save suppression or
+join behavior on a valuable campaign until the relevant lifecycle has been
+verified and the save files are backed up. Offline strings and function names
+are leads only; they do not establish call order, ownership, or side effects.
+
+### Save and load lifecycle (verified on build 19221447)
+
+Observed with `MissionDiscovery=1` and file timestamps under Proton:
+
+- The main menu is drawn over an already-loaded `ORWorld`. `BP_MissionManager`
+  and mission conditions run there, and the game writes `checkpoint.sav`
+  (`OnGameSaved` type 0) and `profile.sav` while the menu is idle.
+- **Continue** does not travel to another level. It fades to black,
+  broadcasts `ReceivePreSaveGameLoaded(bIsCheckpoint)` to a few hundred actors,
+  loads in place (about 7 s), then broadcasts `ReceivePostSaveGameLoaded`.
+- Right after a load, the game writes `profile.sav` and an `autosaveNN.sav`
+  (`OnGameSaved` type 5). The R quicksave writes to the same autosave rotation.
+- The native load and save calls are not visible to `ProcessEvent`; only the
+  Blueprint events around them are.
+- Saves are written directly with `CreateFileW` (no temporary file and rename)
+  below `Saved\<SteamID64>\SaveGames`.
+- A save from another Steam account loads normally. Saves are not tied to the
+  account that wrote them.
+
+`GameMode.SetSavingBlockedByBlueprint(true)` is **not** a save boundary.
+With the flag held from controller creation onward, the game still wrote
+`checkpoint.sav` and `profile.sav` at the main menu. Debug and passenger
+sessions still set the flag, but only to reduce mid-session autosaves.
+
+### Guest save sandbox (`GuestSaveGuard`, experimental)
+
+`GuestSaveGuard=1` patches the game executable's KERNEL32 imports for file
+creation, deletion, renaming (`MoveFileW` and rename-by-handle), attributes and
+directories (`src/coop/save_guard.cpp`). It redirects every write below a
+`Saved\...\SaveGames` folder into `DaysGoneTogether-guest-saves` next to the
+plugin. That folder is wiped each time the game starts.
+
+- Writes are copy-on-write: modifying an existing save first copies the
+  original into the sandbox.
+- Reads prefer the sandbox copy and fall back to the real file.
+- Deletes and moves never touch a real save; deleted names are hidden for the
+  rest of the session.
+- The path rules are pure functions in `src/coop/save_policy.hpp`, covered by
+  `make test`.
+
+Verified live: across menu idle, Continue, the post-load autosave and a manual
+quicksave, every write went to the sandbox. The SHA-256 of every real save was
+unchanged afterwards. Copying another account's saves into the sandbox at the
+main menu, then pressing Continue, loaded that account's progress. That is the
+basis for a host-to-guest save transfer.
+
+Known limits:
+
+- Wildcard directory listings (the **Load Game** list) still show only the
+  real folder.
+- Only the executable's own imports are hooked.
+- With the guard on, **nothing you do in that session is kept**, so never enable
+  it for normal play.
+
+Back up `SaveGames` before experimenting anyway.
 
 ## Offline executable analysis
 

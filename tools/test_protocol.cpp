@@ -8,6 +8,7 @@
 #include "../src/coop/enemy.hpp"
 #include "../src/coop/gear.hpp"
 #include "../src/coop/steam_abi.hpp"
+#include "../src/coop/save_policy.hpp"
 
 #include <cassert>
 #include <cstring>
@@ -556,7 +557,31 @@ void TestSteamAbi() {
     std::puts("steam abi ok");
 }
 
+void TestSavePolicy() {
+    using namespace coop::savepolicy;
+    const std::wstring base = L"C:\\users\\steamuser\\AppData\\Local\\BendGame\\Saved\\7656\\SaveGames";
+    assert(SaveGamesRelative(base + L"\\autosave04.sav") == std::wstring(L"autosave04.sav"));
+    assert(SaveGamesRelative(L"c:/USERS/x/BendGame/SAVED/7656/savegames/sub/profile.sav") == std::wstring(L"sub\\profile.sav"));
+    assert(SaveGamesRelative(base) == std::wstring());
+    assert(SaveGamesRelative(base + L"\\") == std::wstring());
+    assert(!SaveGamesRelative(L"C:\\BendGame\\Saved\\Config\\WindowsNoEditor\\Engine.ini"));
+    assert(!SaveGamesRelative(L"C:\\BendGame\\Saved\\SaveGamesBackup\\a.sav"));
+    assert(!SaveGamesRelative(L"C:\\Games\\SaveGames\\a.sav"));
+    assert(SafeRelative(L"autosave01.sav") && SafeRelative(L"") && SafeRelative(L"a\\..b"));
+    assert(!SafeRelative(L"..\\x.sav") && !SafeRelative(L"a\\..\\..\\x") && !SafeRelative(L"\\x") && !SafeRelative(L"C:x"));
+    assert(SandboxPath(L"D:\\sbx", L"a.sav") == L"D:\\sbx\\a.sav" && SandboxPath(L"D:\\sbx", L"") == L"D:\\sbx");
+    assert(!IsWriteOpen(0x80000000u, kOpenExisting));  // GENERIC_READ
+    assert(IsWriteOpen(0x80000000u, kOpenAlways));
+    assert(IsWriteOpen(kGenericWrite, kOpenExisting) && IsWriteOpen(kDelete, kOpenExisting));
+    assert(IsWriteOpen(kWriteAttributes, kOpenExisting) && IsWriteOpen(kAppendData, kOpenAlways));
+    assert(IsWriteOpen(0x80000000u, kCreateAlways) && IsWriteOpen(0x80000000u, kTruncateExisting));
+    assert(NeedsCopyOnWrite(kOpenExisting) && NeedsCopyOnWrite(kOpenAlways));
+    assert(!NeedsCopyOnWrite(kCreateAlways) && !NeedsCopyOnWrite(kTruncateExisting) && !NeedsCopyOnWrite(kCreateNew));
+    std::puts("save policy ok");
+}
+
 int main() {
+    TestSavePolicy();
     TestPose();
     TestSteamAbi();
     TestEnemy();

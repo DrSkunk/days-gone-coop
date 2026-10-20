@@ -108,7 +108,13 @@ Structure offsets used by the reflection layer ([`ue.hpp`](../src/coop/ue.hpp)):
 Some facts only exist at runtime. With `Discovery=1` the plugin logs the local
 pawn's class chain and components, writes loaded `AnimSequence`s to
 `DaysGoneTogether-anims.txt` and lists classes related to world state, AI and
-spawning. F6 dumps the current pawn again. This revealed, for example:
+spawning. F6 dumps the current pawn again. The separate `MissionDiscovery=1`
+option logs unique mission/save-related `ProcessEvent` signatures and reflected
+parameter layouts without recording parameter values or changing behavior.
+It showed that the main menu runs inside an already-loaded world and that
+Continue loads a save in place; see the save lifecycle in
+[DEVELOPMENT.md](DEVELOPMENT.md).
+This revealed, for example:
 
 - the player is `BendDefaultPlayerPawn_C` with `BendDefaultPlayerController_C`;
 - Deacon is **modular**: a head plus several skinned parts (jacket, jeans,
