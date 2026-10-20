@@ -10,6 +10,7 @@
 #include "../src/coop/steam_abi.hpp"
 #include "../src/coop/save_policy.hpp"
 #include "../src/coop/savesync.hpp"
+#include "../src/coop/session.hpp"
 
 #include <cassert>
 #include <cstring>
@@ -681,7 +682,135 @@ void TestSaveSync() {
     std::puts("save sync ok");
 }
 
+void TestSession() {
+    using namespace coop::session;
+    EventLog log;
+    log.Add("");
+    assert(log.Serial() == 0);
+    for (int i = 0; i < 40; ++i) log.Add("event " + std::to_string(i));
+    assert(log.Serial() == 40);
+    auto last = log.Last(2);
+    assert(last.size() == 2 && last[0] == "event 38" && last[1] == "event 39");
+    assert(log.Last(100).size() == EventLog::kCapacity);
+    auto since = log.Since(37);
+    assert(since.size() == 3 && since[0].serial == 38 && since[2].text == "event 39");
+    assert(log.Since(40).empty());
+
+    Visibility v = Visibility::Private;
+    assert(SteamLobbyType(Visibility::Private) == 0 && SteamLobbyType(Visibility::Friends) == 1 &&
+           SteamLobbyType(Visibility::Public) == 2);
+    assert(NextVisibility(Visibility::Private) == Visibility::Friends);
+    assert(NextVisibility(Visibility::Friends) == Visibility::Public);
+    assert(NextVisibility(Visibility::Public) == Visibility::Private);
+    assert(ParseVisibility("PUBLIC", v) && v == Visibility::Public);
+    assert(ParseVisibility("friends", v) && v == Visibility::Friends);
+    assert(ParseVisibility("invite", v) && v == Visibility::Private);
+    assert(!ParseVisibility("everyone", v) && v == Visibility::Private);
+
+    View view;
+    auto root = BuildRows(Page::Root, view);
+    assert(root.size() == 3 && root[0].action == Action::HostLan && root[2].action == Action::Back);
+    view.steamAvailable = true;
+    root = BuildRows(Page::Root, view);
+    assert(root.size() == 6 && root[0].action == Action::HostSteam && root[1].action == Action::BrowseFriends &&
+           root[2].action == Action::BrowsePublic);
+    for (int i = 0; i < 12; ++i) view.friends.push_back("friend" + std::to_string(i));
+    auto friends = BuildRows(Page::Friends, view);
+    assert(friends.size() == kMaxRows);
+    assert(friends[0].label == "FRIEND0" && friends[6].index == 6 && friends[6].action == Action::JoinFriend);
+    assert(friends[7].action == Action::Refresh && friends[8].action == Action::Back);
+    assert(BuildRows(Page::Public, view).size() == 2);
+    assert(Upper("d\xc3\xa9" "acon") == "D\xc3\xa9" "ACON");
+
+    view.kind = Kind::Steam;
+    view.host = true;
+    view.visibility = Visibility::Public;
+    auto lobby = BuildRows(Page::Root, view);
+    assert(lobby.size() == 5 && lobby[0].action == Action::Start && lobby[1].action == Action::Invite);
+    assert(lobby[2].label == "VISIBILITY: PUBLIC" && lobby[3].label == "CLOSE SESSION");
+    view.inGame = true;
+    assert(BuildRows(Page::Root, view).size() == 4);
+    view.host = false;
+    auto guest = BuildRows(Page::Root, view);
+    assert(guest.size() == 3 && guest[0].action == Action::Invite && guest[1].label == "LEAVE SESSION");
+    view.busy = true;
+    assert(BuildRows(Page::Root, view).size() == 2);
+    view = {};
+    view.kind = Kind::LanJoin;
+    view.host = false;
+    auto lan = BuildRows(Page::Root, view);
+    assert(lan.size() == 3 && lan[0].label == "START GAME (JOIN HOST)" && lan[1].action == Action::Leave);
+    for (const auto& page : {Page::Root, Page::Friends, Page::Public, Page::Lan}) {
+        View full;
+        full.steamAvailable = true;
+        for (int i = 0; i < 30; ++i) {
+            full.friends.push_back("x");
+            full.publicLobbies.push_back("x");
+            full.lanHosts.push_back("x");
+        }
+        assert(BuildRows(page, full).size() <= kMaxRows);
+    }
+
+    View status;
+    status.kind = Kind::LanHost;
+    assert(std::string(PageTitle(Page::Root, status)) == "LAN LOBBY");
+    for (auto visibility : {Visibility::Private, Visibility::Friends, Visibility::Public}) {
+        Visibility parsed;
+        assert(ParseVisibility(VisibilityKey(visibility), parsed) && parsed == visibility);
+    }
+    assert(StatusText(Page::Root, status, {"A connected", "A disconnected"}) ==
+           "LAN host - waiting for a player\nA connected\nA disconnected");
+    status.kind = Kind::Steam;
+    status.connected = true;
+    status.partner = "Boozer";
+    assert(StatusText(Page::Root, status, {}) == "Steam lobby (FRIENDS ONLY) - playing with Boozer");
+    assert(std::string(PageTitle(Page::Lan, View{})) == "LAN GAMES");
+
+    assert(TruncateUtf8("abc", 5) == "abc");
+    assert(TruncateUtf8("ab\xc3\xa9", 3) == "ab");
+    assert(TruncateUtf8("ab\xc3\xa9", 4) == "ab\xc3\xa9");
+
+    Beacon beacon;
+    beacon.port = 27777;
+    beacon.session = 7;
+    std::snprintf(beacon.name, sizeof beacon.name, "%s", "Deacon");
+    char wire[sizeof beacon];
+    std::memcpy(wire, &beacon, sizeof wire);
+    Beacon decoded;
+    assert(DecodeBeacon(wire, sizeof wire, decoded) && decoded.port == 27777 && std::string(decoded.name) == "Deacon");
+    assert(!DecodeBeacon(wire, sizeof wire - 1, decoded));
+    wire[0] ^= 1;
+    assert(!DecodeBeacon(wire, sizeof wire, decoded));
+    wire[0] ^= 1;
+    std::memset(wire + offsetof(Beacon, name), 'x', sizeof beacon.name);
+    assert(DecodeBeacon(wire, sizeof wire, decoded) && std::strlen(decoded.name) == sizeof decoded.name - 1);
+
+    LanDirectory lanDir;
+    lanDir.Heard(beacon, 0x0100007f, 1.0);
+    lanDir.Heard(beacon, 0x0200007f, 2.0);
+    assert(lanDir.Hosts().size() == 1 && lanDir.Hosts()[0].address == 0x0200007f);
+    Beacon other = beacon;
+    other.session = 8;
+    other.name[0] = 0;
+    lanDir.Heard(other, 0x0300007f, 3.0);
+    assert(lanDir.Hosts().size() == 2 && lanDir.Hosts()[1].name == "Days Gone Together");
+    lanDir.Prune(6.5);
+    assert(lanDir.Hosts().size() == 1 && lanDir.Hosts()[0].session == 8);
+    other.open = 0;
+    lanDir.Heard(other, 0x0300007f, 7.0);
+    assert(lanDir.Hosts().empty());
+    lanDir.Heard(other, 0x0300007f, 7.0);
+    assert(lanDir.Hosts().empty());
+    for (uint32_t i = 0; i < 20; ++i) {
+        Beacon b = beacon;
+        b.session = 100 + i;
+        lanDir.Heard(b, i, 8.0);
+    }
+    assert(lanDir.Hosts().size() == LanDirectory::kLimit);
+}
+
 int main() {
+    TestSession();
     TestSavePolicy();
     TestSaveSync();
     TestPose();

@@ -24,14 +24,19 @@ constexpr const char* kNetworkingVersion = "SteamNetworking006";
 constexpr int kGameLobbyJoinRequested = 300 + 33;
 constexpr int kLobbyEnter = 500 + 4;
 constexpr int kLobbyCreated = 500 + 13;
+constexpr int kLobbyMatchList = 500 + 10;
 constexpr int kP2PSessionRequest = 1200 + 2;
 constexpr int kMessagesSessionRequest = 1250 + 1;
 
 // Vtable slots (MSVC order; each interface is a single-inheritance pure virtual class).
 namespace slot {
+constexpr int kRequestLobbyList = 4, kAddRequestLobbyListStringFilter = 5, kAddRequestLobbyListFilterSlotsAvailable = 8,
+              kAddRequestLobbyListDistanceFilter = 9, kAddRequestLobbyListResultCountFilter = 10,
+              kGetLobbyByIndex = 12, kSetLobbyType = 33;
 constexpr int kCreateLobby = 13, kJoinLobby = 14, kLeaveLobby = 15, kGetNumLobbyMembers = 17,
               kGetLobbyMemberByIndex = 18, kGetLobbyData = 19, kSetLobbyData = 20, kSetLobbyJoinable = 34,
               kGetLobbyOwner = 35;
+constexpr int kGetPersonaName = 0;
 constexpr int kGetFriendCount = 2, kGetFriendByIndex = 3, kGetFriendPersonaName = 6, kGetFriendGamePlayed = 7,
               kActivateGameOverlayInviteDialog = 32;
 constexpr int kGetSteamID = 2;
@@ -42,7 +47,8 @@ constexpr int kSendP2PPacket = 0, kIsP2PPacketAvailable = 1, kReadP2PPacket = 2,
               kCloseP2PSessionWithUser = 4;
 } // namespace slot
 
-constexpr int kLobbyTypeFriendsOnly = 1;
+constexpr int kLobbyComparisonEqual = 0;
+constexpr int kLobbyDistanceWorldwide = 3;
 constexpr uint32_t kResultOK = 1;
 constexpr uint32_t kChatRoomEnterSuccess = 1;
 constexpr int kFriendFlagImmediate = 0x04;
@@ -55,6 +61,9 @@ constexpr int kIdentityTypeSteamID = 16;
 struct LobbyCreated {
     uint32_t result;
     uint64_t lobby;
+};
+struct LobbyMatchList {
+    uint32_t count;
 };
 struct LobbyEnter {
     uint64_t lobby;

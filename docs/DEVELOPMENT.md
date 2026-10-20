@@ -45,6 +45,7 @@ Python simulator and analysis tools. They don't replace testing in the game.
 | [`src/coop/combat.hpp`](../src/coop/combat.hpp) | Friendly-fire delivery queue |
 | [`src/coop/appearance.cpp`](../src/coop/appearance.cpp) | Garment tinting |
 | [`src/coop/menu.cpp`](../src/coop/menu.cpp), [`overlay.cpp`](../src/coop/overlay.cpp) | Menu input and DX11 overlay |
+| [`src/coop/native_ui.cpp`](../src/coop/native_ui.cpp), [`session.hpp`](../src/coop/session.hpp) | Native title/pause CO-OP pages, event log and pure session/LAN discovery model |
 | [`src/coop/net.cpp`](../src/coop/net.cpp), [`log.cpp`](../src/coop/log.cpp) | Transport interface, UDP socket and log |
 | [`src/coop/steam.cpp`](../src/coop/steam.cpp), [`steam_abi.hpp`](../src/coop/steam_abi.hpp) | Experimental Steam lobby and networking transport (runtime-resolved, no SDK) |
 | [`src/coop/save_guard.cpp`](../src/coop/save_guard.cpp), [`save_policy.hpp`](../src/coop/save_policy.hpp) | Experimental guest save sandbox (import hooks and pure path rules) |
@@ -135,6 +136,78 @@ cinematic, or after five minutes without a command. Packs are **not** native
 hordes. The game's horde functions are tied to saved horde progress, so they
 are deliberately not used. Blocking saves reduces risk but is not a sandbox:
 use a backed-up or disposable save.
+
+## Native CO-OP menus and discovery
+
+`MenuDiscovery=1` enables a read-only native UI report. Press **F6** while
+the main menu or pause menu is visible to write
+`DaysGoneTogether-menus.txt` beside the plugin. Each capture replaces that
+report. It lists loaded menu/widget classes, their reflected functions and
+parameters, and live widget references. It also logs the main menu's
+confirm, page-selection and mouse-row events. This diagnostic is separate
+from the native CO-OP integration, which is enabled without it.
+
+On build 19221447 under Proton, the main menu is the UMG instance
+`UI_MainMenuWidget_C` from
+`/Game/Libraries/UI/Blueprints/Menus/MainMenu/UI_MainMenuWidget`.
+Its native assets include `MenuInteract_MainMenu0` through
+`MenuInteract_MainMenu9` and `TextEntry0` through `TextEntry9`.
+The observed main page had six options, ten text fields and
+`MaxMenuOptions=6`. Relevant reflected entry points include
+`OnConfirmPressed`, `ConfirmSelection`, `SetCursorPosition`,
+`UpdateSelectedPageOptions` and `MainLabelUpdate`.
+
+The plugin inserts CO-OP above the title menu's quit row, inside the existing
+`MenuOptionNames_Text` array, without reallocating engine storage. While open,
+co-op pages temporarily replace those labels. The engine still draws the
+widgets, focus, sounds and mouse targets; confirm/back actions are intercepted
+and routed to the session model. Start restores the original rows and invokes
+the game's Continue action. This starts only the local game, not both clients.
+
+The pause menu uses a different widget, `OptionsTopMenuWidget_C`, and its
+`OptionsCategoryWidget` list (`UI_CategoryMenuWidget_C`). CO-OP is inserted above
+the two quit options. Highlight/activate callbacks after that index are remapped
+to the original `ActiveMenuProfile` index. Pages reuse the native category
+entries, `OptionsTitle`, and `SetSelectionStatusText`. Fresh FText references
+must be created before shifting category labels: shallow copies can lose
+their last reference while the engine replaces the preceding entry.
+
+`session.hpp` holds the menu rows, bounded event log, visibility rules and
+versioned `DGTB` discovery beacons, covered by `make test`. `Transport=menu`
+starts offline and lets CO-OP choose LAN or Steam. `Transport=udp` retains
+automatic LAN startup from `PeerHost`. LAN hosts broadcast their name, port,
+session and open/full state once per second; stale entries expire after 4 s.
+Steam supports invite-only/friends/public visibility, friend listings and
+filtered public search, with a two-member limit. Steam joining uses the
+Steam API, not an IP-address connection. F8 remains the separate gameplay
+settings/debug overlay.
+
+The event log records hosting, connecting, connected and disconnected/left
+events. Lobby pages show recent events. The title log and transient gameplay
+log are native UMG TextBlock/Image children, using the game's font; the pause
+menu uses its existing status-text widget. The gameplay log expires after
+six seconds. This is not a typed chat protocol.
+
+The title panel is attached to `Menu_Layout`; the gameplay panel is attached
+to `UI_HudWidget_C.CanvasWrapper`. Widgets are constructed with reflected
+`GameplayStatics.SpawnObject`, owned by the respective WidgetTree, attached
+with `AddChildToCanvas`, and retained against garbage collection. Calling the
+stock HUD `AddNotification` wrapper did not visibly display these messages,
+so the implementation does not rely on that path. Failed notification
+dispatch is logged and retried rather than silently acknowledged.
+
+Title and pause entry rendering, keyboard navigation, Steam hosting,
+visibility changes and invite-overlay activation have been exercised live on
+build 19221447 under Proton. LAN discovery/join selection, local Continue
+from Start Game, the shifted title Quit to Desktop row, restoring vanilla
+pause labels, both vanilla pause quit confirmations, and visible gameplay connect/disconnect events against the
+simulated peer were also verified. Public search completed with no compatible
+lobbies found; that does not verify joining one. If the original Steam host
+leaves, the session ends instead of migrating campaign authority.
+Two-account Steam joining/gameplay, controller
+navigation and every mouse target still require acceptance testing. There
+is no synchronized ready/start handshake or host-authoritative mission
+replication yet. Save transfer is optional and not required to open a lobby.
 
 ## Mission and save discovery
 

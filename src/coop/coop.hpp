@@ -14,9 +14,11 @@ struct Config {
     uint32_t port = 27777;
     std::string peerHost;
     uint32_t peerPort = 27777;
-    std::string playerName = "Deacon";
+    std::string lobbyVisibility = "friends"; // initial Steam lobby visibility: private, friends or public
+    std::string playerName;        // empty: the Steam persona name (or "Deacon" without Steam)
     bool discovery = false;
     bool missionDiscovery = false; // log runtime mission/save UFunction signatures; read-only
+    bool menuDiscovery = false;    // F6 dumps native menu classes and live widget references
     bool guestSaveGuard = false;   // experimental: redirect SaveGames writes to a session sandbox
     bool shareSave = false;        // experimental: host serves its saves to a GuestSaveGuard partner
     bool debugTools = false;
@@ -27,7 +29,7 @@ struct Config {
     int teleportKey = 0x76; // VK_F7
     int poseRate = 20;      // player and bike pose updates per second (10-30)
     bool poseFace = false;  // also stream the face rig (about 280 extra bones)
-    bool steam = false;     // Transport=steam: experimental Steam lobby + Steam Networking instead of LAN UDP
+    bool autoLan = false;   // Transport=udp: start a LAN session at launch (host, or join PeerHost)
     bool steamPumpCallbacks = false; // also run SteamAPI_RunCallbacks from the mod (only if invites never arrive)
 };
 

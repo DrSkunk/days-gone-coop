@@ -55,8 +55,8 @@ their motorcycle and the host's nearby enemies in your world.
 - [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
   (x64) to load the plugin.
 - Two PCs on the same LAN, both on the same mod version. The experimental
-  [Steam mode](#online-over-steam-experimental-untested) works over the
-  Internet between Steam friends, but it has not been tested yet.
+  [Steam mode](#online-over-steam-experimental) provides Internet transport;
+  lobby controls have been tested, but two-account joining/gameplay has not.
 
 ## Install
 
@@ -91,14 +91,25 @@ The release also includes a `.sha256` checksum file.
 
 ## Set up a session
 
-Edit `DaysGoneTogether.ini` on both PCs, then start the game.
+Open **CO-OP** in the game's title menu or pause menu. These are native game
+widgets, not the F8 settings overlay. You can host before loading a save or
+open a session while already playing. Sessions currently hold **two players**.
 
-**Host:** leave `PeerHost` empty. The first player who connects becomes your
-partner for the rest of the session.
+### LAN
+
+Choose **HOST LAN GAME**. On the other PC choose **JOIN LAN GAME**, then select
+the host from the local-network list. Use **CLOSE SESSION** / **LEAVE SESSION**
+to disconnect without restarting the game.
+
+For automatic LAN hosting/joining instead of choosing in the menu, set
+`Transport=udp` and configure:
+
+**Host:** leave `PeerHost` empty.
 
 ```ini
 [Coop]
 Port=27777
+Transport=udp
 PeerHost=
 PlayerName=Host
 ```
@@ -108,6 +119,7 @@ PlayerName=Host
 ```ini
 [Coop]
 Port=27777
+Transport=udp
 PeerHost=192.168.1.50
 PeerPort=27777
 PlayerName=Partner
@@ -119,8 +131,8 @@ PlayerName=Partner
   or authentication.
 - Each player loads their own save. Meet up in the same area, or use teleport.
   To start from the host's progress instead, see below.
-- Settings are read when the game starts. Restart the game after editing the
-  INI or to switch partners.
+- Settings are read when the game starts. Restart after editing the INI;
+  switching sessions from CO-OP does not require a restart.
 
 #### Playing on the host's save (experimental)
 
@@ -133,57 +145,66 @@ The guest can load a copy of the host's save instead of their own:
    (if you are already in the game, quit to the main menu first). You load the
    host's last save and are moved next to the host.
 
-The guest's real saves are never read or written while `GuestSaveGuard=1` is
-on, and **nothing the guest does in that session is kept**. Missions still run
+The guard redirects save writes from startup. Before the host bundle is
+adopted, reads can still fall back to the guest's own saves; afterwards the real
+save folder is hidden. **Nothing the guest does in that session is kept**. Missions still run
 separately in each game after loading; only the starting point is shared.
 Verified on one PC against the simulated partner; not yet tested between two
 real players.
 
-### Online over Steam (experimental, untested)
+### Online over Steam (experimental)
 
 > [!WARNING]
-> Steam mode is a proof of concept that has **not been tested in the game
-> yet**. Use LAN mode unless you want to help test it, and send your
-> `DaysGoneTogether.log` if it fails.
+> Lobby creation, visibility changes and the invite overlay have been tested
+> in the game. Joining and gameplay between two Steam accounts still need a
+> two-player test. Send your `DaysGoneTogether.log` if it fails.
 
 Steam mode lets two Steam friends play over the Internet without port
 forwarding. Steam handles the connection, NAT traversal, relaying and
-encryption. Both players set:
+encryption. Leave `Transport=menu` (the default):
 
 ```ini
 [Coop]
-Transport=steam
-PlayerName=YourName
+Transport=menu
+PlayerName=
+Visibility=friends
 ```
 
-1. **Host:** open the menu (F8) and choose *Steam lobby → Host*. Then choose
-   *Invite a Steam friend*, which opens the Steam overlay invite dialog.
-2. **Friend:** accept the invite in Steam, or open the menu and choose a name
-   on the *Join a Steam friend* row. Left/Right switches between friends who
-   are hosting.
-3. The lobby owner is the host for time, weather and enemies.
+1. **Host:** choose **CO-OP → HOST ONLINE GAME**, then **INVITE FRIENDS** to
+   open Steam's invite dialog. **VISIBILITY** cycles between invite-only,
+   friends-only, and public; it can also be changed from the pause menu.
+2. **Guest:** accept the Steam invite, choose **JOIN A FRIEND**, or use
+   **FIND PUBLIC GAMES** for public mod lobbies.
+3. At the title menu, **START GAME** invokes the game's normal Continue action
+   on this PC. It does not remotely start the other player's game.
+4. Steam persona names are used by default. Connection events appear in the
+   lobby log and as native HUD notifications during gameplay. This is an
+   event log, not typed text chat.
 
-Lobbies are friends-only and hold two players. Only traffic from the other
-lobby member is accepted. `Port` and `PeerHost` are ignored in Steam mode.
+Only traffic from the other lobby member is accepted. `Port` and `PeerHost`
+do not control Steam connections. Epic Online Services is not implemented.
+The host remains the intended campaign authority, but shared mission
+progression is **not implemented yet**; a lobby does not change that.
 
 ## Controls
 
 | Action | Keyboard / mouse | Gamepad (XInput) |
 |---|---|---|
-| Open or close the menu | F8 | View/Back + Y |
+| Open or close gameplay settings | F8 | View/Back + Y |
 | Select a row | Up/Down or click | D-pad Up/Down |
 | Change or activate | Left/Right, Enter or click | D-pad Left/Right or A |
 | Close | Esc | B |
 | Join or leave the partner's bike | F9 | View/Back + X |
 | Teleport next to the partner | F7 (`TeleportKey`) | Menu |
 
-The game window must be focused. The menu does not pause the game.
+The game window must be focused. The F8 settings overlay does not pause the
+game. Session hosting/joining is in the native title/pause **CO-OP** menu.
 
 On a **Steam Deck**, the mod reads XInput, not Steam Input actions. If the
 gamepad shortcuts do nothing, pick the *Gamepad With Joystick Trackpad*
 template under *Controller Settings → Current Layout → Templates*.
 
-### Menu
+### Gameplay settings (F8)
 
 | Row | Effect |
 |---|---|
@@ -218,9 +239,9 @@ All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 | Key | Default | Meaning |
 |---|---|---|
 | `Port` | `27777` | Local UDP port |
-| `PeerHost` | *(empty)* | Empty = host. Otherwise the host's IP or hostname |
+| `PeerHost` | *(empty)* | With `Transport=udp`: empty = host; otherwise host IP or hostname |
 | `PeerPort` | same as `Port` | Host's UDP port (joining player only) |
-| `PlayerName` | `Deacon` | Name shown in the partner's log (max 15 characters) |
+| `PlayerName` | *(empty)* | Uses the Steam persona name; optional LAN override (state packets hold 15 UTF-8 bytes) |
 | `TeleportKey` | `118` (F7) | Windows virtual-key code for teleport |
 | `JacketColor`, `TrousersColor`, `CapColor` | `0` | 0 Original … 6 Violet |
 | `ShowCap` | `1` | Show your cap |
@@ -229,14 +250,16 @@ All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 | `AllowPassenger` | `1` | Allow a passenger on your bike |
 | `Discovery` | `0` | Developers: log engine details; F6 dumps the local pawn |
 | `MissionDiscovery` | `0` | Developers: trace mission/save function names and parameter layouts only; see [DEVELOPMENT.md](docs/DEVELOPMENT.md) |
+| `MenuDiscovery` | `0` | Developers: F6 dumps native menu classes/widget references and enables UI event tracing |
 | `GuestSaveGuard` | `0` | Experimental, guest only: redirect all save writes to a throw-away sandbox and download the host's save into it; nothing from that session is kept (see [Playing on the host's save](#playing-on-the-hosts-save-experimental)) |
 | `ShareSave` | `0` | Experimental, host only: send a copy of your newest saves to a `GuestSaveGuard=1` partner |
 | `DebugTools` | `0` | Developers: enable test tools (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
 | `AnimIdle`, `AnimWalk`, `AnimRun`, `AnimSprint` | Deacon clips | Fallback animations used when no pose stream arrives |
 | `PoseRate` | `20` | Player and bike pose updates per second (10-30). Lower saves bandwidth |
 | `PoseFace` | `0` | `1` also streams the face rig (about 280 more bones, much more bandwidth) |
-| `Transport` | `udp` | `udp` = LAN. `steam` = experimental, untested Steam lobby and networking |
-| `SteamPumpCallbacks` | `0` | Steam mode: `1` also pumps Steam callbacks from the mod. Try it if invites never arrive |
+| `Transport` | `menu` | Choose Steam/LAN in CO-OP; `udp` automatically hosts/joins LAN using the INI |
+| `Visibility` | `friends` | Steam: `private` (invite only), `friends`, or `public`; adjustable while hosting |
+| `SteamPumpCallbacks` | `0` | `1` also pumps Steam callbacks from the mod. Try it if invites never arrive |
 
 ## Troubleshooting
 

@@ -1,14 +1,16 @@
 #include "net.hpp"
 #include "log.hpp"
+#include "session.hpp"
 
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
 namespace coop {
 
-bool UdpPeer::Open(uint16_t port, const std::string& peerHost, uint16_t peerPort, std::string& diag) {
+bool UdpPeer::Open(uint16_t port, std::string& diag) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         diag = "WSAStartup failed";
@@ -26,30 +28,79 @@ bool UdpPeer::Open(uint16_t port, const std::string& peerHost, uint16_t peerPort
         sock_ = INVALID_SOCKET;
         return false;
     }
+    BOOL broadcast = TRUE;
+    setsockopt(sock_, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&broadcast), sizeof broadcast);
     sockaddr_in local{};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     local.sin_port = htons(port);
     if (bind(sock_, reinterpret_cast<sockaddr*>(&local), sizeof local) != 0) {
         diag = "bind() failed on UDP port " + std::to_string(port);
+        closesocket(sock_);
+        sock_ = INVALID_SOCKET;
         return false;
     }
-    if (!peerHost.empty()) {
-        addrinfo hints{}, *res = nullptr;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_DGRAM;
-        if (getaddrinfo(peerHost.c_str(), nullptr, &hints, &res) != 0 || !res) {
-            diag = "cannot resolve peer " + peerHost;
-            return false;
-        }
-        peer_ = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
-        peer_.sin_port = htons(peerPort);
-        freeaddrinfo(res);
-        hasPeer_ = true;
-    }
-    diag = "listening on UDP " + std::to_string(port) +
-           (hasPeer_ ? ", peer " + PeerText() : ", waiting for a peer to connect (host mode)");
+    port_ = port;
+    diag = "UDP port " + std::to_string(port) + " open";
     return true;
+}
+
+void UdpPeer::SetIdle() {
+    mode_ = Mode::Idle;
+    hasPeer_ = false;
+}
+
+void UdpPeer::Listen() {
+    mode_ = Mode::Listen;
+    hasPeer_ = false;
+}
+
+void UdpPeer::Browse() {
+    mode_ = Mode::Browse;
+    hasPeer_ = false;
+}
+
+void UdpPeer::DropPartner() {
+    if (mode_ == Mode::Listen) hasPeer_ = false;
+}
+
+bool UdpPeer::Connect(const std::string& host, uint16_t port, std::string& diag) {
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+        diag = "cannot resolve " + host;
+        return false;
+    }
+    uint32_t address = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr.s_addr;
+    freeaddrinfo(res);
+    Connect(address, port);
+    diag = "partner " + PeerText();
+    return true;
+}
+
+void UdpPeer::Connect(uint32_t address, uint16_t port) {
+    peer_ = {};
+    peer_.sin_family = AF_INET;
+    peer_.sin_addr.s_addr = address;
+    peer_.sin_port = htons(port);
+    hasPeer_ = true;
+    mode_ = Mode::Connect;
+}
+
+void UdpPeer::Broadcast(const void* data, int size, std::initializer_list<uint16_t> ports) {
+    if (sock_ == INVALID_SOCKET) return;
+    uint16_t sent[4] = {};
+    size_t count = 0;
+    for (uint16_t port : ports) {
+        if (!port || std::find(sent, sent + count, port) != sent + count || count == 4) continue;
+        sent[count++] = port;
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        to.sin_port = htons(port);
+        sendto(sock_, static_cast<const char*>(data), size, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+    }
 }
 
 bool DecodeIncoming(const char* data, int size, StatePacket& out, uint16_t& lastForeignVersion) {
@@ -68,7 +119,7 @@ bool DecodeIncoming(const char* data, int size, StatePacket& out, uint16_t& last
 }
 
 void UdpPeer::SendRaw(const void* data, int size) {
-    if (!hasPeer_) return;
+    if (!hasPeer_ || sock_ == INVALID_SOCKET) return;
     int n = sendto(sock_, static_cast<const char*>(data), size, 0,
                    reinterpret_cast<const sockaddr*>(&peer_), sizeof peer_);
     int error = n == SOCKET_ERROR ? WSAGetLastError() : 0;
@@ -78,6 +129,7 @@ void UdpPeer::SendRaw(const void* data, int size) {
 }
 
 bool UdpPeer::Receive(StatePacket& out, const std::function<void(const char*, int)>& other) {
+    if (sock_ == INVALID_SOCKET) return false;
     char buf[1500];
     // Bound work on the game thread even if unrelated traffic floods the port.
     for (int budget = 0; budget < 128; ++budget) {
@@ -86,15 +138,23 @@ bool UdpPeer::Receive(StatePacket& out, const std::function<void(const char*, in
         int n = recvfrom(sock_, buf, sizeof buf, 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n == SOCKET_ERROR) {
             int error = WSAGetLastError();
-            if (error == WSAEMSGSIZE) continue;
+            // A previous partner's closed port reports ICMP unreachable as a receive error on Windows.
+            if (error == WSAEMSGSIZE || error == WSAECONNRESET) continue;
             if (error != WSAEWOULDBLOCK && error != lastReceiveError_)
                 Log("network: receive failed (%d)", error);
             lastReceiveError_ = error;
             return false;
         }
         lastReceiveError_ = 0;
+        uint32_t magic = 0;
+        if (n >= 4) std::memcpy(&magic, buf, sizeof magic);
+        if (magic == session::kBeaconMagic) {
+            if (beacon_) beacon_(buf, n, from.sin_addr.s_addr);
+            continue;
+        }
         if (hasPeer_ && (from.sin_addr.s_addr != peer_.sin_addr.s_addr ||
                         from.sin_port != peer_.sin_port)) continue;
+        if (!hasPeer_ && mode_ != Mode::Listen) continue;
         if (!DecodeIncoming(buf, n, out, lastForeignVersion_)) {
             if (hasPeer_ && other) other(buf, n);
             continue;

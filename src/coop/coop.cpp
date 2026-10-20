@@ -6,6 +6,9 @@
 #include "save_guard.hpp"
 #include "save_transfer.hpp"
 #include "menu.hpp"
+#include "native_ui.hpp"
+#include "session.hpp"
+#include <ws2tcpip.h>
 #include "motion.hpp"
 #include "frameclock.hpp"
 #include "appearance.hpp"
@@ -61,10 +64,34 @@ UdpPeer g_udp;
 SteamPeer g_steam;
 Transport* g_net = &g_udp;
 size_t g_joinChoice = 0;
+bool g_udpOpen = false;
+session::Kind g_kind = session::Kind::None;
+session::EventLog g_events;
+session::LanDirectory g_lan;
+uint64_t g_notified = 0;
+double g_notifyRetryAt = 0;
+double g_tickNow = 0;
 
-// LAN: the player without a PeerHost hosts. Steam: the lobby owner hosts.
+// Steam: the lobby owner hosts. LAN: the player who chose HOST LAN GAME (or has no PeerHost) hosts.
 bool IsHost() {
-    return g_cfg.steam ? g_steam.IsOwner() : g_cfg.peerHost.empty();
+    switch (g_kind) {
+    case session::Kind::Steam: return g_steam.IsOwner();
+    case session::Kind::LanJoin: return false;
+    default: return true;
+    }
+}
+
+// The name shown to the partner: PlayerName from the INI, else the Steam persona name.
+std::string LocalName() {
+    static std::string cached;
+    static double next = -1;
+    if (!g_cfg.playerName.empty()) return g_cfg.playerName;
+    if (g_tickNow >= next || cached.empty()) {
+        next = g_tickNow + 5;
+        std::string persona = g_steam.PersonaName();
+        cached = persona.empty() ? "Deacon" : persona;
+    }
+    return cached;
 }
 uint32_t g_seq = 0;
 uint32_t g_localShotSequence = 0;
@@ -352,17 +379,27 @@ bool ResolveEngine() {
         Log("animation slot %d '%s' -> %s", i, names[i]->c_str(), g_anims[i] ? "found" : "not loaded yet");
     }
     std::string net;
-    if (g_cfg.steam) {
-        g_net = &g_steam;
-        g_steam.Open(g_cfg.playerName, g_cfg.steamPumpCallbacks, net);
-        Log("network: experimental Steam transport; %s", net.c_str());
-        return true;
-    }
-    if (!g_udp.Open(g_cfg.port, g_cfg.peerHost, g_cfg.peerPort, net)) {
-        Log("FATAL: network: %s", net.c_str());
-        return false;
-    }
+    g_steam.Open(g_cfg.playerName, g_cfg.steamPumpCallbacks, net);
     Log("network: %s", net.c_str());
+    g_udpOpen = g_udp.Open(g_cfg.port, net);
+    Log("network: %s%s", net.c_str(), g_udpOpen ? "" : "; LAN play is unavailable");
+    g_udp.SetBeaconHandler([](const char* data, int size, uint32_t address) {
+        session::Beacon beacon;
+        if (session::DecodeBeacon(data, size, beacon) && beacon.session != g_session) g_lan.Heard(beacon, address, g_tickNow);
+    });
+    g_net = &g_udp;
+    if (g_cfg.autoLan && g_udpOpen) {
+        if (g_cfg.peerHost.empty()) {
+            g_udp.Listen();
+            g_kind = session::Kind::LanHost;
+            Log("network: LAN host on UDP %u (Transport=udp)", g_cfg.port);
+        } else if (g_udp.Connect(g_cfg.peerHost, static_cast<uint16_t>(g_cfg.peerPort), net)) {
+            g_kind = session::Kind::LanJoin;
+            Log("network: LAN %s (Transport=udp)", net.c_str());
+        } else {
+            Log("network: %s", net.c_str());
+        }
+    }
     return true;
 }
 
@@ -589,6 +626,97 @@ void DumpObjectReferences(FILE* file, UObject* object) {
             field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(field) + off::FieldNext);
         }
     }
+}
+
+void DiscoverMenus() {
+    FILE* file = _wfopen((g_basePath + L"-menus.txt").c_str(), L"w");
+    if (!file) {
+        Log("menu discovery: cannot write native menu report");
+        return;
+    }
+    std::unordered_set<UObject*> classes;
+    auto classType = FindClass("Class");
+    auto widgetType = FindClass("Widget");
+    auto menuType = FindClass("BaseMenu");
+    for (int32_t i = 0, count = ObjectCount(); i < count; ++i) {
+        auto object = ObjectAt(i);
+        if (!IsLive(object) || !IsLive(object->cls)) continue;
+        std::string name = Name(object);
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (classType && IsA(object, classType)) {
+            if (lower.find("menu") != std::string::npos || lower.find("widget") != std::string::npos ||
+                lower.find("button") != std::string::npos || lower.find("textblock") != std::string::npos ||
+                lower.find("panel") != std::string::npos || lower.find("uimanager") != std::string::npos)
+                classes.insert(object);
+            continue;
+        }
+        if (IsDefaultOrArchetype(object)) continue;
+        std::string typeName = Name(object->cls);
+        std::string lowerType = typeName;
+        std::transform(lowerType.begin(), lowerType.end(), lowerType.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if ((widgetType && IsA(object, widgetType)) || lowerType.find("menu") != std::string::npos ||
+            lowerType.find("uimanager") != std::string::npos || (menuType && IsA(object, menuType))) {
+            std::fprintf(file, "\nOBJECT %s\n", FullName(object).c_str());
+            DumpObjectReferences(file, object);
+            if (Name(object->cls) == "UI_MainMenuWidget_C") {
+                for (auto key : {"CursorPosition", "MaxMenuOptions", "ActiveMenuPageIndex"}) {
+                    int value = 0;
+                    if (GetProp(object, key, value)) std::fprintf(file, "  VALUE %s=%d\n", key, value);
+                }
+                struct Array { void* data; int32_t count, capacity; };
+                for (auto key : {"MenuOptionNames_Text", "MainTextFields", "ActiveTextFields", "ActiveOptionsNames_Text"}) {
+                    Array value{};
+                    if (GetProp(object, key, value))
+                        std::fprintf(file, "  ARRAY %s count=%d capacity=%d\n", key, value.count, value.capacity);
+                }
+            }
+            classes.insert(object->cls);
+        }
+    }
+    for (auto name : {"KismetTextLibrary", "KismetSystemLibrary", "GameplayStatics"})
+        if (auto cls = FindClass(name)) classes.insert(cls);
+    if (auto library = FindDefaultObject("UIManager")) {
+        Call get(library, "GetUIManager");
+        if (get.invoke()) {
+            auto manager = get.get<UObject*>("ReturnValue");
+            if (IsLive(manager)) {
+                std::fprintf(file, "\nUI MANAGER %s\n", FullName(manager).c_str());
+                DumpObjectReferences(file, manager);
+                struct Array { uint8_t* data; int32_t count, capacity; };
+                for (auto key : {"MenuWidgetClass", "Menus", "HudMenus"}) {
+                    Array entries{};
+                    if (!GetProp(manager, key, entries) || entries.count < 0 ||
+                        entries.count > 128 || entries.count > entries.capacity) continue;
+                    std::fprintf(file, "  ARRAY %s count=%d capacity=%d\n", key, entries.count, entries.capacity);
+                }
+            }
+        }
+    }
+    for (int32_t i = 0, count = ObjectCount(); i < count; ++i) {
+        auto object = ObjectAt(i);
+        if (!IsLive(object) || !IsLive(object->cls) || Name(object->cls) != "ScriptStruct") continue;
+        std::string name = Name(object);
+        if (name.find("Notification") == std::string::npos && name.find("MenuProfile") == std::string::npos &&
+            name.find("Category") == std::string::npos && name.find("MenuOption") == std::string::npos)
+            continue;
+        std::fprintf(file, "\nSTRUCT %s\n", FullName(object).c_str());
+        auto field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(object) + off::StructChildren);
+        for (int budget = 0; field && budget < 256; ++budget) {
+            std::fprintf(file, "  %s %s offset=%d size=%d\n", Name(field->cls).c_str(), Name(field).c_str(),
+                         PropertyOffset(field),
+                         *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(field) + off::PropertyElementSize));
+            field = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(field) + off::FieldNext);
+        }
+    }
+    std::vector<UObject*> sortedClasses(classes.begin(), classes.end());
+    std::sort(sortedClasses.begin(), sortedClasses.end(),
+              [](UObject* a, UObject* b) { return FullName(a) < FullName(b); });
+    for (auto cls : sortedClasses) DumpClass(file, cls, false);
+    std::fclose(file);
+    Log("menu discovery: native widget report written (%u classes)", static_cast<unsigned>(classes.size()));
 }
 
 void Discover(UObject* pawn) {
@@ -1030,7 +1158,7 @@ void SendLocalState(UObject* pawn, double now) {
     if (g_settings.motorcycles) p.flags |= kSyncBikes;
     if (g_settings.enemies && !IsHost()) p.flags |= kSyncEnemies;
     if (g_settings.passengers) p.flags |= kAcceptPassengers;
-    std::snprintf(p.name, sizeof p.name, "%s", g_cfg.playerName.c_str());
+    std::snprintf(p.name, sizeof p.name, "%s", session::TruncateUtf8(LocalName(), sizeof p.name - 1).c_str());
     g_damage.Fill(p);
     if (pawn) {
         uint8_t crouched = 0;
@@ -1173,6 +1301,8 @@ void ReceiveRemote(double now) {
             g_bodyPoses.Clear();
             g_bikePoses.Clear();
             Log("peer %s (%s) connected", p.name, g_net->PeerText().c_str());
+            std::string name = g_kind == session::Kind::Steam ? g_steam.PartnerName() : std::string(p.name);
+            g_events.Add(name + " connected");
             DestroyAvatar();  // Rebuild from the player's current look; also a manual "respawn" lever.
             DestroyBike();
             DestroyEnemyReplicas();
@@ -1180,7 +1310,7 @@ void ReceiveRemote(double now) {
         g_lastRecv = now;
         ++g_receivedStates;
         g_lastRemoteSeq = p.seq;
-        g_remoteName = p.name;
+        g_remoteName = g_kind == session::Kind::Steam ? g_steam.PartnerName() : std::string(p.name);
         g_peer = p;
         UpdateDamageScope(now);
         g_damage.Acknowledge(p);
@@ -3160,6 +3290,194 @@ bool InGameplay(UObject* pawn) {
 
 double g_lastHudTick = -1;
 
+bool PartnerConnected(double now) {
+    return now - g_lastRecv < kPeerTimeout;
+}
+
+std::string PartnerName() {
+    std::string steamName = g_kind == session::Kind::Steam ? g_steam.PartnerName() : std::string();
+    return !steamName.empty() ? steamName : g_remoteName.empty() ? "Your partner" : g_remoteName;
+}
+
+// Forgets the current partner and everything replicated from them.
+void ResetPartner() {
+    if (g_passenger.pawn) EndPassenger(true);
+    DestroyAvatar();
+    DestroyBike();
+    DestroyEnemyReplicas();
+    g_motion.Clear();
+    g_bodyPoses.Clear();
+    g_bikePoses.Clear();
+    g_lastRecv = -100;
+    g_peer = {};
+    g_remoteName.clear();
+    if (!++g_consent) ++g_consent;
+}
+
+void LeaveSession(bool announce) {
+    if (g_kind == session::Kind::None && !g_steam.InLobby()) return;
+    bool wasConnected = PartnerConnected(g_tickNow);
+    std::string partner = PartnerName();
+    if (g_steam.InLobby()) g_steam.Leave();
+    else if (announce && g_kind != session::Kind::Steam) g_events.Add("Left the LAN session");
+    if (wasConnected) g_events.Add(partner + " disconnected");
+    g_udp.SetIdle();
+    g_kind = session::Kind::None;
+    g_net = &g_udp;
+    ResetPartner();
+}
+
+void HostSteamSession() {
+    if (!g_steam.Available() || g_steam.Busy()) return;
+    LeaveSession(true);
+    g_steam.Host(g_steam.Visibility());
+    g_kind = session::Kind::Steam;
+    g_net = &g_steam;
+}
+
+void JoinSteamSession(uint64_t lobby) {
+    if (!g_steam.Available() || g_steam.Busy() || !lobby) return;
+    LeaveSession(true);
+    g_steam.Join(lobby);
+    g_kind = session::Kind::Steam;
+    g_net = &g_steam;
+}
+
+void HostLanSession() {
+    if (!g_udpOpen) {
+        g_events.Add("LAN unavailable: UDP port " + std::to_string(g_cfg.port) + " is in use");
+        return;
+    }
+    LeaveSession(true);
+    g_udp.Listen();
+    g_kind = session::Kind::LanHost;
+    g_net = &g_udp;
+    g_events.Add("Hosting a LAN game on port " + std::to_string(g_udp.Port()));
+}
+
+void JoinLanSession(const session::LanHost& host) {
+    if (!g_udpOpen) return;
+    LeaveSession(true);
+    g_udp.Connect(host.address, host.port);
+    g_kind = session::Kind::LanJoin;
+    g_net = &g_udp;
+    g_events.Add("Connecting to " + host.name + "...");
+}
+
+// Follows Steam when it enters or loses a lobby on its own (overlay invites, +connect_lobby, kicks).
+void SyncSessionKind() {
+    bool steamActive = g_steam.InLobby() || g_steam.Joining();
+    if (steamActive && g_kind != session::Kind::Steam) {
+        Log("network: switching to the Steam lobby");
+        if (g_kind != session::Kind::None) ResetPartner();
+        g_udp.SetIdle();
+        g_kind = session::Kind::Steam;
+        g_net = &g_steam;
+    } else if (g_kind == session::Kind::Steam && !steamActive && !g_steam.Busy()) {
+        g_kind = session::Kind::None;
+        g_net = &g_udp;
+        ResetPartner();
+    }
+}
+
+void SendBeacon(double now) {
+    static double next = 0;
+    if (g_kind != session::Kind::LanHost || now < next) return;
+    next = now + 1;
+    session::Beacon beacon;
+    beacon.port = g_udp.Port();
+    beacon.session = g_session;
+    beacon.open = PartnerConnected(now) ? 0 : 1;
+    std::snprintf(beacon.name, sizeof beacon.name, "%s", session::TruncateUtf8(LocalName(), sizeof beacon.name - 1).c_str());
+    g_udp.Broadcast(&beacon, sizeof beacon,
+                    {static_cast<uint16_t>(g_cfg.port), static_cast<uint16_t>(g_cfg.peerPort), static_cast<uint16_t>(27777)});
+}
+
+std::string LanHostLabel(const session::LanHost& host) {
+    in_addr address{};
+    address.s_addr = host.address;
+    char ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &address, ip, sizeof ip);
+    return host.name + " (" + ip + ")";
+}
+
+session::View SessionView(double now) {
+    session::View view;
+    view.inGame = g_pawn != nullptr;
+    view.steamAvailable = g_steam.Available();
+    view.kind = g_kind;
+    view.host = IsHost();
+    view.busy = g_steam.Busy() || g_steam.Searching();
+    view.visibility = g_steam.Visibility();
+    view.connected = PartnerConnected(now);
+    view.partner = PartnerName();
+    for (const auto& lobby : g_steam.Friends()) view.friends.push_back(lobby.name);
+    for (const auto& lobby : g_steam.PublicLobbies()) view.publicLobbies.push_back(lobby.name);
+    for (const auto& host : g_lan.Hosts()) view.lanHosts.push_back(LanHostLabel(host));
+    return view;
+}
+
+void RunMenuCommand(const ui::Command& command) {
+    using session::Action;
+    switch (command.action) {
+    case Action::HostSteam: HostSteamSession(); break;
+    case Action::HostLan: HostLanSession(); break;
+    case Action::BrowseFriends: break;
+    case Action::BrowsePublic: g_steam.RequestPublic(); break;
+    case Action::BrowseLan:
+        g_lan.Clear();
+        if (g_kind == session::Kind::None) g_udp.Browse();
+        break;
+    case Action::JoinFriend:
+        if (command.index < g_steam.Friends().size()) JoinSteamSession(g_steam.Friends()[command.index].lobby);
+        break;
+    case Action::JoinPublic:
+        if (command.index < g_steam.PublicLobbies().size()) JoinSteamSession(g_steam.PublicLobbies()[command.index].lobby);
+        break;
+    case Action::JoinLan:
+        if (command.index < g_lan.Hosts().size()) JoinLanSession(g_lan.Hosts()[command.index]);
+        break;
+    case Action::Invite: g_steam.Invite(); break;
+    case Action::CycleVisibility: {
+        auto next = session::NextVisibility(g_steam.Visibility());
+        g_steam.SetVisibility(next);
+        static const wchar_t* const kIniNames[] = {L"private", L"friends", L"public"};
+        if (!WritePrivateProfileStringW(L"Coop", L"Visibility", kIniNames[static_cast<int>(g_steam.Visibility())],
+                                       (g_basePath + L".ini").c_str()))
+            g_events.Add("Could not save lobby visibility to the INI");
+        break;
+    }
+    case Action::Leave: LeaveSession(true); break;
+    case Action::Refresh:
+        if (ui::CurrentPage() == session::Page::Public) g_steam.RequestPublic();
+        if (ui::CurrentPage() == session::Page::Lan) g_lan.Clear();
+        break;
+    default: break;
+    }
+}
+
+void UpdateSession(double now) {
+    for (auto& text : g_steam.TakeEvents()) g_events.Add(std::move(text));
+    SyncSessionKind();
+    g_lan.Prune(now);
+    SendBeacon(now);
+    auto page = ui::CurrentPage();
+    if (page == session::Page::Friends) g_steam.RefreshFriends(now);
+    if (g_kind == session::Kind::None && g_udp.GetMode() == UdpPeer::Mode::Browse && page != session::Page::Lan)
+        g_udp.SetIdle();
+    ui::Update(now, SessionView(now), g_events);
+    for (const auto& command : ui::TakeCommands()) RunMenuCommand(command);
+    // Session events also appear as native HUD notifications during gameplay.
+    if (now < g_notifyRetryAt) return;
+    for (const auto& entry : g_events.Since(g_notified)) {
+        if (g_pawn && !ui::MenuOpen() && !ui::Notify("CO-OP", entry.text)) {
+            g_notifyRetryAt = now + 1;
+            break;
+        }
+        g_notified = entry.serial;
+    }
+}
+
 bool IsMissionDiscoveryName(const std::string& value) {
     std::string lower = value;
     std::transform(lower.begin(), lower.end(), lower.begin(),
@@ -3290,6 +3608,7 @@ void Tick(bool hudFrame) {
         }
     }
     double now = g_frameClock.Update(wall, engineTime, engineValid);
+    g_tickNow = now;
     if (now - g_lastScan >= 1.0 || !IsLive(g_controller)) {
         g_lastScan = now;
         auto controller = FindLocalController();
@@ -3323,10 +3642,24 @@ void Tick(bool hudFrame) {
     static bool wasAlive = false, wasConnected = false;
     bool alive = g_pawn && Alive(g_pawn), connected = now - g_lastRecv < kPeerTimeout;
     if (alive != wasAlive || (wasConnected && !connected)) ++g_consent;
+    if (wasConnected && !connected) {
+        g_events.Add(PartnerName() + " disconnected");
+        // A LAN host forgets the silent partner so the next player can take the slot.
+        if (g_kind == session::Kind::LanHost) g_udp.DropPartner();
+    }
     wasAlive = alive;
     wasConnected = connected;
+    if (g_net != &g_udp) g_udp.Poll(now);
     g_net->Poll(now);
+    if (g_net != &g_steam) g_steam.Poll(now);
     ReceiveRemote(now);
+    UpdateSession(now);
+    if (g_cfg.menuDiscovery) {
+        static bool held = false;
+        bool down = OwnWindowFocused() && (GetAsyncKeyState(VK_F6) & 0x8000);
+        if (down && !held) DiscoverMenus();
+        held = down;
+    }
     SaveTransferTick(TransferContext(now));
     static double teleportAt = -1;
     if (g_teleportAfterLoad) {
@@ -3358,13 +3691,12 @@ void Tick(bool hudFrame) {
     SendEnemies(g_pawn, now);
     UpdateEnemyReplicas(g_pawn, now);
     MenuOnline online;
-    if (g_cfg.steam) {
+    if (g_steam.Available()) {
         online.enabled = true;
         if (g_menu.IsOpen()) g_steam.RefreshFriends(now);
         const auto& friends = g_steam.Friends();
         if (g_joinChoice >= friends.size()) g_joinChoice = 0;
-        online.lobby = !g_steam.Available() ? "Unavailable" : g_steam.Busy() ? "Working..." :
-                       g_steam.InLobby() ? "Leave" : "Host";
+        online.lobby = g_steam.Busy() ? "Working..." : g_steam.InLobby() ? "Leave" : "Host";
         online.invite = g_steam.InLobby() ? "Open Steam overlay" : "Host first";
         online.join = friends.empty() ? "No friends in a lobby" :
                       friends.size() == 1 ? friends[0].name : "< " + friends[g_joinChoice].name + " >";
@@ -3375,11 +3707,11 @@ void Tick(bool hudFrame) {
         if (actions.joinStep && !friends.empty())
             g_joinChoice = (g_joinChoice + friends.size() + actions.joinStep) % friends.size();
         if (actions.lobby) {
-            if (g_steam.InLobby()) g_steam.Leave();
-            else g_steam.Host();
+            if (g_steam.InLobby()) LeaveSession(true);
+            else HostSteamSession();
         }
         if (actions.invite) g_steam.Invite();
-        if (actions.join && g_joinChoice < friends.size()) g_steam.Join(friends[g_joinChoice].lobby);
+        if (actions.join && g_joinChoice < friends.size()) JoinSteamSession(friends[g_joinChoice].lobby);
     }
     if (actions.passenger || actions.teleport || actions.invite) g_menu.Close(g_controller);
     if (actions.passenger) TogglePassenger(now);
@@ -3387,8 +3719,11 @@ void Tick(bool hudFrame) {
     if (g_menu.IsOpen()) {
         Call viewport(g_controller, "GetViewportSize");
         if (viewport.invoke()) {
-            std::string status = now - g_lastRecv < kPeerTimeout ? "Connected: " + g_remoteName :
-                                 g_cfg.steam ? g_steam.Status() : "Waiting for a LAN partner";
+            std::string status = now - g_lastRecv < kPeerTimeout ? "Connected: " + PartnerName() :
+                                 g_kind == session::Kind::Steam ? g_steam.Status() :
+                                 g_kind == session::Kind::LanHost ? "Hosting a LAN game; waiting for a partner" :
+                                 g_kind == session::Kind::LanJoin ? "Connecting to the LAN host..." :
+                                 "Not in a session: open CO-OP in the title or pause menu";
             if (g_settings.friendlyFire)
                 status += g_peer.flags & kFriendlyFire ? " / friendly fire ACTIVE" : " / partner has not enabled friendly fire";
             if (auto transfer = SaveTransferStatus(TransferContext(now)); !transfer.empty()) status += " / " + transfer;
@@ -3496,9 +3831,33 @@ void HookedProcessEvent(UObject* obj, UObject* fn, void* parms) {
     }
     if (g_ready && g_cfg.missionDiscovery && GetCurrentThreadId() == g_gameThread)
         TraceMissionEvent(obj, fn);
+    bool ownUi = g_ready && !g_inTick && GetCurrentThreadId() == g_gameThread && IsLive(obj) && IsLive(fn);
+    if (ownUi) {
+        g_inTick = true;
+        bool swallow = ui::BeforeEvent(obj, fn, parms);
+        g_inTick = false;
+        if (swallow) return;
+    }
+    if (g_ready && g_cfg.menuDiscovery && !g_inTick && IsLive(obj) && IsLive(fn) &&
+        Name(obj->cls) == "UI_MainMenuWidget_C") {
+        std::string name = Name(fn);
+        if (name == "OnConfirmPressed" || name == "ConfirmSelection" || name == "SetCursorPosition" ||
+            name == "SetSelectedPage" || name.starts_with("BndEvt__MenuInteract_MainMenu")) {
+            int cursor = -1, page = -1, position = -1;
+            GetProp(obj, "CursorPosition", cursor);
+            GetProp(obj, "ActiveMenuPageIndex", page);
+            ReadEventParam(fn, parms, "Position", position);
+            Log("menu discovery: %s cursor=%d page=%d position=%d", name.c_str(), cursor, page, position);
+        }
+    }
     if (g_ready && g_cfg.guestSaveGuard && GetCurrentThreadId() == g_gameThread)
         ObserveSaveEvent(obj, fn, parms);
     g.processEvent(obj, fn, parms);
+    if (ownUi && IsLive(obj)) {
+        g_inTick = true;
+        ui::AfterEvent(obj, fn);
+        g_inTick = false;
+    }
     if (g_ready && !g_inTick && GetCurrentThreadId() == g_gameThread && fn) {
         g_inTick = true;
         ObserveAttack(obj, fn, parms);
@@ -3543,6 +3902,7 @@ Config LoadConfig(const std::wstring& ini) {
     c.playerName = IniString(ini, L"PlayerName", c.playerName.c_str());
     c.discovery = GetPrivateProfileIntW(L"Coop", L"Discovery", 0, ini.c_str()) != 0;
     c.missionDiscovery = GetPrivateProfileIntW(L"Coop", L"MissionDiscovery", 0, ini.c_str()) != 0;
+    c.menuDiscovery = GetPrivateProfileIntW(L"Coop", L"MenuDiscovery", 0, ini.c_str()) != 0;
     c.guestSaveGuard = GetPrivateProfileIntW(L"Coop", L"GuestSaveGuard", 0, ini.c_str()) != 0;
     c.shareSave = GetPrivateProfileIntW(L"Coop", L"ShareSave", 0, ini.c_str()) != 0;
     c.debugTools = GetPrivateProfileIntW(L"Coop", L"DebugTools", 0, ini.c_str()) != 0;
@@ -3553,11 +3913,12 @@ Config LoadConfig(const std::wstring& ini) {
     c.teleportKey = GetPrivateProfileIntW(L"Coop", L"TeleportKey", c.teleportKey, ini.c_str());
     c.poseRate = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Coop", L"PoseRate", c.poseRate, ini.c_str())), 10, 30);
     c.poseFace = GetPrivateProfileIntW(L"Coop", L"PoseFace", 0, ini.c_str()) != 0;
-    std::string transport = IniString(ini, L"Transport", "udp");
+    std::string transport = IniString(ini, L"Transport", "menu");
     std::transform(transport.begin(), transport.end(), transport.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    c.steam = transport == "steam";
-    if (!c.steam && transport != "udp") Log("config: unknown Transport '%s'; using udp", transport.c_str());
+    c.autoLan = transport == "udp";
+    if (!c.autoLan && transport != "menu") Log("config: unknown Transport '%s'; using menu", transport.c_str());
+    c.lobbyVisibility = IniString(ini, L"Visibility", c.lobbyVisibility.c_str());
     c.steamPumpCallbacks = GetPrivateProfileIntW(L"Coop", L"SteamPumpCallbacks", 0, ini.c_str()) != 0;
     return c;
 }
@@ -3594,11 +3955,14 @@ bool Install(const std::wstring& basePath) {
         Log("FATAL: Port and PeerPort must be between 1 and 65535");
         return false;
     }
-    if (g_cfg.steam)
-        Log("config: transport=steam (experimental) name=%s", g_cfg.playerName.c_str());
-    else
-        Log("config: transport=udp port=%u peer=%s:%u name=%s", g_cfg.port,
-            g_cfg.peerHost.empty() ? "(host mode)" : g_cfg.peerHost.c_str(), g_cfg.peerPort, g_cfg.playerName.c_str());
+    session::Visibility visibility = session::Visibility::Friends;
+    if (!session::ParseVisibility(g_cfg.lobbyVisibility, visibility))
+        Log("config: unknown Visibility '%s'; using friends", g_cfg.lobbyVisibility.c_str());
+    g_steam.SetVisibility(visibility);
+    ui::Configure(g_cfg.menuDiscovery);
+    Log("config: transport=%s port=%u peer=%s:%u name=%s visibility=%s", g_cfg.autoLan ? "udp (LAN at launch)" : "menu",
+        g_cfg.port, g_cfg.peerHost.empty() ? "(host mode)" : g_cfg.peerHost.c_str(), g_cfg.peerPort,
+        g_cfg.playerName.empty() ? "(Steam name)" : g_cfg.playerName.c_str(), session::VisibilityName(visibility));
     if (g_cfg.missionDiscovery)
         Log("mission discovery: read-only signature tracing enabled; parameter values are not logged");
 

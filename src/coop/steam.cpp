@@ -226,12 +226,14 @@ void SteamPeer::Poll(double now) {
     if (pending_ != Pending::None && !pendingSince_) pendingSince_ = now;
     if (pending_ != Pending::None && now - pendingSince_ > 20) {
         Log("steam: %s timed out", pending_ == Pending::Create ? "creating the lobby" : "joining the lobby");
+        Announce(pending_ == Pending::Create ? "Creating the lobby timed out" : "Joining the lobby timed out");
         // Steam can still finish the call later; keep watching it so a late lobby gets left.
         if (pendingCall_ && staleCalls_.size() < 8) staleCalls_.push_back({pendingCall_, pending_});
         pending_ = Pending::None;
         pendingCall_ = 0;
     }
     PollStaleCalls();
+    PollList(now);
     if (lobby_ && now >= nextMembers_) {
         nextMembers_ = now + 1;
         RefreshMembers();
@@ -249,6 +251,7 @@ void SteamPeer::HandleEvents() {
         switch (e.id) {
         case kGameLobbyJoinRequested:
             Log("steam: joining %s's lobby from the Steam overlay", FriendName(e.b).c_str());
+            Announce("Joining " + FriendName(e.b) + "'s game");
             Join(e.a);
             break;
         case kLobbyCreated:
@@ -259,7 +262,10 @@ void SteamPeer::HandleEvents() {
             pending_ = Pending::None;
             pendingCall_ = 0;
             if (e.c == kResultOK && e.a) Entered(e.a, true);
-            else Log("steam: creating the lobby failed (result %u)", e.c);
+            else {
+                Log("steam: creating the lobby failed (result %u)", e.c);
+                Announce("Could not create a Steam lobby");
+            }
             break;
         case kLobbyEnter:
             if (pending_ != Pending::Join || e.a != pendingLobby_) {
@@ -269,7 +275,10 @@ void SteamPeer::HandleEvents() {
             pending_ = Pending::None;
             pendingCall_ = 0;
             if (e.c == kChatRoomEnterSuccess) Entered(e.a, false);
-            else Log("steam: joining the lobby failed: %s (%u)", EnterResponseText(e.c), e.c);
+            else {
+                Log("steam: joining the lobby failed: %s (%u)", EnterResponseText(e.c), e.c);
+                Announce(std::string("Could not join: ") + EnterResponseText(e.c));
+            }
             break;
         case kMessagesSessionRequest:
             if (IsMember(e.a) && api.messages) {
@@ -304,14 +313,20 @@ void SteamPeer::PollCall() {
         bool ok = VCall<bool>(api.utils, slot::kGetAPICallResult, call, static_cast<void*>(&result),
                               static_cast<int>(sizeof result), kLobbyCreated, &failed);
         if (ok && !failed && result.result == kResultOK && result.lobby) Entered(result.lobby, true);
-        else Log("steam: creating the lobby failed (result %u, io failure %d)", result.result, failed);
+        else {
+            Log("steam: creating the lobby failed (result %u, io failure %d)", result.result, failed);
+            Announce("Could not create a Steam lobby");
+        }
     } else if (kind == Pending::Join) {
         LobbyEnter result{};
         bool ok = VCall<bool>(api.utils, slot::kGetAPICallResult, call, static_cast<void*>(&result),
                               static_cast<int>(sizeof result), kLobbyEnter, &failed);
         if (ok && !failed && result.response == kChatRoomEnterSuccess && result.lobby) Entered(result.lobby, false);
-        else Log("steam: joining the lobby failed: %s (%u, io failure %d)", EnterResponseText(result.response),
-                 result.response, failed);
+        else {
+            Log("steam: joining the lobby failed: %s (%u, io failure %d)", EnterResponseText(result.response),
+                result.response, failed);
+            Announce(std::string("Could not join: ") + EnterResponseText(result.response));
+        }
     }
 }
 
@@ -363,18 +378,99 @@ void SteamPeer::ClosePartnerSession() {
     inbox_.clear();
 }
 
-void SteamPeer::Host() {
+void SteamPeer::Host(session::Visibility visibility) {
     if (!ready_ || pendingCall_) return;
     if (lobby_) Leave();
-    uint64_t call = VCall<uint64_t>(api.matchmaking, slot::kCreateLobby, kLobbyTypeFriendsOnly, 2);
+    visibility_ = visibility;
+    uint64_t call = VCall<uint64_t>(api.matchmaking, slot::kCreateLobby, session::SteamLobbyType(visibility), 2);
     if (!call) {
         Log("steam: Steam refused to create a lobby");
+        Announce("Steam refused to create a lobby");
         return;
     }
     pendingCall_ = call;
     pending_ = Pending::Create;
     pendingSince_ = 0;
-    Log("steam: creating a friends-only lobby (call %llu)", static_cast<unsigned long long>(pendingCall_));
+    Log("steam: creating a %s lobby (call %llu)", session::VisibilityName(visibility),
+        static_cast<unsigned long long>(pendingCall_));
+}
+
+void SteamPeer::SetVisibility(session::Visibility visibility) {
+    if (!ready_ || !lobby_) {
+        visibility_ = visibility;
+        return;
+    }
+    if (owner_ != self_) return;
+    if (VCall<bool>(api.matchmaking, slot::kSetLobbyType, lobby_, session::SteamLobbyType(visibility))) {
+        visibility_ = visibility;
+        if (!VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby_, "visibility", session::VisibilityKey(visibility)))
+            Announce("Visibility changed, but Steam could not update the lobby description");
+        Log("steam: lobby visibility is now %s", session::VisibilityName(visibility));
+        Announce(std::string("Lobby is now ") + session::VisibilityName(visibility));
+    } else {
+        Log("steam: Steam refused to change the lobby visibility");
+        Announce("Could not change lobby visibility");
+    }
+}
+
+void SteamPeer::RequestPublic() {
+    if (!ready_ || listCall_ || !api.utils) return;
+    std::string version = LobbyVersion();
+    VCall<void>(api.matchmaking, slot::kAddRequestLobbyListStringFilter, "dgt", version.c_str(), kLobbyComparisonEqual);
+    VCall<void>(api.matchmaking, slot::kAddRequestLobbyListFilterSlotsAvailable, 1);
+    VCall<void>(api.matchmaking, slot::kAddRequestLobbyListDistanceFilter, kLobbyDistanceWorldwide);
+    VCall<void>(api.matchmaking, slot::kAddRequestLobbyListResultCountFilter, 20);
+    listCall_ = VCall<uint64_t>(api.matchmaking, slot::kRequestLobbyList);
+    listSince_ = 0;
+    if (!listCall_) Announce("Steam refused the public lobby search");
+    Log("steam: searching public lobbies (call %llu)", static_cast<unsigned long long>(listCall_));
+}
+
+void SteamPeer::PollList(double now) {
+    if (!listCall_) return;
+    if (!listSince_) listSince_ = now;
+    bool failed = false;
+    if (!VCall<bool>(api.utils, slot::kIsAPICallCompleted, listCall_, &failed)) {
+        if (now - listSince_ > 15) {
+            Log("steam: the public lobby search timed out");
+            Announce("Public lobby search timed out");
+            listCall_ = 0;
+        }
+        return;
+    }
+    LobbyMatchList result{};
+    bool ok = VCall<bool>(api.utils, slot::kGetAPICallResult, listCall_, static_cast<void*>(&result),
+                          static_cast<int>(sizeof result), kLobbyMatchList, &failed);
+    listCall_ = 0;
+    public_.clear();
+    if (!ok || failed) {
+        Log("steam: the public lobby search failed");
+        Announce("Public lobby search failed");
+        return;
+    }
+    for (uint32_t i = 0; i < result.count && i < 50; ++i) {
+        uint64_t lobby = VCallSteamId(api.matchmaking, slot::kGetLobbyByIndex, static_cast<int>(i));
+        if (!lobby || lobby == lobby_) continue;
+        const char* name = VCall<const char*>(api.matchmaking, slot::kGetLobbyData, lobby, "name");
+        public_.push_back({0, lobby, name && *name ? name : "Days Gone Together"});
+    }
+    Log("steam: %u public lobbies found", static_cast<unsigned>(public_.size()));
+}
+
+std::string SteamPeer::PersonaName() const {
+    if (!ready_) return {};
+    const char* name = VCall<const char*>(api.friends, slot::kGetPersonaName);
+    return name ? name : "";
+}
+
+void SteamPeer::Announce(std::string text) {
+    if (events_.size() < 32) events_.push_back(std::move(text));
+}
+
+std::vector<std::string> SteamPeer::TakeEvents() {
+    std::vector<std::string> out;
+    out.swap(events_);
+    return out;
 }
 
 void SteamPeer::Join(uint64_t lobby) {
@@ -383,6 +479,7 @@ void SteamPeer::Join(uint64_t lobby) {
     uint64_t call = VCall<uint64_t>(api.matchmaking, slot::kJoinLobby, lobby);
     if (!call) {
         Log("steam: Steam refused to join lobby %llu", static_cast<unsigned long long>(lobby));
+        Announce("Steam refused to join the lobby");
         return;
     }
     pendingCall_ = call;
@@ -398,6 +495,7 @@ void SteamPeer::Leave() {
     ClosePartnerSession();
     VCall<void>(api.matchmaking, slot::kLeaveLobby, lobby_);
     Log("steam: left lobby %llu", static_cast<unsigned long long>(lobby_));
+    Announce("Left the Steam lobby");
     lobby_ = owner_ = 0;
     members_.clear();
     inbox_.clear();
@@ -414,22 +512,29 @@ void SteamPeer::Entered(uint64_t lobby, bool created) {
     partner_ = 0;
     members_.clear();
     inbox_.clear();
+    announced_ = false;
     std::string version = LobbyVersion();
     if (created) {
+        std::string name = name_.empty() ? PersonaName() : name_;
         VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "dgt", version.c_str());
-        VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "name", name_.c_str());
+        VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "name", name.c_str());
+        if (!VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "visibility", session::VisibilityKey(visibility_)))
+            Announce("Steam could not publish the lobby visibility description");
         VCall<bool>(api.matchmaking, slot::kSetLobbyJoinable, lobby, true);
-        Log("steam: hosting lobby %llu; invite a friend from the co-op menu or the Steam overlay",
-            static_cast<unsigned long long>(lobby));
+        Log("steam: hosting %s lobby %llu; invite a friend from the co-op menu or the Steam overlay",
+            session::VisibilityName(visibility_), static_cast<unsigned long long>(lobby));
+        Announce(std::string("Hosting a Steam lobby (") + session::VisibilityName(visibility_) + ")");
     } else {
         const char* value = VCall<const char*>(api.matchmaking, slot::kGetLobbyData, lobby, "dgt");
         if (!value || version != value) {
             Log("steam: lobby %llu is not a Days Gone Together protocol v%s lobby (it reports '%s'); leaving",
                 static_cast<unsigned long long>(lobby), version.c_str(), value ? value : "");
+            Announce("That lobby runs a different Days Gone Together version");
             Leave();
             return;
         }
         Log("steam: joined lobby %llu", static_cast<unsigned long long>(lobby));
+        Announce("Joined " + FriendName(VCallSteamId(api.matchmaking, slot::kGetLobbyOwner, lobby)) + "'s lobby");
     }
     nextMembers_ = 0;
     RefreshMembers();
@@ -439,15 +544,36 @@ void SteamPeer::RefreshMembers() {
     int count = VCall<int>(api.matchmaking, slot::kGetNumLobbyMembers, lobby_);
     if (count <= 0) {
         Log("steam: no longer in lobby %llu", static_cast<unsigned long long>(lobby_));
+        Announce("The lobby closed");
         ClosePartnerSession();
         lobby_ = owner_ = 0;
         members_.clear();
         inbox_.clear();
         return;
     }
-    owner_ = VCallSteamId(api.matchmaking, slot::kGetLobbyOwner, lobby_);
-    members_.clear();
+    uint64_t owner = VCallSteamId(api.matchmaking, slot::kGetLobbyOwner, lobby_);
+    if (owner_ && owner != owner_) {
+        Announce("The host left; the session has ended");
+        Leave();
+        return;
+    }
+    owner_ = owner;
+    if (owner_ != self_) {
+        const char* visibility = VCall<const char*>(api.matchmaking, slot::kGetLobbyData, lobby_, "visibility");
+        session::Visibility parsed;
+        if (visibility && session::ParseVisibility(visibility, parsed)) visibility_ = parsed;
+    }
+    std::vector<uint64_t> previous;
+    previous.swap(members_);
     for (int i = 0; i < count && i < 16; ++i) members_.push_back(VCallSteamId(api.matchmaking, slot::kGetLobbyMemberByIndex, lobby_, i));
+    if (announced_) {
+        for (uint64_t member : members_)
+            if (member && member != self_ && std::find(previous.begin(), previous.end(), member) == previous.end())
+                Announce(FriendName(member) + " is connecting");
+        for (uint64_t member : previous)
+            if (member && member != self_ && !IsMember(member)) Announce(FriendName(member) + " left the lobby");
+    }
+    announced_ = true;
     uint64_t next = 0;
     for (uint64_t member : members_) {
         if (member && member != self_) {
@@ -559,7 +685,8 @@ std::string SteamPeer::Status() const {
     if (pending_ == Pending::Join) return "Steam: joining a lobby...";
     if (!lobby_) return "Steam: host a lobby or join a friend";
     if (partner_) return "Steam lobby with " + FriendName(partner_);
-    return owner_ == self_ ? "Steam: hosting - invite a friend" : "Steam: in lobby, waiting for the host";
+    return owner_ == self_ ? std::string("Steam: hosting (") + session::VisibilityName(visibility_) + ") - invite a friend" :
+                             "Steam: in lobby, waiting for the host";
 }
 
 } // namespace coop

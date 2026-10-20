@@ -205,10 +205,13 @@ Engine functions are called **by name**. Only `ProcessEvent` and
 
 ### 4.1 Peering
 
-One non-blocking UDP socket ([`net.cpp`](../src/coop/net.cpp)). In host mode
-(`PeerHost` empty) the first valid sender becomes the partner. In join mode
-the plugin sends to the configured host. Either way, the peer's address is
-then pinned until the game restarts. A peer that has been silent for 5 s
+One non-blocking UDP socket ([`net.cpp`](../src/coop/net.cpp)). The native
+CO-OP menu switches between idle, browsing, hosting and joining. In host mode
+the first valid sender becomes the partner; in join mode the plugin sends to
+the selected host. Closing/leaving clears the pinned endpoint; a host drops
+a timed-out partner so another can join. `Transport=udp` optionally starts
+hosting/joining from the INI instead of waiting for a menu choice.
+`DGTB` broadcast beacons advertise open LAN hosts. A peer silent for 5 s
 counts as disconnected. A new session ID (from `BCryptGenRandom`) counts as a
 reconnect.
 
@@ -216,10 +219,12 @@ Both transports implement the same small `Transport` interface: send a
 datagram, receive the partner's datagrams, and poll. The rest of the plugin
 does not know which one is active.
 
-### 4.1.1 Steam transport (experimental, untested in the game)
+### 4.1.1 Steam transport (experimental)
 
-With `Transport=steam`, [`steam.cpp`](../src/coop/steam.cpp) replaces the UDP
-socket. No Steamworks SDK code is bundled or linked:
+Choosing a Steam session in CO-OP activates [`steam.cpp`](../src/coop/steam.cpp)
+instead of the UDP transport. Lobby creation, visibility changes and overlay
+invites have been tested in-game; two-account joining/traffic is still
+unverified. No Steamworks SDK code is bundled or linked:
 
 - The game already loads `steam_api64.dll` and initializes Steam. The plugin
   takes the loaded module with `GetModuleHandle` and resolves four exports:
@@ -236,7 +241,7 @@ socket. No Steamworks SDK code is bundled or linked:
   calling convention, with one exception: MSVC returns a `CSteamID` from a
   member function through a hidden pointer after `this`. Those calls pass that
   pointer explicitly. Struct layouts are checked with `static_assert`.
-- **Discovery.** The host creates a friends-only lobby limited to two members
+- **Discovery.** The host creates an invite-only, friends-only or public lobby limited to two members
   and sets lobby data `dgt` to the protocol version. A joiner leaves any lobby
   whose `dgt` doesn't match. A friend joins in one of three ways:
   - a Steam overlay invite, through the `GameLobbyJoinRequested_t` callback;
@@ -244,6 +249,8 @@ socket. No Steamworks SDK code is bundled or linked:
     running;
   - the menu, which lists friends playing the same app ID whose
     `FriendGameInfo_t` reports a lobby.
+  Public search filters by the mod's `dgt` metadata and available member slots.
+  Hosts can change visibility without leaving the game.
 - **Results without threads.** `CreateLobby` and `JoinLobby` results are
   polled from the game thread with `ISteamUtils::GetAPICallResult`. Callbacks
   use hand-built `CCallbackBase` objects. They may fire on whichever thread
@@ -255,7 +262,8 @@ socket. No Steamworks SDK code is bundled or linked:
   only from lobby members. Steam authenticates the sender and encrypts the
   traffic, and its relays avoid exposing IP addresses or forwarding ports.
 - **Roles.** The lobby owner is the host for world time, weather and enemies.
-  In LAN mode, the player without `PeerHost` is the host.
+  If the original owner leaves, the session ends instead of adopting Steam's
+  replacement owner. In LAN mode, the player who chose Host is the host.
 
 ### 4.2 State packet (protocol v6)
 
@@ -398,7 +406,8 @@ collector.
 
 ### 5.5 Settings overlay
 
-The menu uses [Dear ImGui](https://github.com/ocornut/imgui) with its DX11
+The F8 settings overlay, separate from the native title/pause CO-OP menus,
+uses [Dear ImGui](https://github.com/ocornut/imgui) with its DX11
 backend. A setup thread creates a dummy D3D11 swap chain to find the shared
 `Present` and `ResizeBuffers` vtable slots and replaces them. The game thread
 publishes an immutable frame under a mutex; `Present` draws it and restores
@@ -474,5 +483,5 @@ authoritative enemy model, which doesn't exist yet.
 - Motorcycle physics, fuel, damage and upgrades are not shared.
 - Two players only. LAN mode is for trusted networks only: its protocol is
   neither encrypted nor authenticated. The Steam transport is encrypted and
-  authenticated by Steam, but it has not been tested in the game yet.
+  authenticated by Steam, but two-account traffic has not been tested yet.
 - Only one game build is supported. Native Windows is untested.
