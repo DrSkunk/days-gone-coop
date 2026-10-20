@@ -9,12 +9,14 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <vector>
 
 using namespace ue;
 
 namespace coop {
 namespace {
-constexpr int kRows = 11;
+constexpr int kBaseRows = 10; // settings and actions before the optional Steam rows and "Close"
+constexpr int kOnlineRows = 3;
 using Color = OverlayColor;
 OverlayFrame pendingFrame;
 
@@ -118,8 +120,10 @@ void SettingsMenu::SetOpen(bool open, UObject* controller) {
     Log("menu: %s", open_ ? "opened" : "closed");
 }
 
-MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings& settings) {
+MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings& settings, const MenuOnline& online) {
     MenuActions result;
+    rows_ = kBaseRows + (online.enabled ? kOnlineRows : 0) + 1;
+    if (selected_ >= rows_) selected_ = rows_ - 1;
     bool toggle = Pressed(VK_F8);
     bool passenger = Pressed(VK_F9);
     bool back = Pressed(VK_ESCAPE);
@@ -152,7 +156,7 @@ MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings
     right |= (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
     accept |= (pressed & XINPUT_GAMEPAD_A) != 0;
     if (up || down) {
-        selected_ = (selected_ + (down ? 1 : kRows - 1)) % kRows;
+        selected_ = (selected_ + (down ? 1 : rows_ - 1)) % rows_;
         confirmDamage_ = false;
     }
     if (click && panelWidth_ > 0) {
@@ -165,7 +169,7 @@ MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings
                 float x = static_cast<float>(cursor.x) * renderWidth_ / client.right;
                 float y = static_cast<float>(cursor.y) * renderHeight_ / client.bottom;
                 float row = (y - panelY_) / rowHeight_;
-                if (x >= panelX_ && x < panelX_ + panelWidth_ && row >= 0 && row < kRows) {
+                if (x >= panelX_ && x < panelX_ + panelWidth_ && row >= 0 && row < rows_) {
                     selected_ = static_cast<int>(row);
                     accept = true;
                 }
@@ -201,32 +205,46 @@ MenuActions SettingsMenu::Update(UObject* controller, bool focused, MenuSettings
         result.changed = true;
     } else if (selected_ == 8 && accept) result.passenger = true;
     else if (selected_ == 9 && accept) result.teleport = true;
-    else if (selected_ == 10 && accept) SetOpen(false, controller);
+    else if (online.enabled && selected_ == kBaseRows && accept) result.lobby = true;
+    else if (online.enabled && selected_ == kBaseRows + 1 && accept) result.invite = true;
+    else if (online.enabled && selected_ == kBaseRows + 2) {
+        if (accept) result.join = true;
+        else result.joinStep = direction;
+    } else if (selected_ == rows_ - 1 && accept) SetOpen(false, controller);
     return result;
 }
 
 void SettingsMenu::Draw(int width, int height, const MenuSettings& settings,
-                        const std::string& status) {
+                        const std::string& status, const MenuOnline& online) {
     if (!open_ || width < 320 || height < 240) return;
     pendingFrame = {width, height, {}};
     renderWidth_ = width;
     renderHeight_ = height;
-    float scale = std::min(width / 1280.f, height / 800.f);
-    float w = 700 * scale, h = 690 * scale, x = (width - w) * 0.5f, y = (height - h) * 0.5f;
+    std::vector<std::string> labels = {"Jacket color", "Trousers color", "Cap color", "Cap",
+        "Sync motorcycles", "Allow a passenger", "Friendly fire", "Sync host's enemies", "Join / leave partner's bike", "Teleport to partner"};
+    std::vector<std::string> values = {PaletteName(settings.jacket), PaletteName(settings.trousers),
+        PaletteName(settings.capColor), settings.cap ? "On" : "Off", settings.motorcycles ? "On" : "Off",
+        settings.passengers ? "On" : "Off", settings.friendlyFire ? "ON - LETHAL" : "Off", settings.enemies ? "On" : "Off", "", ""};
+    if (online.enabled) {
+        labels.insert(labels.end(), {"Steam lobby", "Invite a Steam friend", "Join a Steam friend"});
+        values.insert(values.end(), {online.lobby, online.invite, online.join});
+    }
+    labels.push_back("Close");
+    values.push_back("");
+    int rows = static_cast<int>(labels.size());
+    float scale = std::min(width / 1280.f, height / std::max(800.f, 270.f + rows * 40));
+    // Header 108, rows of 40, footer 142 (the original 11-row layout is 690 high).
+    float w = 700 * scale, h = (250 + rows * 40) * scale, x = (width - w) * 0.5f, y = std::max(0.f, (height - h) * 0.5f);
+    float footer = y + (108 + rows * 40) * scale;
     Color white{0.92f, 0.95f, 1.f, 1.f}, muted{0.55f, 0.64f, 0.72f, 1.f};
     Rect({0.01f, 0.02f, 0.03f, 0.75f}, 0, 0, static_cast<float>(width), static_cast<float>(height));
     Rect({0.025f, 0.045f, 0.065f, 0.98f}, x, y, w, h);
     Rect({0.12f, 0.7f, 0.65f, 1.f}, x, y, w, 4 * scale);
     Text("DAYS GONE / CO-OP", white, x + 28 * scale, y + 22 * scale, 1.8f * scale);
     Text(status, muted, x + 28 * scale, y + 65 * scale, 0.9f * scale);
-    std::array<std::string, kRows> labels = {"Jacket color", "Trousers color", "Cap color", "Cap",
-        "Sync motorcycles", "Allow a passenger", "Friendly fire", "Sync host's enemies", "Join / leave partner's bike", "Teleport to partner", "Close"};
-    std::array<std::string, kRows> values = {PaletteName(settings.jacket), PaletteName(settings.trousers),
-        PaletteName(settings.capColor), settings.cap ? "On" : "Off", settings.motorcycles ? "On" : "Off",
-        settings.passengers ? "On" : "Off", settings.friendlyFire ? "ON - LETHAL" : "Off", settings.enemies ? "On" : "Off", "", "", ""};
     float rowY = y + 108 * scale, rowH = 40 * scale;
     panelX_ = x; panelY_ = rowY; panelWidth_ = w; rowHeight_ = rowH;
-    for (int i = 0; i < kRows; ++i) {
+    for (int i = 0; i < rows; ++i) {
         if (i == selected_) Rect({0.06f, 0.22f, 0.26f, 1.f}, x + 12 * scale, rowY + i * rowH, w - 24 * scale, rowH);
         Text(labels[i], white, x + 28 * scale, rowY + (i * 40 + 10) * scale, scale);
         Text(values[i], i == 6 && settings.friendlyFire ? Color{1.f, 0.35f, 0.25f, 1.f} : muted,
@@ -234,11 +252,11 @@ void SettingsMenu::Draw(int width, int height, const MenuSettings& settings,
     }
     Text(confirmDamage_ ? "Enable real damage and death? Press A / Enter again to confirm." :
          "Friendly fire requires BOTH players to opt in. The world keeps running.",
-         confirmDamage_ ? Color{1.f, 0.6f, 0.25f, 1.f} : muted, x + 28 * scale, y + 575 * scale, 0.86f * scale);
+         confirmDamage_ ? Color{1.f, 0.6f, 0.25f, 1.f} : muted, x + 28 * scale, footer + 27 * scale, 0.86f * scale);
     Text("D-pad / arrows: select     Left / right / A: change     B / Esc: close", muted,
-         x + 28 * scale, y + 615 * scale, 0.86f * scale);
+         x + 28 * scale, footer + 67 * scale, 0.86f * scale);
     Text("Open: F8 or View + Y     Appearance saves automatically", muted,
-         x + 28 * scale, y + 644 * scale, 0.86f * scale);
+         x + 28 * scale, footer + 96 * scale, 0.86f * scale);
     POINT cursor{};
     RECT client{};
     HWND window = GetForegroundWindow();

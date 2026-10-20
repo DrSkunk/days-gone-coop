@@ -54,7 +54,9 @@ their motorcycle and the host's nearby enemies in your world.
   on a desktop Linux PC and a Steam Deck. Native Windows has not been tested yet.
 - [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
   (x64) to load the plugin.
-- Two PCs on the same LAN, both on the same mod version.
+- Two PCs on the same LAN, both on the same mod version. The experimental
+  [Steam mode](#online-over-steam-experimental-untested) works over the
+  Internet between Steam friends, but it has not been tested yet.
 
 ## Install
 
@@ -119,6 +121,33 @@ PlayerName=Partner
 - Settings are read when the game starts. Restart the game after editing the
   INI or to switch partners.
 
+### Online over Steam (experimental, untested)
+
+> [!WARNING]
+> Steam mode is a proof of concept that has **not been tested in the game
+> yet**. Use LAN mode unless you want to help test it, and send your
+> `DaysGoneTogether.log` if it fails.
+
+Steam mode lets two Steam friends play over the Internet without port
+forwarding. Steam handles the connection, NAT traversal, relaying and
+encryption. Both players set:
+
+```ini
+[Coop]
+Transport=steam
+PlayerName=YourName
+```
+
+1. **Host:** open the menu (F8) and choose *Steam lobby → Host*. Then choose
+   *Invite a Steam friend*, which opens the Steam overlay invite dialog.
+2. **Friend:** accept the invite in Steam, or open the menu and choose a name
+   on the *Join a Steam friend* row. Left/Right switches between friends who
+   are hosting.
+3. The lobby owner is the host for time, weather and enemies.
+
+Lobbies are friends-only and hold two players. Only traffic from the other
+lobby member is accepted. `Port` and `PeerHost` are ignored in Steam mode.
+
 ## Controls
 
 | Action | Keyboard / mouse | Gamepad (XInput) |
@@ -148,6 +177,9 @@ template under *Controller Settings → Current Layout → Templates*.
 | Sync host's enemies | Host: send nearby enemies. Joining player: show them |
 | Join / leave partner's bike | Same as F9 |
 | Teleport to partner | Same as F7 |
+| Steam lobby | Steam mode only: host a lobby, or leave the current one |
+| Invite a Steam friend | Steam mode only: opens the Steam overlay invite dialog |
+| Join a Steam friend | Steam mode only: Left/Right picks a friend who is hosting, A/Enter joins |
 
 Menu changes are saved to the INI right away, except friendly fire. Friendly
 fire starts off in every session and is never saved.
@@ -182,6 +214,8 @@ All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 | `AnimIdle`, `AnimWalk`, `AnimRun`, `AnimSprint` | Deacon clips | Fallback animations used when no pose stream arrives |
 | `PoseRate` | `20` | Player and bike pose updates per second (10-30). Lower saves bandwidth |
 | `PoseFace` | `0` | `1` also streams the face rig (about 280 more bones, much more bandwidth) |
+| `Transport` | `udp` | `udp` = LAN. `steam` = experimental, untested Steam lobby and networking |
+| `SteamPumpCallbacks` | `0` | Steam mode: `1` also pumps Steam callbacks from the mod. Try it if invites never arrive |
 
 ## Troubleshooting
 

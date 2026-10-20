@@ -45,7 +45,8 @@ Python simulator and analysis tools. They don't replace testing in the game.
 | [`src/coop/combat.hpp`](../src/coop/combat.hpp) | Friendly-fire delivery queue |
 | [`src/coop/appearance.cpp`](../src/coop/appearance.cpp) | Garment tinting |
 | [`src/coop/menu.cpp`](../src/coop/menu.cpp), [`overlay.cpp`](../src/coop/overlay.cpp) | Menu input and DX11 overlay |
-| [`src/coop/net.cpp`](../src/coop/net.cpp), [`log.cpp`](../src/coop/log.cpp) | UDP socket and log |
+| [`src/coop/net.cpp`](../src/coop/net.cpp), [`log.cpp`](../src/coop/log.cpp) | Transport interface, UDP socket and log |
+| [`src/coop/steam.cpp`](../src/coop/steam.cpp), [`steam_abi.hpp`](../src/coop/steam_abi.hpp) | Experimental Steam lobby and networking transport (runtime-resolved, no SDK) |
 | [`src/coop/debug_commands.hpp`](../src/coop/debug_commands.hpp) | Debug command allowlist |
 | [`tools/`](../tools) | Tests, simulator, debug helper, offline analysis |
 

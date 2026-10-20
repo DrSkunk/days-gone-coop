@@ -2,6 +2,7 @@
 
 #include "log.hpp"
 #include "net.hpp"
+#include "steam.hpp"
 #include "menu.hpp"
 #include "motion.hpp"
 #include "frameclock.hpp"
@@ -53,7 +54,15 @@ bool g_inTick = false;
 bool g_failed = false;
 bool g_ready = false;
 double g_lastTick = 0, g_nextSend = 0, g_lastScan = -10;
-UdpPeer g_net;
+UdpPeer g_udp;
+SteamPeer g_steam;
+Transport* g_net = &g_udp;
+size_t g_joinChoice = 0;
+
+// LAN: the player without a PeerHost hosts. Steam: the lobby owner hosts.
+bool IsHost() {
+    return g_cfg.steam ? g_steam.IsOwner() : g_cfg.peerHost.empty();
+}
 uint32_t g_seq = 0;
 uint32_t g_localShotSequence = 0;
 uint32_t g_session = 0, g_consent = 1;
@@ -340,7 +349,13 @@ bool ResolveEngine() {
         Log("animation slot %d '%s' -> %s", i, names[i]->c_str(), g_anims[i] ? "found" : "not loaded yet");
     }
     std::string net;
-    if (!g_net.Open(g_cfg.port, g_cfg.peerHost, g_cfg.peerPort, net)) {
+    if (g_cfg.steam) {
+        g_net = &g_steam;
+        g_steam.Open(g_cfg.playerName, g_cfg.steamPumpCallbacks, net);
+        Log("network: experimental Steam transport; %s", net.c_str());
+        return true;
+    }
+    if (!g_udp.Open(g_cfg.port, g_cfg.peerHost, g_cfg.peerPort, net)) {
         Log("FATAL: network: %s", net.c_str());
         return false;
     }
@@ -456,8 +471,7 @@ void RestoreWorldSnapshot() {
 
 void UpdateWorldSync(UObject* pawn, double now) {
     if (pawn != g_worldPawn) {
-        if (!g_cfg.peerHost.empty() && g_worldRestore.state.valid &&
-            g_worldRestore.manager == g_worldManager)
+        if (g_worldRestore.state.valid && g_worldRestore.manager == g_worldManager)
             RestoreWorldSnapshot();
         g_worldPawn = pawn;
         g_worldManager = nullptr;
@@ -481,7 +495,16 @@ void UpdateWorldSync(UObject* pawn, double now) {
     }
     if (now < g_worldUpdateAt) return;
     g_worldUpdateAt = now + 0.5;
-    if (g_cfg.peerHost.empty()) {
+    if (IsHost()) {
+        // A former client (e.g. after leaving a Steam lobby) first returns to its own time and weather.
+        if (g_worldRestore.state.valid) {
+            if (g_worldRestore.manager == g_worldManager) RestoreWorldSnapshot();
+            else g_worldRestore = {};
+            if (g_worldRestore.state.valid) {
+                g_worldState = {};
+                return;
+            }
+        }
         WorldSnapshot state{};
         bool valid = ReadWorldSnapshot(g_worldManager, state);
         if (valid && (!g_worldState.valid || std::fabs(g_worldState.timeOfDay - state.timeOfDay) > 0.1f ||
@@ -972,7 +995,7 @@ void SendPose(PoseKind kind, PoseSource& source, UObject* mesh, uint32_t timeMs,
         }
     }
     EncodePose(header, source.names, source.bones, [](const char* packet, size_t size) {
-        g_net.SendRaw(packet, static_cast<int>(size));
+        g_net->SendRaw(packet, static_cast<int>(size));
         ++g_poseStats.sent;
         g_poseStats.bytes += size;
     }, &source.tracker);
@@ -993,7 +1016,7 @@ void SendLocalState(UObject* pawn, double now) {
     p.trousers = static_cast<uint8_t>(g_settings.trousers);
     p.capColor = static_cast<uint8_t>(g_settings.capColor);
     p.cap = g_settings.cap;
-    if (g_cfg.peerHost.empty() && g_worldState.valid) {
+    if (IsHost() && g_worldState.valid) {
         p.flags |= kWorldState;
         p.worldTimeOfDay = g_worldState.timeOfDay;
         p.worldRelativeTime = g_worldState.relativeTime;
@@ -1002,7 +1025,7 @@ void SendLocalState(UObject* pawn, double now) {
     }
     if (g_settings.friendlyFire) p.flags |= kFriendlyFire;
     if (g_settings.motorcycles) p.flags |= kSyncBikes;
-    if (g_settings.enemies && !g_cfg.peerHost.empty()) p.flags |= kSyncEnemies;
+    if (g_settings.enemies && !IsHost()) p.flags |= kSyncEnemies;
     if (g_settings.passengers) p.flags |= kAcceptPassengers;
     std::snprintf(p.name, sizeof p.name, "%s", g_cfg.playerName.c_str());
     g_damage.Fill(p);
@@ -1083,7 +1106,7 @@ void SendLocalState(UObject* pawn, double now) {
             }
         }
     }
-    g_net.Send(p);
+    g_net->Send(p);
     if (!(p.flags & kHasPawn) || now - g_lastRecv >= kPeerTimeout) return;
     SendGear(pawn, now);
     if (now < g_nextPoseSend) return;
@@ -1121,7 +1144,7 @@ void ReceivePose(const char* data, int len, double now) {
 void ReceiveRemote(double now) {
     StatePacket p;
     auto other = [now](const char* data, int len) { ReceivePose(data, len, now); };
-    for (int budget = 0; budget < 64 && g_net.Receive(p, other); ++budget) {
+    for (int budget = 0; budget < 64 && g_net->Receive(p, other); ++budget) {
         bool reconnect = now - g_lastRecv > kPeerTimeout || p.session != g_peer.session;
         if (!reconnect && !NewerSequence(p.seq, g_lastRemoteSeq)) continue;
         if (reconnect) {
@@ -1129,7 +1152,7 @@ void ReceiveRemote(double now) {
             g_motion.Clear();
             g_bodyPoses.Clear();
             g_bikePoses.Clear();
-            Log("peer %s (%s) connected", p.name, g_net.PeerText().c_str());
+            Log("peer %s (%s) connected", p.name, g_net->PeerText().c_str());
             DestroyAvatar();  // Rebuild from the player's current look; also a manual "respawn" lever.
             DestroyBike();
             DestroyEnemyReplicas();
@@ -1690,7 +1713,7 @@ bool DebugProbe(bool player) {
 
 // Host-only world tests: the client must follow through the regular world-state stream.
 bool DebugWorld(bool weather) {
-    if (!g_cfg.peerHost.empty()) return DebugError("World tests run on the host; the client follows the host");
+    if (!IsHost()) return DebugError("World tests run on the host; the client follows the host");
     UObject* manager = FindWorldManager();
     WorldSnapshot current{};
     if (!WorldSyncAllowed(manager) || !ReadWorldSnapshot(manager, current))
@@ -2608,7 +2631,7 @@ void SendGear(UObject* pawn, double now) {
     g_localGear.packet = packet;
     g_localGear.valid = true;
     g_localGear.lastSent = now;
-    g_net.SendRaw(&packet, sizeof packet);
+    g_net->SendRaw(&packet, sizeof packet);
 }
 
 void ReceiveGear(const char* data, int len, double now) {
@@ -2879,7 +2902,7 @@ void SendEnemy(EnemySource& e, const FVector& origin, uint32_t timeMs, double no
     if (now - e.lastInfo >= kEnemyInfoInterval) {
         EnemyInfoPacket info;
         if (EncodeEnemyInfo(g_session, e.entity, e.paths, info)) {
-            g_net.SendRaw(&info, sizeof info);
+            g_net->SendRaw(&info, sizeof info);
             ++g_enemyStats.infos;
             g_enemyStats.bytes += sizeof info;
         }
@@ -2914,7 +2937,7 @@ void SendEnemy(EnemySource& e, const FVector& origin, uint32_t timeMs, double no
     Call alive(e.pawn, "IsAlive");
     if (alive.invoke() && alive.get<bool>("ReturnValue")) header.flags |= kPoseAlive;
     EncodePose(header, e.names, e.bones, [](const char* packet, size_t size) {
-        g_net.SendRaw(packet, static_cast<int>(size));
+        g_net->SendRaw(packet, static_cast<int>(size));
         ++g_enemyStats.sent;
         g_enemyStats.bytes += size;
     }, &e.tracker);
@@ -2922,7 +2945,7 @@ void SendEnemy(EnemySource& e, const FVector& origin, uint32_t timeMs, double no
 }
 
 void SendEnemies(UObject* pawn, double now) {
-    if (!g_cfg.peerHost.empty() || !pawn || !EnemyReplicationActive(now) || !(g_peer.flags & kSyncEnemies)) {
+    if (!IsHost() || !pawn || !EnemyReplicationActive(now) || !(g_peer.flags & kSyncEnemies)) {
         if (!g_enemySources.empty()) Log("enemies: stopped streaming");
         g_enemySources.clear();
         g_enemyScan.cursor = 0;
@@ -2954,7 +2977,7 @@ void DestroyEnemyReplicas() {
 }
 
 bool AcceptEnemies(double now) {
-    return !g_cfg.peerHost.empty() && g_pawn && EnemyReplicationActive(now);
+    return !IsHost() && g_pawn && EnemyReplicationActive(now);
 }
 
 EnemyReplica* ReplicaFor(uint32_t entity) {
@@ -3178,6 +3201,7 @@ void Tick(bool hudFrame) {
     if (alive != wasAlive || (wasConnected && !connected)) ++g_consent;
     wasAlive = alive;
     wasConnected = connected;
+    g_net->Poll(now);
     ReceiveRemote(now);
     UpdateWorldSync(g_pawn, now);
     UpdateDebugTools(now);
@@ -3195,18 +3219,42 @@ void Tick(bool hudFrame) {
     UpdateGear(g_pawn, now);
     SendEnemies(g_pawn, now);
     UpdateEnemyReplicas(g_pawn, now);
-    auto actions = g_menu.Update(g_controller, OwnWindowFocused(), g_settings);
-    if (actions.passenger || actions.teleport) g_menu.Close(g_controller);
+    MenuOnline online;
+    if (g_cfg.steam) {
+        online.enabled = true;
+        if (g_menu.IsOpen()) g_steam.RefreshFriends(now);
+        const auto& friends = g_steam.Friends();
+        if (g_joinChoice >= friends.size()) g_joinChoice = 0;
+        online.lobby = !g_steam.Available() ? "Unavailable" : g_steam.Busy() ? "Working..." :
+                       g_steam.InLobby() ? "Leave" : "Host";
+        online.invite = g_steam.InLobby() ? "Open Steam overlay" : "Host first";
+        online.join = friends.empty() ? "No friends in a lobby" :
+                      friends.size() == 1 ? friends[0].name : "< " + friends[g_joinChoice].name + " >";
+    }
+    auto actions = g_menu.Update(g_controller, OwnWindowFocused(), g_settings, online);
+    if (online.enabled) {
+        const auto& friends = g_steam.Friends();
+        if (actions.joinStep && !friends.empty())
+            g_joinChoice = (g_joinChoice + friends.size() + actions.joinStep) % friends.size();
+        if (actions.lobby) {
+            if (g_steam.InLobby()) g_steam.Leave();
+            else g_steam.Host();
+        }
+        if (actions.invite) g_steam.Invite();
+        if (actions.join && g_joinChoice < friends.size()) g_steam.Join(friends[g_joinChoice].lobby);
+    }
+    if (actions.passenger || actions.teleport || actions.invite) g_menu.Close(g_controller);
     if (actions.passenger) TogglePassenger(now);
     if (actions.teleport) TeleportToPartner(g_pawn, now);
     if (g_menu.IsOpen()) {
         Call viewport(g_controller, "GetViewportSize");
         if (viewport.invoke()) {
-            std::string status = now - g_lastRecv < kPeerTimeout ? "Connected: " + g_remoteName : "Waiting for a LAN partner";
+            std::string status = now - g_lastRecv < kPeerTimeout ? "Connected: " + g_remoteName :
+                                 g_cfg.steam ? g_steam.Status() : "Waiting for a LAN partner";
             if (g_settings.friendlyFire)
                 status += g_peer.flags & kFriendlyFire ? " / friendly fire ACTIVE" : " / partner has not enabled friendly fire";
             if (!g_settingsError.empty()) status = g_settingsError;
-            g_menu.Draw(viewport.get<int>("SizeX"), viewport.get<int>("SizeY"), g_settings, status);
+            g_menu.Draw(viewport.get<int>("SizeX"), viewport.get<int>("SizeY"), g_settings, status, online);
         }
     }
     if (actions.changed) {
@@ -3359,6 +3407,12 @@ Config LoadConfig(const std::wstring& ini) {
     c.teleportKey = GetPrivateProfileIntW(L"Coop", L"TeleportKey", c.teleportKey, ini.c_str());
     c.poseRate = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Coop", L"PoseRate", c.poseRate, ini.c_str())), 10, 30);
     c.poseFace = GetPrivateProfileIntW(L"Coop", L"PoseFace", 0, ini.c_str()) != 0;
+    std::string transport = IniString(ini, L"Transport", "udp");
+    std::transform(transport.begin(), transport.end(), transport.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    c.steam = transport == "steam";
+    if (!c.steam && transport != "udp") Log("config: unknown Transport '%s'; using udp", transport.c_str());
+    c.steamPumpCallbacks = GetPrivateProfileIntW(L"Coop", L"SteamPumpCallbacks", 0, ini.c_str()) != 0;
     return c;
 }
 
@@ -3394,8 +3448,11 @@ bool Install(const std::wstring& basePath) {
         Log("FATAL: Port and PeerPort must be between 1 and 65535");
         return false;
     }
-    Log("config: port=%u peer=%s:%u name=%s", g_cfg.port, g_cfg.peerHost.empty() ? "(host mode)" : g_cfg.peerHost.c_str(),
-        g_cfg.peerPort, g_cfg.playerName.c_str());
+    if (g_cfg.steam)
+        Log("config: transport=steam (experimental) name=%s", g_cfg.playerName.c_str());
+    else
+        Log("config: transport=udp port=%u peer=%s:%u name=%s", g_cfg.port,
+            g_cfg.peerHost.empty() ? "(host mode)" : g_cfg.peerHost.c_str(), g_cfg.peerPort, g_cfg.playerName.c_str());
 
     g.imageBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g.imageBase);

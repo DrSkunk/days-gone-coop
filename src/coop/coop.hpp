@@ -24,6 +24,8 @@ struct Config {
     int teleportKey = 0x76; // VK_F7
     int poseRate = 20;      // player and bike pose updates per second (10-30)
     bool poseFace = false;  // also stream the face rig (about 280 extra bones)
+    bool steam = false;     // Transport=steam: experimental Steam lobby + Steam Networking instead of LAN UDP
+    bool steamPumpCallbacks = false; // also run SteamAPI_RunCallbacks from the mod (only if invites never arrive)
 };
 
 Config LoadConfig(const std::wstring& iniPath);

@@ -206,6 +206,51 @@ then pinned until the game restarts. A peer that has been silent for 5 s
 counts as disconnected. A new session ID (from `BCryptGenRandom`) counts as a
 reconnect.
 
+Both transports implement the same small `Transport` interface: send a
+datagram, receive the partner's datagrams, and poll. The rest of the plugin
+does not know which one is active.
+
+### 4.1.1 Steam transport (experimental, untested in the game)
+
+With `Transport=steam`, [`steam.cpp`](../src/coop/steam.cpp) replaces the UDP
+socket. No Steamworks SDK code is bundled or linked:
+
+- The game already loads `steam_api64.dll` and initializes Steam. The plugin
+  takes the loaded module with `GetModuleHandle` and resolves four exports:
+  `SteamAPI_GetHSteamUser`, `SteamInternal_FindOrCreateUserInterface`,
+  `SteamAPI_RegisterCallback` and `SteamAPI_RunCallbacks`. `DaysGone.exe`
+  contains the same export names as strings, which shows the game's DLL
+  provides them.
+- Interfaces are requested by version string. The running Steam client serves
+  them, so versions newer than the game's SDK are available, for example
+  `SteamNetworkingMessages002`. If that is missing, it falls back to the
+  legacy `SteamNetworking006` P2P API.
+- Methods are called through vtable slots taken from the public SDK headers
+  ([`steam_abi.hpp`](../src/coop/steam_abi.hpp)). MinGW and MSVC share the x64
+  calling convention, with one exception: MSVC returns a `CSteamID` from a
+  member function through a hidden pointer after `this`. Those calls pass that
+  pointer explicitly. Struct layouts are checked with `static_assert`.
+- **Discovery.** The host creates a friends-only lobby limited to two members
+  and sets lobby data `dgt` to the protocol version. A joiner leaves any lobby
+  whose `dgt` doesn't match. A friend joins in one of three ways:
+  - a Steam overlay invite, through the `GameLobbyJoinRequested_t` callback;
+  - the `+connect_lobby <id>` launch argument Steam adds when the game wasn't
+    running;
+  - the menu, which lists friends playing the same app ID whose
+    `FriendGameInfo_t` reports a lobby.
+- **Results without threads.** `CreateLobby` and `JoinLobby` results are
+  polled from the game thread with `ISteamUtils::GetAPICallResult`. Callbacks
+  use hand-built `CCallbackBase` objects. They may fire on whichever thread
+  the game runs callbacks on, so they only queue events under a mutex. Lobby
+  membership is polled once a second.
+- **Traffic.** Datagrams go to the other lobby member as unreliable,
+  no-Nagle messages on channel 0. Received messages from anyone except the
+  current partner are dropped and released. Session requests are accepted
+  only from lobby members. Steam authenticates the sender and encrypts the
+  traffic, and its relays avoid exposing IP addresses or forwarding ports.
+- **Roles.** The lobby owner is the host for world time, weather and enemies.
+  In LAN mode, the player without `PeerHost` is the host.
+
 ### 4.2 State packet (protocol v6)
 
 [`protocol.hpp`](../src/coop/protocol.hpp) defines a fixed 144-byte
@@ -414,6 +459,7 @@ authoritative enemy model, which doesn't exist yet.
 - No projectile or muzzle-flash replication. Friendly-fire damage is an
   approximation.
 - Motorcycle physics, fuel, damage and upgrades are not shared.
-- Two players only, trusted LAN only. The protocol is neither encrypted nor
-  authenticated.
+- Two players only. LAN mode is for trusted networks only: its protocol is
+  neither encrypted nor authenticated. The Steam transport is encrypted and
+  authenticated by Steam, but it has not been tested in the game yet.
 - Only one game build is supported. Native Windows is untested.

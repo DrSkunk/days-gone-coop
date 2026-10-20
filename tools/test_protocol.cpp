@@ -7,6 +7,7 @@
 #include "../src/coop/pose.hpp"
 #include "../src/coop/enemy.hpp"
 #include "../src/coop/gear.hpp"
+#include "../src/coop/steam_abi.hpp"
 
 #include <cassert>
 #include <cstring>
@@ -537,8 +538,27 @@ void TestGear() {
     std::puts("gear ok");
 }
 
+void TestSteamAbi() {
+    using coop::steam::ParseConnectLobby;
+    // Layout checks live in steam_abi.hpp as static_asserts; this exercises the invite parser.
+    assert(ParseConnectLobby("DaysGone.exe +connect_lobby 109775241234567890") == 109775241234567890ull);
+    assert(ParseConnectLobby("\"C:\\Games\\DaysGone.exe\" -dx11 +connect_lobby\t42 -windowed") == 42);
+    assert(ParseConnectLobby("+connect_lobby 7\"") == 7);
+    assert(!ParseConnectLobby("DaysGone.exe"));
+    assert(!ParseConnectLobby("+connect_lobby"));
+    assert(!ParseConnectLobby("+connect_lobby "));
+    assert(!ParseConnectLobby("+connect_lobbyx 12"));
+    assert(!ParseConnectLobby("+connect_lobby 12abc"));
+    assert(!ParseConnectLobby("+connect_lobby -5"));
+    assert(!ParseConnectLobby("+connect_lobby 18446744073709551616"));
+    assert(ParseConnectLobby("+connect_lobby 18446744073709551615") == 18446744073709551615ull);
+    assert(coop::steam::GameAppId(0x010000000013379Cull) == coop::steam::kDaysGoneAppId);
+    std::puts("steam abi ok");
+}
+
 int main() {
     TestPose();
+    TestSteamAbi();
     TestEnemy();
     TestGear();
     using coop::DebugCommand;
