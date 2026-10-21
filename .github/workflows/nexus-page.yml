@@ -1,0 +1,46 @@
+name: Nexus Mods page
+
+on:
+  workflow_dispatch:
+    inputs:
+      summary:
+        description: Short summary shown on mod tiles (max 350 characters)
+        required: true
+        type: string
+        default: Experimental two-player co-op for Days Gone over Steam or LAN, with native CO-OP menus. Not full campaign co-op.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexusmods-1019
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update summary and description
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Edit the mod page
+        env:
+          NEXUS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY }}
+          NEXUS_MOD_ID: ${{ vars.NEXUSMODS_MOD_ID }}
+          SUMMARY: ${{ inputs.summary }}
+        run: |
+          if [[ -z "$NEXUS_API_KEY" || ! "$NEXUS_MOD_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Set the NEXUSMODS_API_KEY secret and NEXUSMODS_MOD_ID variable."
+            exit 1
+          fi
+          jq -n --arg summary "$SUMMARY" --rawfile description docs/nexus-description.bbcode \
+            '{summary: $summary, description: $description}' > body.json
+          status=$(curl -sS -o response.json -w '%{http_code}' -X PATCH \
+            -H "apikey: $NEXUS_API_KEY" -H 'Content-Type: application/json' \
+            --data @body.json "https://api.nexusmods.com/v3/mods/$NEXUS_MOD_ID")
+          if [[ "$status" != 204 ]]; then
+            echo "::error::Nexus returned HTTP $status"
+            cat response.json
+            exit 1
+          fi
+          echo "Updated https://www.nexusmods.com/daysgone/mods/1019" >> "$GITHUB_STEP_SUMMARY"

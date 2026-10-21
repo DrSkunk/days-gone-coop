@@ -408,3 +408,9 @@ To upload an existing GitHub release after a failed Nexus job, run **Nexus
 Mods** from the Actions tab with its release tag and **Upload to Nexus**
 checked (or use `-F publish=true`). Check Nexus first: uploading is not
 idempotent, so do not rerun an upload that already created the version.
+
+The mod page text lives in `docs/nexus-description.bbcode`. After editing it,
+push it with the **Nexus Mods page** workflow (`gh workflow run nexus-page.yml`),
+which sets the summary and description through the experimental v3
+`PATCH /mods/{id}` endpoint. The API cannot change the mod name, images or
+tags; edit those on the website.
