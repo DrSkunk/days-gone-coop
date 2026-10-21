@@ -16,6 +16,7 @@ COMMANDS = (
     "reload-save",
     "story-probe",
     "story-diverge",
+    "hit-enemy",
 )
 
 

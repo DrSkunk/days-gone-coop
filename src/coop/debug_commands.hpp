@@ -8,7 +8,7 @@ namespace coop {
 enum class DebugCommand {
     unknown, inspect, begin, end, status, godOn, godOff, spawnSingle, spawnPack,
     cleanup, probePlayer, probeEnemy, timeShift, weatherNext, dumpReflection, dumpObjects,
-    traceOn, traceOff, rideTest, reloadSave, storyProbe, storyDiverge
+    traceOn, traceOff, rideTest, reloadSave, storyProbe, storyDiverge, hitEnemy
 };
 
 inline DebugCommand ParseDebugCommand(std::string_view text) {
@@ -33,6 +33,7 @@ inline DebugCommand ParseDebugCommand(std::string_view text) {
     if (text == "reload-save") return DebugCommand::reloadSave;
     if (text == "story-probe") return DebugCommand::storyProbe;
     if (text == "story-diverge") return DebugCommand::storyDiverge;
+    if (text == "hit-enemy") return DebugCommand::hitEnemy;
     return DebugCommand::unknown;
 }
 

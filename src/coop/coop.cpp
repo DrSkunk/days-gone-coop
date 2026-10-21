@@ -267,6 +267,12 @@ void ReceiveStory(const char* data, int len);
 void SendGear(UObject* pawn, double now);
 void DestroyGear();
 void ReceiveDamage(const StatePacket& packet);
+void ReceiveEnemyHit(const char* data, int len, double now);
+void ReceiveGuestStrike(const char* data, int len);
+bool IsGuestProxy(UObject* pawn);
+void QueueEnemyHit(bool melee, UObject* weapon);
+bool HasEnemyReplicas();
+bool DebugHitEnemy();
 void UpdateDamageScope(double now);
 bool EndPassenger(bool forced);
 bool SpawnAvatar(UObject* localPawn, const FVector& at, Avatar& avatar);
@@ -1168,7 +1174,7 @@ void SendLocalState(UObject* pawn, double now) {
     }
     if (g_settings.friendlyFire) p.flags |= kFriendlyFire;
     if (g_settings.motorcycles) p.flags |= kSyncBikes;
-    if (g_settings.enemies && !IsHost()) p.flags |= kSyncEnemies;
+    if (g_settings.enemies) p.flags |= kSyncEnemies;
     if (g_settings.passengers) p.flags |= kAcceptPassengers;
     std::snprintf(p.name, sizeof p.name, "%s", session::TruncateUtf8(LocalName(), sizeof p.name - 1).c_str());
     g_damage.Fill(p);
@@ -1292,6 +1298,14 @@ void ReceivePose(const char* data, int len, double now) {
     }
     if (magic == kStoryMagic) {
         ReceiveStory(data, len);
+        return;
+    }
+    if (magic == kEnemyHitMagic) {
+        ReceiveEnemyHit(data, len, now);
+        return;
+    }
+    if (magic == kGuestStrikeMagic) {
+        ReceiveGuestStrike(data, len);
         return;
     }
     PosePacket packet;
@@ -1997,6 +2011,9 @@ void UpdateDebugTools(double now) {
     else if (command == DebugCommand::storyDiverge) {
         if (!DivergeStory()) success = DebugError("story-diverge needs a guest with the save sandbox active");
     }
+    else if (command == DebugCommand::hitEnemy) {
+        if (!DebugHitEnemy()) success = DebugError("hit-enemy needs a guest with a live enemy replica");
+    }
     else if (command == DebugCommand::reloadSave) {
         if (!ReloadNewestSave()) success = DebugError("No mission manager to reload with");
     } else if (command == DebugCommand::rideTest) {
@@ -2346,6 +2363,23 @@ void ReceiveDamage(const StatePacket& packet) {
         packet.attackId, packet.attackKind, packet.damage, damage.get<float>("ReturnValue"), before, after);
 }
 
+// Midpoint of the weapon's native hit damage range.
+bool WeaponDamage(bool melee, UObject* weapon, float& amount) {
+    int32_t minimum = 0, maximum = 0;
+    bool read = melee ?
+        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "MeleeData"}, {"WeaponMeleeData", "MeleeHitDamage"}}, minimum) &&
+        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "MeleeData"}, {"WeaponMeleeData", "MeleeHitDamageMax"}}, maximum) :
+        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "CoreData"}, {"WeaponCoreData", "MinHitDamage"}}, minimum) &&
+        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "CoreData"}, {"WeaponCoreData", "MaxHitDamage"}}, maximum);
+    if (!read || minimum <= 0 || maximum < minimum || maximum > 1000) {
+        g_settingsError = "Weapon damage data unavailable; attack was not sent";
+        Log("combat: invalid native damage range %d..%d for %s", minimum, maximum, FullName(weapon).c_str());
+        return false;
+    }
+    amount = (minimum + maximum) * 0.5f;
+    return true;
+}
+
 void QueueAttack(bool melee, UObject* weapon) {
     if (!g_pawn || g_passenger.pawn || !g_settings.friendlyFire || g_menu.IsOpen() ||
         Now() < g_localSettledAt || Now() - g_lastRecv >= kPeerTimeout ||
@@ -2396,18 +2430,8 @@ void QueueAttack(bool melee, UObject* weapon) {
         if (g_cfg.discovery) Log("combat: world geometry blocked the attack");
         return;
     }
-    int32_t minimum = 0, maximum = 0;
-    bool read = melee ?
-        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "MeleeData"}, {"WeaponMeleeData", "MeleeHitDamage"}}, minimum) &&
-        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "MeleeData"}, {"WeaponMeleeData", "MeleeHitDamageMax"}}, maximum) :
-        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "CoreData"}, {"WeaponCoreData", "MinHitDamage"}}, minimum) &&
-        GetStructField(weapon, "CurWeaponConfig", {{"WeaponData", "CoreData"}, {"WeaponCoreData", "MaxHitDamage"}}, maximum);
-    if (!read || minimum <= 0 || maximum < minimum || maximum > 1000) {
-        g_settingsError = "Weapon damage data unavailable; attack was not sent";
-        Log("combat: invalid native damage range %d..%d for %s", minimum, maximum, FullName(weapon).c_str());
-        return;
-    }
-    float amount = (minimum + maximum) * 0.5f;
+    float amount = 0;
+    if (!WeaponDamage(melee, weapon, amount)) return;
     UpdateDamageScope(Now());
     if (!g_damage.Queue(melee ? 1 : 2, amount, Now())) {
         g_settingsError = "Friendly-fire queue unavailable; attack was not sent";
@@ -2426,6 +2450,7 @@ void ObserveAttack(UObject* object, UObject* function, void* parameters) {
     }
     ++g_localShotSequence;
     QueueAttack(false, weapon);
+    QueueEnemyHit(false, weapon);
 }
 
 void PollMelee() {
@@ -2435,7 +2460,7 @@ void PollMelee() {
         lastPawn = g_pawn;
         previousWindow = previousAttack = false;
     }
-    if (!g_pawn || !g_settings.friendlyFire) { previousWindow = false; return; }
+    if (!g_pawn || (!g_settings.friendlyFire && !HasEnemyReplicas())) { previousWindow = false; return; }
     uint8_t attacking = 0;
     if (!GetProp(g_pawn, "m_bIsInMeleeAttack", attacking) || attacking > 1) {
         g_settingsError = "Melee state unavailable; melee friendly fire is blocked";
@@ -2454,7 +2479,10 @@ void PollMelee() {
     bool window = attacking && collision.invoke() && collision.get<bool>("ReturnValue");
     if (g_cfg.discovery && (previousAttack != (attacking != 0) || previousWindow != window))
         Log("combat: native melee attack=%u collisionWindow=%d weapon=%s", attacking, window, Name(weapon).c_str());
-    if (window && !previousWindow) QueueAttack(true, weapon);
+    if (window && !previousWindow) {
+        if (g_settings.friendlyFire) QueueAttack(true, weapon);
+        QueueEnemyHit(true, weapon);
+    }
     previousWindow = window;
     previousAttack = attacking != 0;
 }
@@ -2776,7 +2804,8 @@ struct EnemyReplica {
     PoseBuffer poses;
     std::vector<std::string> paths;
     double lastInfo = -10, lastSpawnAttempt = -10;
-    bool missingLogged = false;
+    bool missingLogged = false, alive = false;
+    FVector at{}; // feet, in local engine coordinates
 };
 std::vector<EnemySource> g_enemySources;
 std::unordered_map<uint32_t, EnemyReplica> g_enemyReplicas;
@@ -3039,6 +3068,18 @@ void UpdateGear(UObject* localPawn, double now) {
     }
 }
 
+// Enemies the host owns for both players: freakers, animals, and anyone hostile to the local player.
+// Camp NPCs and companions stay local on each machine so they are never doubled.
+bool SharedEnemy(UObject* ai, UObject* player) {
+    static UObject* freaker = FindClass("BendFreakerController");
+    static UObject* animal = FindClass("BendAnimalController");
+    auto controller = Prop(ai, "Controller");
+    if (!IsLive(controller)) return false;
+    if ((freaker && IsA(controller, freaker)) || (animal && IsA(controller, animal))) return true;
+    Call enemy(controller, "IsEnemy");
+    return enemy.set("BendPawn", player).invoke() && enemy.get<bool>("ReturnValue");
+}
+
 // Walks the object array in slices so finding enemies never stalls a frame.
 struct EnemyScan {
     int32_t cursor = 0;
@@ -3075,6 +3116,7 @@ void FinishEnemyScan(UObject* pawn) {
         Call alive(o, "IsAlive");
         bool living = alive.invoke() && alive.get<bool>("ReturnValue");
         if (living && !IsLive(Prop(o, "Controller"))) continue;
+        if (IsGuestProxy(o) || (living && !SharedEnemy(o, pawn))) continue;
         Call where(o, "K2_GetActorLocation");
         if (!where.invoke()) continue;
         auto p = where.get<FVector>("ReturnValue");
@@ -3344,9 +3386,480 @@ void UpdateEnemyReplicas(UObject* pawn, double now) {
             Call move(r.actor, "K2_SetActorLocationAndRotation");
             move.set("NewLocation", at).set("NewRotation", facing).setBool("bSweep", false).setBool("bTeleport", true).invoke();
             if (r.writer.Apply(frame)) ++g_enemyStats.applied;
+            r.at = at;
+            r.alive = (frame.flags & kPoseAlive) && frame.health > 0;
         }
         ++it;
     }
+}
+
+// Shared combat: the guest's hits on replicas become real damage on the host's pawns.
+struct EnemyHitState {
+    uint32_t sequence = 0;
+    struct Resend { EnemyHitPacket packet; double at; };
+    std::vector<Resend> resend;
+    EnemyHitDedupe dedupe;
+    uint64_t sent = 0, applied = 0, ignored = 0;
+} g_enemyHits;
+
+bool HasEnemyReplicas() { return !g_enemyReplicas.empty(); }
+
+void QueueEnemyHit(bool melee, UObject* weapon) {
+    double now = Now();
+    if (IsHost() || !g_pawn || g_passenger.pawn || g_menu.IsOpen() || g_enemyReplicas.empty() ||
+        !IsLive(weapon) || !AcceptEnemies(now) || !Alive(g_pawn)) return;
+    uint32_t best = 0;
+    float bestDistance = 1e30f;
+    FVector start{}, aim{};
+    if (melee) {
+        Call at(Prop(g_pawn, "Mesh"), "K2_GetComponentLocation"), facing(Prop(g_pawn, "Mesh"), "K2_GetComponentRotation");
+        if (!at.invoke() || !facing.invoke()) return;
+        start = at.get<FVector>("ReturnValue");
+        start.z += 90;
+        float yaw = (facing.get<FRotator>("ReturnValue").yaw + 90) * 3.14159265f / 180.f;
+        for (const auto& [entity, r] : g_enemyReplicas) {
+            if (!r.alive || !IsLive(r.actor)) continue;
+            FVector center{r.at.x, r.at.y, r.at.z + 90};
+            float dx = center.x - start.x, dy = center.y - start.y, dz = center.z - start.z;
+            float distance = std::sqrt(dx * dx + dy * dy);
+            if (distance > kEnemyMeleeRange || std::fabs(dz) > 160 ||
+                dx * std::cos(yaw) + dy * std::sin(yaw) < distance * 0.35f || distance >= bestDistance) continue;
+            best = entity;
+            bestDistance = distance;
+            aim = center;
+        }
+    } else {
+        auto camera = Prop(g_controller, "PlayerCameraManager");
+        Call where(camera, "GetCameraLocation"), rotation(camera, "GetCameraRotation");
+        if (!where.invoke() || !rotation.invoke()) return;
+        start = where.get<FVector>("ReturnValue");
+        auto r = rotation.get<FRotator>("ReturnValue");
+        float yaw = r.yaw * 3.14159265f / 180.f, pitch = r.pitch * 3.14159265f / 180.f;
+        float s0[3]{start.x, start.y, start.z};
+        float d[3]{std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), std::sin(pitch)};
+        for (const auto& [entity, replica] : g_enemyReplicas) {
+            if (!replica.alive || !IsLive(replica.actor)) continue;
+            float feet[3]{replica.at.x, replica.at.y, replica.at.z};
+            float t = AimDistanceToBody(s0, d, feet);
+            if (t < 0 || t >= bestDistance) continue;
+            best = entity;
+            bestDistance = t;
+            aim = {start.x + d[0] * t, start.y + d[1] * t, start.z + d[2] * t};
+        }
+    }
+    if (!best) {
+        if (g_cfg.discovery) Log("enemies: %s hit no replica", melee ? "melee" : "shot");
+        return;
+    }
+    if (TraceWorld(start, aim) != 0) {
+        if (g_cfg.discovery) Log("enemies: world geometry blocked the hit on %u", best);
+        return;
+    }
+    float amount = 0;
+    if (!WeaponDamage(melee, weapon, amount)) return;
+    if (!++g_enemyHits.sequence) ++g_enemyHits.sequence;
+    auto packet = EncodeEnemyHit(g_session, best, g_enemyHits.sequence, melee, amount);
+    g_net->SendRaw(&packet, sizeof packet);
+    g_enemyHits.resend.push_back({packet, now + 0.1});
+    ++g_enemyHits.sent;
+    Log("enemies: %s hit replica %u at %.0f cm for %.1f", melee ? "melee" : "shot", best, bestDistance, amount);
+}
+
+// Sends a 25-point gunshot hit on the nearest live replica, bypassing aim; tests the network and host path.
+bool DebugHitEnemy() {
+    if (IsHost() || !g_pawn || !AcceptEnemies(Now())) return false;
+    uint32_t best = 0;
+    float bestDistance = 1e30f;
+    Call me(g_pawn, "K2_GetActorLocation");
+    if (!me.invoke()) return false;
+    auto at = me.get<FVector>("ReturnValue");
+    for (const auto& [entity, r] : g_enemyReplicas) {
+        if (!r.alive || !IsLive(r.actor)) continue;
+        float dx = r.at.x - at.x, dy = r.at.y - at.y, d = dx * dx + dy * dy;
+        if (d < bestDistance) { best = entity; bestDistance = d; }
+    }
+    if (!best) return false;
+    if (!++g_enemyHits.sequence) ++g_enemyHits.sequence;
+    auto packet = EncodeEnemyHit(g_session, best, g_enemyHits.sequence, false, 25.f);
+    g_net->SendRaw(&packet, sizeof packet);
+    g_enemyHits.resend.push_back({packet, Now() + 0.1});
+    Log("debug: hit-enemy sent 25 to replica %u at %.0f cm", best, std::sqrt(bestDistance));
+    return true;
+}
+
+void ResendEnemyHits(double now) {
+    for (auto it = g_enemyHits.resend.begin(); it != g_enemyHits.resend.end();) {
+        if (now < it->at) { ++it; continue; }
+        g_net->SendRaw(&it->packet, sizeof it->packet);
+        it = g_enemyHits.resend.erase(it);
+    }
+}
+
+void ReceiveEnemyHit(const char* data, int len, double now) {
+    EnemyHitPacket hit;
+    if (!DecodeEnemyHit(data, len, hit) || hit.session != g_peer.session || !g_peer.session) {
+        ++g_enemyStats.rejected;
+        return;
+    }
+    if (!IsHost() || !g_pawn || !EnemyReplicationActive(now) || !g_enemyHits.dedupe.Accept(hit.session, hit.sequence)) return;
+    auto source = std::find_if(g_enemySources.begin(), g_enemySources.end(),
+        [&](const EnemySource& e) { return e.entity == hit.entity; });
+    if (source == g_enemySources.end() || !IsLive(source->pawn) || !Alive(source->pawn)) {
+        ++g_enemyHits.ignored;
+        Log("enemies: partner hit on %u ignored; that enemy is gone", hit.entity);
+        return;
+    }
+    Call where(source->pawn, "K2_GetActorLocation");
+    if (!where.invoke()) return;
+    FVector origin = WorldOrigin(g_pawn), at = where.get<FVector>("ReturnValue");
+    float dx = at.x + origin.x - g_peer.pos[0], dy = at.y + origin.y - g_peer.pos[1], dz = at.z + origin.z - g_peer.pos[2];
+    float range = hit.kind == 1 ? kEnemyMeleeRange + 400 : kEnemyShotRange;
+    if (dx * dx + dy * dy + dz * dz > range * range) {
+        ++g_enemyHits.ignored;
+        Log("enemies: partner hit on %u ignored; out of range", hit.entity);
+        return;
+    }
+    float before = 0, after = 0;
+    GetProp(source->pawn, "Health", before);
+    Call damage(C.statics, "ApplyDamage");
+    if (!damage.set("DamagedActor", source->pawn).set("BaseDamage", hit.damage).set("EventInstigator", g_controller)
+            .set("DamageCauser", g_pawn).set("DamageTypeClass", FindClass("DamageType")).invoke()) {
+        Log("enemies: ApplyDamage failed for partner hit on %u", hit.entity);
+        return;
+    }
+    GetProp(source->pawn, "Health", after);
+    ++g_enemyHits.applied;
+    Log("enemies: partner %s hit %s (%u) for %.1f: health %.1f -> %.1f", hit.kind == 1 ? "melee" : "shot",
+        Name(source->pawn).c_str(), hit.entity, hit.damage, before, after);
+}
+
+// The host's AI only fights pawns. A hidden stand-in pawn with the player's faction follows the guest's
+// avatar in the host world. Enemies nearer to it than to the host are made aware of it; their melee swings
+// at it (OnEnemySwing) and any damage it takes are forwarded to the guest, and its health is refilled.
+struct GuestProxy {
+    UObject* pawn = nullptr;
+    UObject* controller = nullptr;
+    float health = 0;
+    uint32_t sequence = 0;
+    double nextSpawn = 0, nextReport = 0, settleAt = 0, nextAggro = 0;
+    struct Resend { GuestStrikePacket packet; double at; };
+    std::vector<Resend> resend;
+    EnemyHitDedupe dedupe; // guest side
+    bool failedLogged = false;
+} g_proxy;
+constexpr float kProxyMaxStrike = 400.f; // larger drops are engine resets, not hits
+
+bool WriteFloatProp(UObject* o, const char* name, float value) {
+    auto property = IsLive(o) ? FindChild(o->cls, name) : nullptr;
+    if (!property) return false;
+    std::memcpy(reinterpret_cast<uint8_t*>(o) + PropertyOffset(property), &value, sizeof value);
+    return true;
+}
+
+bool ProxyWanted(double now) {
+    return IsHost() && g_pawn && EnemyReplicationActive(now) && (g_peer.flags & kSyncEnemies) &&
+        (g_peer.flags & kHasPawn) && (g_peer.flags & kAlive) && IsLive(g_avatar.actor) && !g_avatar.hidden;
+}
+
+void DestroyProxy(const char* why) {
+    if (IsLive(g_proxy.controller)) Call(g_proxy.controller, "K2_DestroyActor").invoke();
+    if (IsLive(g_proxy.pawn)) Call(g_proxy.pawn, "K2_DestroyActor").invoke();
+    if (g_proxy.pawn) Log("enemies: guest stand-in removed (%s)", why);
+    g_proxy.pawn = g_proxy.controller = nullptr;
+}
+
+bool SpawnProxy(const FVector& at, double now) {
+    g_proxy.nextSpawn = now + 5;
+    static UObject* pawnClass = FindClass("SwarmerPawn_C");
+    auto library = FindDefaultObject("AIBlueprintHelperLibrary");
+    Call faction(g_pawn, "GetFactionType");
+    if (!pawnClass || !library || !faction.invoke()) {
+        if (!g_proxy.failedLogged) Log("enemies: guest stand-in unavailable (class, spawn library or faction missing)");
+        g_proxy.failedLogged = true;
+        return false;
+    }
+    Call spawn(library, "SpawnAIFromClass");
+    if (!spawn.set("WorldContextObject", g_pawn).set("PawnClass", pawnClass)
+            .set("BehaviorTree", static_cast<UObject*>(nullptr)).set("Location", at)
+            .set("Rotation", FRotator{}).setBool("bNoCollisionFail", true).invoke()) return false;
+    auto pawn = spawn.get<UObject*>("ReturnValue");
+    if (!IsLive(pawn)) return false;
+    g_proxy.pawn = pawn;
+    g_proxy.controller = Prop(pawn, "Controller");
+    // No look is assigned, so the body renders nothing; stopping the brain keeps it from acting.
+    static const wchar_t reason[] = L"TheysGone stand-in";
+    struct { const wchar_t* data; int32_t num, max; } text{reason, static_cast<int32_t>(std::size(reason)),
+        static_cast<int32_t>(std::size(reason))};
+    bool stopped = Call(Prop(g_proxy.controller, "BrainComponent"), "StopLogic").set("Reason", text).invoke();
+    uint8_t playerFaction = faction.get<uint8_t>("ReturnValue");
+    bool factioned = Call(pawn, "SetFactionType").set("newFaction", playerFaction).invoke();
+    // The engine initialises health over the next frames; the baseline is taken once it settles.
+    g_proxy.health = -1;
+    g_proxy.settleAt = now + 1.5;
+    Call proxyFaction(pawn, "GetFactionType");
+    Log("enemies: guest stand-in %s player faction=%u set=%d now=%d brain stopped=%d", Name(pawn).c_str(), playerFaction,
+        factioned, proxyFaction.invoke() ? proxyFaction.get<uint8_t>("ReturnValue") : 255, stopped);
+    return true;
+}
+
+bool IsGuestProxy(UObject* pawn) { return pawn && pawn == g_proxy.pawn; }
+
+void SendGuestStrike(float damage, double now) {
+    if (!++g_proxy.sequence) ++g_proxy.sequence;
+    auto packet = EncodeGuestStrike(g_session, g_proxy.sequence, std::min(damage, kEnemyHitMaxDamage));
+    g_net->SendRaw(&packet, sizeof packet);
+    g_proxy.resend.push_back({packet, now + 0.1});
+}
+
+void UpdateGuestProxy(double now) {
+    for (auto it = g_proxy.resend.begin(); it != g_proxy.resend.end();) {
+        if (now < it->at) { ++it; continue; }
+        g_net->SendRaw(&it->packet, sizeof it->packet);
+        it = g_proxy.resend.erase(it);
+    }
+    if (!ProxyWanted(now)) {
+        if (g_proxy.pawn) DestroyProxy("partner unavailable");
+        return;
+    }
+    Call where(g_avatar.actor, "K2_GetActorLocation");
+    if (!where.invoke()) return;
+    FVector at = where.get<FVector>("ReturnValue");
+    at.z += 95; // the avatar stands on its feet; the pawn is placed by its capsule centre
+    if (!IsLive(g_proxy.pawn)) {
+        g_proxy.pawn = g_proxy.controller = nullptr;
+        if (now >= g_proxy.nextSpawn) SpawnProxy(at, now);
+        return;
+    }
+    if (!Alive(g_proxy.pawn)) {
+        DestroyProxy("it died");
+        return;
+    }
+    Call move(g_proxy.pawn, "K2_SetActorLocation");
+    move.set("NewLocation", at).setBool("bSweep", false).invoke();
+    float health = 0;
+    if (now >= g_proxy.settleAt && GetProp(g_proxy.pawn, "Health", health) && std::isfinite(health)) {
+        if (g_proxy.health <= 0) {
+            g_proxy.health = health;
+            Log("enemies: guest stand-in health settled at %.1f", health);
+        } else if (health < g_proxy.health - 0.01f) {
+            float damage = g_proxy.health - health;
+            if (damage <= kProxyMaxStrike) {
+                SendGuestStrike(damage, now);
+                Log("enemies: guest stand-in took %.1f; forwarded to the partner", damage);
+            } else Log("enemies: guest stand-in health jumped by %.1f; not forwarded", damage);
+            WriteFloatProp(g_proxy.pawn, "Health", g_proxy.health);
+        }
+    }
+    if (now >= g_proxy.nextAggro) {
+        // Enemies only notice the stand-in on their own when they see it; nearer ones are told about it.
+        g_proxy.nextAggro = now + 0.5;
+        auto Distance = [](FVector a, FVector b) {
+            return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+        };
+        FVector hostAt{};
+        Call self(g_pawn, "K2_GetActorLocation");
+        if (self.invoke()) hostAt = self.get<FVector>("ReturnValue");
+        for (const auto& e : g_enemySources) {
+            if (!IsLive(e.pawn) || !Alive(e.pawn)) continue;
+            Call loc(e.pawn, "K2_GetActorLocation");
+            if (!loc.invoke()) continue;
+            FVector p = loc.get<FVector>("ReturnValue");
+            if (Distance(p, at) >= Distance(p, hostAt) || Distance(p, at) > 4000) continue;
+            auto controller = Prop(e.pawn, "Controller");
+            Call aware(controller, "SetAwarenessOfPawn"), faction(controller, "SetFactionValueOfPawn");
+            aware.set("awarePawn", g_proxy.pawn).set("AwarenessLevel", 1.f).invoke();
+            faction.set("targetPawn", g_proxy.pawn).set("Value", 1.f).invoke();
+        }
+    }
+    if (now >= g_proxy.nextReport) {
+        g_proxy.nextReport = now + 15;
+        int onProxy = 0, onHost = 0, total = 0;
+        for (const auto& e : g_enemySources) {
+            auto controller = Prop(e.pawn, "Controller");
+            Call target(controller, "GetCurrentTargetPawn");
+            if (!target.invoke()) continue;
+            ++total;
+            auto t = target.get<UObject*>("ReturnValue");
+            onProxy += t == g_proxy.pawn;
+            onHost += t == g_pawn;
+        }
+        if (total) Log("enemies: %d streamed enemies target the partner %d, the host %d", total, onProxy, onHost);
+    }
+}
+
+// Freaker swings at the stand-in play in full but their hit test only damages the player, so the swing
+// itself (the MeleeArmed anim notify) is what gets forwarded when it comes from an enemy within reach.
+constexpr float kProxySwingReach = 260.f;
+float SwingDamage(UObject* pawn) {
+    std::string cls = Name(pawn->cls);
+    if (cls.find("Swarmer") != std::string::npos || cls.find("Newt") != std::string::npos) return 12.f;
+    if (cls.find("Breaker") != std::string::npos || cls.find("Reacher") != std::string::npos) return 35.f;
+    if (cls.find("Wolf") != std::string::npos || cls.find("Rager") != std::string::npos) return 20.f;
+    return 15.f;
+}
+
+void OnEnemySwing(UObject* notify, UObject* fn, void* parms) {
+    static int begin = FindNameIndex("Received_NotifyBegin");
+    static UObject* armedClass = nullptr;
+    if (!parms || fn->name.index != begin || !IsLive(notify) || !IsHost()) return;
+    if (notify->cls != armedClass) {
+        if (armedClass || Name(notify->cls) != "AnimNotify_MeleeArmed_C") return;
+        armedClass = notify->cls;
+    }
+    auto mesh = *static_cast<UObject**>(parms);
+    Call owner(mesh, "GetOwner");
+    if (!IsLive(mesh) || !owner.invoke()) return;
+    auto pawn = owner.get<UObject*>("ReturnValue");
+    if (!IsLive(pawn) || pawn == g_proxy.pawn || pawn == g_pawn) return;
+    Call target(Prop(pawn, "Controller"), "GetCurrentTargetPawn");
+    if (!target.invoke()) return;
+    auto victim = target.get<UObject*>("ReturnValue");
+    if (victim != g_proxy.pawn || !IsLive(g_proxy.pawn)) return;
+    Call a(pawn, "K2_GetActorLocation"), b(g_proxy.pawn, "K2_GetActorLocation");
+    if (!a.invoke() || !b.invoke()) return;
+    FVector p = a.get<FVector>("ReturnValue"), q = b.get<FVector>("ReturnValue");
+    float dx = p.x - q.x, dy = p.y - q.y, dz = p.z - q.z;
+    float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance > kProxySwingReach) return;
+    float damage = SwingDamage(pawn);
+    SendGuestStrike(damage, Now());
+    Log("enemies: %s swung at the partner from %.0f cm; forwarded %.0f", Name(pawn).c_str(), distance, damage);
+}
+
+void ReceiveGuestStrike(const char* data, int len) {
+    GuestStrikePacket strike;
+    if (!DecodeGuestStrike(data, len, strike) || strike.session != g_peer.session || !g_peer.session) {
+        ++g_enemyStats.rejected;
+        return;
+    }
+    if (IsHost() || !g_pawn || !Alive(g_pawn) || !g_proxy.dedupe.Accept(strike.session, strike.sequence)) return;
+    float before = 0, after = 0;
+    GetProp(g_pawn, "Health", before);
+    Call damage(C.statics, "ApplyDamage");
+    if (!damage.set("DamagedActor", g_pawn).set("BaseDamage", strike.damage)
+            .set("EventInstigator", static_cast<UObject*>(nullptr)).set("DamageCauser", static_cast<UObject*>(nullptr))
+            .set("DamageTypeClass", FindClass("DamageType")).invoke()) {
+        Log("enemies: ApplyDamage failed for a host enemy strike");
+        return;
+    }
+    GetProp(g_pawn, "Health", after);
+    Log("enemies: host enemy hit you for %.1f: health %.1f -> %.1f", strike.damage, before, after);
+}
+
+// While the host streams enemies, the guest's own hostile AI is removed and its spawners are paused, so
+// the only enemies the guest sees are the host's. Spawners resume when the session ends.
+struct LocalAISuppression {
+    int32_t cursor = 0;
+    bool active = false, masksLogged = false;
+    // class -> 0 other, 1 AI pawn, 2 spawn area, 3 crowd generator, 4 ambient generator
+    std::unordered_map<UObject*, uint8_t> kinds;
+    std::vector<UObject*> areas, generators, ambient;
+    std::unordered_map<UObject*, double> despawned; // controller -> last attempt
+    uint64_t removed = 0;
+    double time = 0;
+} g_suppress;
+
+bool SuppressionWanted(double now) {
+    return g_cfg.hostSave && !IsHost() && g_pawn && AcceptEnemies(now) && (g_peer.flags & kSyncEnemies);
+}
+
+void ReleaseLocalAI() {
+    if (!g_suppress.active) return;
+    for (auto a : g_suppress.areas)
+        if (IsLive(a)) Call(a, "SetAreaActive").setBool("activeArea", true).invoke();
+    for (auto g : g_suppress.generators)
+        if (IsLive(g)) Call(g, "SetPaused").setBool("bPaused", false).invoke();
+    for (auto g : g_suppress.ambient)
+        if (IsLive(g)) Call(g, "ResetGlobalSpawnLimit").invoke();
+    Log("enemies: local AI resumed (%d spawn areas, %d crowd generators, %d ambient generators)",
+        static_cast<int>(g_suppress.areas.size()), static_cast<int>(g_suppress.generators.size()),
+        static_cast<int>(g_suppress.ambient.size()));
+    g_suppress = LocalAISuppression{};
+}
+
+template <typename T> bool Remember(std::vector<T>& list, T item) {
+    if (std::find(list.begin(), list.end(), item) != list.end()) return false;
+    list.push_back(item);
+    return true;
+}
+
+// Returns a live AI pawn to its spawner the way the game does when the player rides away.
+void DespawnLocalAI(UObject* pawn, double now) {
+    auto controller = Prop(pawn, "Controller");
+    if (!IsLive(controller) || !Alive(pawn)) return;
+    bool pooled = false, inUse = true;
+    uint8_t pooledMask = 0, inUseMask = 0;
+    bool read = GetBoolProp(controller, "bPooledSpawn", pooled, &pooledMask) &&
+        GetBoolProp(controller, "bPooledSpawnInUse", inUse, &inUseMask);
+    if (!g_suppress.masksLogged) {
+        g_suppress.masksLogged = true;
+        Log("enemies: pool flags read=%d masks 0x%02x/0x%02x", read, pooledMask, inUseMask);
+    }
+    if (read && pooled && !inUse) return; // parked in the pool, not in the world
+    if (!SharedEnemy(pawn, g_pawn)) return;
+    auto [last, first] = g_suppress.despawned.try_emplace(controller, -100.0);
+    if (now - last->second < 5) return;
+    last->second = now;
+    bool ok = false;
+    for (auto generator : g_suppress.ambient) {
+        if (!IsLive(generator)) continue;
+        ok = Call(generator, "DespawnUnit").set("Controller", controller).setBool("notifyDespawn", true)
+            .setBool("runFullDespawn", true).invoke();
+        if (ok) break;
+    }
+    if (!ok) ok = Call(controller, "Despawn").setBool("notifyDespawn", true).invoke();
+    ++g_suppress.removed;
+    if (first) Log("enemies: despawned local %s%s%s", Name(pawn).c_str(), pooled ? " (pooled)" : "", ok ? "" : " FAILED");
+}
+
+void SuppressLocalAI(double now) {
+    if (!SuppressionWanted(now)) {
+        ReleaseLocalAI();
+        return;
+    }
+    static UObject* aiClass = FindClass("BendAIPawn");
+    static UObject* areaClass = FindClass("BendAmbientSpawnArea");
+    static UObject* crowdClass = FindClass("BendCrowdGenerator");
+    static UObject* ambientClass = FindClass("BendAmbientGenerator");
+    if (!g_suppress.active) {
+        g_suppress.active = true;
+        Log("enemies: the host owns enemies; despawning local hostile AI");
+    }
+    double start = Now();
+    int32_t count = ObjectCount();
+    int32_t end = std::min(count, g_suppress.cursor + std::max<int32_t>(2048, count / 60));
+    for (int32_t i = g_suppress.cursor; i < end; ++i) {
+        auto o = ObjectAt(i);
+        if (!o || !o->cls || !o->outer || IsDefaultOrArchetype(o)) continue;
+        auto [kind, added] = g_suppress.kinds.try_emplace(o->cls, 0);
+        if (added) {
+            kind->second = ClassIsA(o->cls, aiClass) ? 1 : ClassIsA(o->cls, areaClass) ? 2 :
+                ClassIsA(o->cls, crowdClass) ? 3 : ClassIsA(o->cls, ambientClass) ? 4 : 0;
+        }
+        if (!kind->second || !IsLive(o)) continue;
+        switch (kind->second) {
+        case 1: DespawnLocalAI(o, now); break;
+        case 2:
+            if (Remember(g_suppress.areas, o)) Call(o, "SetAreaActive").setBool("activeArea", false).invoke();
+            break;
+        case 3:
+            if (Remember(g_suppress.generators, o)) {
+                Call(o, "SetPaused").setBool("bPaused", true).invoke();
+                Call(o, "DestroyGeneratedCrowdMembers").invoke();
+            }
+            break;
+        case 4:
+            if (Remember(g_suppress.ambient, o)) {
+                bool limited = Call(o, "OverrideGlobalSpawnLimitNEW").set("newLimit", 0).invoke();
+                bool cleared = Call(o, "ForceDespawnAll").setBool("resetSpawnedCount", false)
+                    .setBool("resetToKilled", false).setBool("Delay", false).invoke();
+                Log("enemies: ambient generator %s spawn limit 0=%d despawn all=%d", Name(o).c_str(), limited, cleared);
+            }
+            break;
+        }
+    }
+    g_suppress.cursor = end >= count ? 0 : end;
+    g_suppress.time += Now() - start;
 }
 
 bool OwnWindowFocused() {
@@ -4030,6 +4543,9 @@ void Tick(bool hudFrame) {
     UpdateGear(g_pawn, now);
     SendEnemies(g_pawn, now);
     UpdateEnemyReplicas(g_pawn, now);
+    ResendEnemyHits(now);
+    SuppressLocalAI(now);
+    UpdateGuestProxy(now);
     MenuOnline online;
     if (g_steam.Available()) {
         online.enabled = true;
@@ -4173,6 +4689,11 @@ void HookedProcessEvent(UObject* obj, UObject* fn, void* parms) {
     if (g_ready && g_cfg.missionDiscovery && GetCurrentThreadId() == g_gameThread)
         TraceMissionEvent(obj, fn);
     if (g_ready && GetCurrentThreadId() == g_gameThread) ride::OnEvent(obj, fn);
+    if (g_ready && GetCurrentThreadId() == g_gameThread && !g_inTick && g_proxy.pawn && fn) {
+        g_inTick = true;
+        OnEnemySwing(obj, fn, parms);
+        g_inTick = false;
+    }
     if (g_ready && research::Tracing() && GetCurrentThreadId() == g_gameThread && !g_inTick)
         research::TraceEvent(obj, fn, parms);
     bool ownUi = g_ready && !g_inTick && GetCurrentThreadId() == g_gameThread && IsLive(obj) && IsLive(fn);

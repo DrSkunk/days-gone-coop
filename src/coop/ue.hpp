@@ -87,6 +87,8 @@ UObject* FindDefaultObject(const char* className);
 UObject* FindChild(const UObject* structObj, const char* name);
 UObject* FindFunction(const UObject* cls, const char* name);
 int PropertyOffset(const UObject* prop);
+// Reads a BoolProperty, including native bitfields, through its UBoolProperty byte mask.
+bool GetBoolProp(UObject* obj, const char* name, bool& out, uint8_t* maskOut = nullptr);
 struct StructField { const char* structure; const char* member; };
 bool ReadStructFields(const void* data, size_t size, std::initializer_list<StructField> fields, void* out, size_t outSize);
 template <typename T> bool ReadEventParam(UObject* function, void* parameters, const char* name, T& out) {

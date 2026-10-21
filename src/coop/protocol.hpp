@@ -19,7 +19,7 @@ enum StateFlags : uint16_t {
     kAlive = 1 << 6,
     kSyncBikes = 1 << 7,
     kWorldState = 1 << 8,
-    kSyncEnemies = 1 << 9, // the sender wants the host's enemies replicated
+    kSyncEnemies = 1 << 9, // guest: wants the host's enemies; host: streams them
 };
 
 enum ActionFlags : uint8_t {

@@ -90,8 +90,8 @@ Units are centimeters. `--speed 0` gives a stationary partner and `--follow`
 trails the player. Run `--help` for all options.
 
 `--serve-save DIR` makes the simulator a host that shares the `*.sav` files in
-`DIR` with a `GuestSaveGuard=1` game (`PeerHost=127.0.0.1`, `PeerPort=27778`).
-`--fetch-save DIR` makes it a guest that downloads a `ShareSave=1` host game's
+`DIR` with a joining game (`HostSave=1`, `PeerHost=127.0.0.1`, `PeerPort=27778`).
+`--fetch-save DIR` makes it a guest that downloads a `HostSave=1` host game's
 saves into `DIR` and prints their SHA-256.
 
 ## Debug tools
@@ -122,6 +122,17 @@ poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/
 | `weather-next` | Host: switch to the next weather state |
 | `cleanup` | Destroy only the enemies this session spawned |
 | `end` | Clean up and restore damage and saving state |
+| `hit-enemy` | Guest: send 25 damage to the nearest live host enemy, as a real hit would |
+| `story-probe` | Log the job manager's jobs and missions and this PC's story signature |
+| `story-diverge` | Guest with the sandbox active: pretend the story differs, to force a resync |
+| `reload-save` | Reload the newest save in place (`ReloadBecauseOfJobFailure`) |
+| `ride-test` | Toggle a **Ride with** prompt 3 m ahead, to test the native interact prompt alone |
+| `dump-reflection` | Write every loaded class, property and function to `TheysGone-reflection.txt` |
+| `dump-objects` | Write a census of live objects to `TheysGone-objects.txt` |
+| `trace-on` / `trace-off` | Record every distinct ProcessEvent call with sample parameters to `TheysGone-trace.txt` |
+
+`hit-enemy`, `story-*`, `reload-save`, `ride-test`, `dump-*` and `trace-*`
+work without `begin`. The research commands only read and log.
 
 Commands go through a file mailbox. The helper atomically writes
 `TheysGone-debug.ini` (`[Debug] Command=…, Request=<new number>`) next to
@@ -256,13 +267,16 @@ With the flag held from controller creation onward, the game still wrote
 `checkpoint.sav` and `profile.sav` at the main menu. Debug and passenger
 sessions still set the flag, but only to reduce mid-session autosaves.
 
-### Guest save sandbox (`GuestSaveGuard`, experimental)
+### Guest save sandbox (`HostSave`)
 
-`GuestSaveGuard=1` patches the game executable's KERNEL32 imports for file
-creation, deletion, renaming (`MoveFileW` and rename-by-handle), attributes and
-directories (`src/coop/save_guard.cpp`). It redirects every write below a
-`Saved\...\SaveGames` folder into `TheysGone-guest-saves` next to the
-plugin. That folder is wiped each time the game starts.
+With `HostSave=1` (the default) the plugin patches the game executable's
+KERNEL32 imports for file creation, deletion, renaming (`MoveFileW` and
+rename-by-handle), attributes and directories (`src/coop/save_guard.cpp`) at
+startup, in **passthrough** mode: nothing is redirected while you play alone or
+host. The moment this player joins someone else's session, the guard switches
+on and redirects every write below a `Saved\...\SaveGames` folder into
+`TheysGone-guest-saves` next to the plugin. That folder is wiped at each
+join.
 
 - Writes are copy-on-write: modifying an existing save first copies the
   original into the sandbox.
@@ -283,17 +297,17 @@ Known limits:
 - Until a host save is adopted, wildcard directory listings (the **Load Game**
   list) still show only the real folder.
 - Only the executable's own imports are hooked.
-- With the guard on, **nothing you do in that session is kept**, so never enable
-  it for normal play.
+- While joined, **nothing you do in that session is kept**. Set `HostSave=0`
+  to play your own save instead.
 
 Back up `SaveGames` before experimenting anyway.
 
-### Host-to-guest save transfer (`ShareSave` + `GuestSaveGuard`, experimental)
+### Host-to-guest save transfer (`HostSave`)
 
 The guest starts from a copy of the host's save:
 
-1. A connected `GuestSaveGuard=1` guest sends a `DGSV` request every second.
-2. A `ShareSave=1` host picks the `%LOCALAPPDATA%\BendGame\Saved\<account>\SaveGames`
+1. A connected guest sends a `DGSV` request every second.
+2. The host picks the `%LOCALAPPDATA%\BendGame\Saved\<account>\SaveGames`
    folder with the newest `profile.sav`. It reads every `*.sav` file (retrying
    if a file changes while being read) into one bundle: a file table with
    names, sizes and per-file SHA-256, then the contents. A snapshot is reused
@@ -311,8 +325,11 @@ The guest starts from a copy of the host's save:
    `TheysGone-guest-saves-discard` and deletes are ignored, so the menu's
    own `profile.sav`/`checkpoint.sav` writes can't replace the host's files
    before Continue.
-6. After the load the pins are released, the guest's autosaves go to the
-   sandbox, and the guest is teleported to the host once both are in game.
+6. A guest already in gameplay reloads in place with
+   `BendGameMission.ReloadBecauseOfJobFailure`; at the title menu, Continue
+   loads it. After the load the pins are released, the guest's autosaves go
+   to the sandbox, and the guest is teleported to the host once both are in
+   game.
 
 All datagrams carry the sender's session id and are ignored unless it matches
 the connected partner. File names are limited to `[A-Za-z0-9_.-]` ending in
@@ -329,9 +346,147 @@ Verified live on one PC (build 19221447, Proton) with `fake_peer.py`:
 - Host: the plugin found the right account folder and served a 7.4 MB bundle
   in about 10 s. Every fetched file matched the snapshot byte for byte.
 
-Not yet tested between two real players or over the Steam transport. The host
-shares its last save on disk, so it should quicksave right before the guest
-loads. Missions still run independently in each game after loading.
+Since then verified between two real PCs over the LAN transport (Proton,
+desktop Linux and Steam Deck), including the in-place reload. Not yet tested
+over the Steam transport. The host shares its last save on disk.
+
+### Story sync (`DMST`)
+
+Each side samples a signature of `BendJobManager`'s jobs and missions (which
+are complete, which are known) every 3 s ([`story.hpp`](../src/coop/story.hpp)).
+The host sends its live signature, the signature at its last save and a save
+serial every second. When a guest's signature differs from the host's saved
+one for 6 s, and the host has saved this session, the guest requests the
+host's save again and reloads onto it. Verified live with `story-diverge`.
+
+## Shared enemies
+
+With *Sync host's enemies* on, both PCs set `kSyncEnemies`:
+
+- **Host.** Streams pose and appearance (`DPOS`, `DMEN`) for at most 16 hostile
+  AI pawns within 80 m of either player. Hostile means a freaker or animal
+  controller, or `BendAIController.IsEnemy(player)`; camp NPCs and companions
+  stay local on each PC.
+- **Guest suppression.** A joined guest with `HostSave=1` stops its own AI:
+  `BendAmbientGenerator.OverrideGlobalSpawnLimitNEW(0)` and `ForceDespawnAll`,
+  `BendAmbientSpawnArea.SetAreaActive(false)`, `BendCrowdGenerator.SetPaused`,
+  and every other hostile pawn is returned to its pool with the generator's
+  `DespawnUnit` (or `BendAIController.Despawn`). `K2_DestroyActor` does not work
+  on pooled pawns: they come back. Pooled, unused pawns
+  (`bPooledSpawn && !bPooledSpawnInUse`, native bitfield bools at
+  `UBoolProperty`+0x78) are skipped. Everything is restored on leave.
+- **Guest to host (`DMEH`).** A guest shot is tested along the camera ray
+  against each replica's body; a melee hit must be within 4 m and in front.
+  Both need a clear world trace. The weapon's damage goes to the host, which
+  applies it with `ApplyDamage` to the real enemy, instigated by the host's
+  controller. Hits are sent twice and deduplicated.
+- **Host enemies to guest (`DMPX`).** Host AI only fights pawns, so the host
+  spawns an invisible, brain-stopped `SwarmerPawn_C` with the player's faction
+  that follows the guest's avatar. Every 0.5 s, enemies nearer to it than to
+  the host get `SetAwarenessOfPawn` and `SetFactionValueOfPawn` for it, so
+  they pick it as a target. Freaker hit tests only damage the player, so the
+  host watches `AnimNotify_MeleeArmed_C.Received_NotifyBegin` through the
+  ProcessEvent hook: a swing from an enemy targeting the stand-in within
+  2.6 m sends a strike (swarmer 12, others 15-35, an estimate). Real damage
+  the stand-in takes is forwarded too, capped at 400 per change. The guest
+  applies strikes with `ApplyDamage`.
+
+Verified live between two PCs: the guest's own enemies vanished and the host's
+appeared; `hit-enemy` brought a host swarmer from 160 to below 0; a pack split
+its aggro between the host and the stand-in and its swings killed the guest.
+Real aimed shots and melee from the guest, and ranged enemies, are not yet
+verified.
+
+### Reverse-engineering findings and failed approaches
+
+These findings came from live inspection on build 19221447 under Proton,
+using the reflection dump, object census and ProcessEvent trace described
+above. They are observations for this build, not a recovered Unreal
+multiplayer implementation.
+
+1. **Separate hostile AI from camp NPCs.** Inspecting pawn controllers exposed
+   `BendFreakerController`, `BendAnimalController` and `IsEnemy`. The shared
+   enemy scan uses those checks rather than copying every `BendAIPawn`.
+2. **Return pooled AI instead of destroying it.** `K2_DestroyActor` did not
+   keep the guest's enemies gone. Controller inspection exposed
+   `bPooledSpawn` and `bPooledSpawnInUse`; their native bitfield masks are
+   read from `UBoolProperty` metadata at property offset `0x78`. Returning
+   active pawns with `DespawnUnit` and pausing generators stopped the local
+   duplicates.
+3. **Give host AI a real target.** The rendered partner is a non-colliding
+   skeletal actor, not a pawn. A spawned `SwarmerPawn_C`, with its brain
+   stopped and faction set to the player's, supplies a target. Merely setting
+   the faction was insufficient: `IsEnemy` reported hostility, but enemies
+   still chose the host. Calling `SetAwarenessOfPawn(1)` and
+   `SetFactionValueOfPawn(1)` every 0.5 s for streamed enemies within 40 m
+   and closer to the stand-in than the host made the pack split targets.
+4. **Wait for health initialization.** Giving the stand-in 5,000 health
+   produced phantom damage when the engine subsequently initialized it.
+   The implementation now waits 1.5 s, captures its settled health (160 or
+   200 observed), forwards subsequent drops of at most 400 and refills to
+   that baseline. Larger drops are logged and not forwarded.
+5. **Observe swings when native collision does not deliver damage.**
+   Freakers surrounded the stand-in and swung from as close as 68 cm, but
+   its health remained unchanged with damage enabled. Tracing revealed
+   `AnimNotify_MeleeArmed_C.Received_NotifyBegin`,
+   `AnimState_AIMeleeAttack_C` and
+   `AttackMgr_Swarmer_C.OnAttackerReachedSlot`. The implementation hooks the
+   first event, resolves its mesh parameter's owning pawn, checks that the
+   controller targets the stand-in and checks the 2.6 m range. It forwards
+   estimated damage at notify time; this is not proof of a native hit.
+
+Current base damage estimates are 12 for swarmers/newts, 35 for
+breakers/reachers, 20 for wolves/ragers and 15 otherwise. These are not
+measurements of the game's attack damage. Only the swarmer path has been
+verified live; other classes still need their notify and damage behavior
+checked.
+
+### Combat delivery and authority
+
+[`enemy.hpp`](../src/coop/enemy.hpp) defines a 24-byte `DMEH` hit packet
+(session, entity, sequence, attack kind and damage) and a 20-byte `DMPX`
+strike packet (session, sequence and damage). Both have their own version,
+reserved fields and positive damage limit of 1,000. Receivers validate the
+packet and current partner session; a 64-entry sequence window suppresses
+duplicates. Each hit is sent immediately and once again after 0.1 s.
+There is no acknowledgement or retry beyond that second send, so losing
+both copies loses the hit.
+
+The guest selects hits against approximate bodies, not native enemy hitboxes:
+a 50 cm-radius standing body for shots, or range and facing checks for melee,
+with a world obstruction trace. Weapon damage is the midpoint of the native
+weapon damage range. The host checks the entity is still alive and in range
+(150 m for shots; 8 m for melee, including latency allowance), then calls
+`ApplyDamage`. The host does not independently reconstruct the guest's aim
+or weapon damage; this remains a trusted-partner protocol. The game can
+modify base damage: a 25-point debug hit reduced one swarmer by 18.75.
+
+### Current validation and remaining work
+
+| Surface | Evidence / status |
+|---|---|
+| Host save and sandbox | LAN transfer and in-place reload verified between two real PCs; real guest save hashes remained unchanged in the sandbox tests |
+| Story catch-up | Forced divergence with `story-diverge` triggered a host-save resync; natural mission progression and full campaign play remain unverified |
+| Guest AI suppression | Local enemies disappeared and host replicas appeared in the two-PC LAN test |
+| Guest damage to host enemies | `hit-enemy` damaged and killed a real host swarmer; this bypasses aim and does not validate real shooting or melee input |
+| Host melee damage to guest | Swarmer pack targeted the stand-in, damaged and killed the guest; guest and stand-in respawned, and a later clean-build strike reduced health from 121.9 to 109.9 |
+| Native bike interaction | Standalone `ride-test` prompt exercised; boarding a real partner's bike through it still needs a player test |
+| Steam transport | Earlier lobby/transport tests do not validate these new gameplay paths; current gameplay evidence is from UDP LAN |
+
+Complete host-first synchronization is **not finished**. Live mission state,
+inventory, loot, ranged enemy damage and shared bike simulation remain outside
+the implemented paths. Swing forwarding has no native contact, obstruction,
+dodge or attack-outcome confirmation; proxy-health forwarding has no damage
+source attribution. Check for double delivery if an attack both triggers the
+notify and damages the proxy. The stand-in's capsule blocking the host and
+host shots accidentally hurting the guest through it remain untested.
+Disconnect cleanup resumes generators, but does not snapshot and restore
+their individual pre-session pause/active states.
+
+During Deck testing, the native CO-OP history displayed disconnect/leave
+messages without corresponding transport log entries while the UDP session
+remained connected. The cause is unresolved; do not treat those menu messages
+alone as proof of a transport disconnect.
 
 ## Offline executable analysis
 

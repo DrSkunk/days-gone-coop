@@ -303,6 +303,22 @@ int PropertyOffset(const UObject* prop) {
     return *reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(prop) + g.propertyOffsetField);
 }
 
+bool GetBoolProp(UObject* obj, const char* name, bool& out, uint8_t* maskOut) {
+    if (!IsLive(obj)) return false;
+    auto property = FindChild(obj->cls, name);
+    if (!property) return false;
+    // UBoolProperty: FieldSize, ByteOffset, ByteMask, FieldMask directly after the 0x78-byte UProperty
+    // (Offset_Internal sits at 0x50 in this build; measured live on bPooledSpawnInUse).
+    auto fields = reinterpret_cast<const uint8_t*>(property) + 0x78;
+    if (!ReadableMemory(fields, 4)) return false;
+    uint8_t fieldSize = fields[0], byteOffset = fields[1], byteMask = fields[2];
+    if (!fieldSize || fieldSize > 8 || byteOffset >= fieldSize || !byteMask || (byteMask & (byteMask - 1))) return false;
+    auto value = *(reinterpret_cast<const uint8_t*>(obj) + PropertyOffset(property) + byteOffset);
+    out = (value & byteMask) != 0;
+    if (maskOut) *maskOut = byteMask;
+    return true;
+}
+
 bool DetectPropertyOffsetField(std::string& diag) {
     auto statics = FindClass("GameplayStatics");
     auto fn = statics ? FindFunction(statics, "GetPlayerPawn") : nullptr;

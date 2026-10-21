@@ -6,14 +6,15 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Theys Gone** is an experimental two-player co-op mod for **Days Gone
-(PC)**. It runs as an ASI plugin inside the game and shows your partner,
-their motorcycle and the host's nearby enemies in your world. Host and join
-sessions through Steam or your local network.
+(PC)**. It runs as an ASI plugin inside the game. The host's save is the one
+that counts: the joining player loads it, fights the host's enemies and helps
+the host progress. Host and join sessions through Steam or your local network.
 
 > [!IMPORTANT]
-> This is **not** full campaign co-op. Each player still runs their own
-> single-player game, and missions, inventory, loot and saves are not shared.
-> The UDP/LAN transport is unauthenticated and should only be used on a
+> This is **not** full campaign co-op. Each player still runs their own copy of
+> the game. The joining player starts from the host's save and is resynced when
+> the host's story moves on, but missions, inventory and loot are not mirrored
+> live. The UDP/LAN transport is unauthenticated and should only be used on a
 > trusted local network. Back up your saves before you try it.
 
 > [!NOTE]
@@ -30,8 +31,11 @@ sessions through Steam or your local network.
 | Animation mirroring | The partner's real skeleton pose is streamed, so walking, strafing, aiming, crouching and riding match their screen |
 | Held items | The weapon or tool in your partner's hands is shown in the same hand |
 | Motorcycles | The partner's bike is shown with its parts, steering and suspension |
-| Passenger riding | Ride on the back of your partner's bike (experimental) |
-| Host enemies | The joining player sees the host's nearby enemies, up to 16 within 80 m, as visual copies |
+| Passenger riding | Walk up to your partner's bike and hold the native **Ride with** prompt (experimental) |
+| Host-first progress | The joining player plays on a copy of the host's save; their own saves are never touched |
+| Story sync | When the host saves with new story progress, the joining player is reloaded onto it |
+| Shared enemies | The host's hostile AI, up to 16 within 80 m, appears for the joining player instead of their own |
+| Shared combat | The joining player's shots and melee damage the host's enemies; those enemies attack and damage the joining player |
 | Time and weather | The joining player's time of day and weather follow the host |
 | Appearance | Seven color presets for jacket, trousers and cap, and an option to hide the cap |
 | Friendly fire | Optional. Both players must opt in each session |
@@ -40,9 +44,11 @@ sessions through Steam or your local network.
 
 ### What is not synchronized
 
-- Missions, story progress, inventory, loot, doors, saves.
-- Enemy AI and combat. Host enemies are visual copies for the joining player:
-  they can't be fought there, and that player's own enemies still exist.
+- Live mission state, inventory, loot and doors. The joining player's story
+  is only resynced when the host saves.
+- Camp NPCs and companions: each player keeps their own.
+- Ranged enemy attacks on the joining player. Only melee swings at the
+  joining player are forwarded, and their damage per enemy type is an estimate.
 - Projectiles, muzzle flashes and hit effects.
 - Motorcycle physics, fuel, damage and upgrades.
 - Outfit models. Your partner is drawn with *your* Deacon outfit, tinted with
@@ -131,28 +137,30 @@ PlayerName=Partner
   for example with `sudo ufw allow from 192.168.1.0/24 to any port 27777 proto udp`.
   **Never** forward this port to the Internet: the protocol has no encryption
   or authentication.
-- Each player loads their own save. Meet up in the same area, or use teleport.
-  To start from the host's progress instead, see below.
+- The host loads their save. The joining player is given the host's save
+  automatically; see below.
 - Settings are read when the game starts. Restart after editing the INI;
   switching sessions from CO-OP does not require a restart.
 
-#### Playing on the host's save (experimental)
+#### Playing on the host's save
 
-The guest can load a copy of the host's save instead of their own:
+With `HostSave=1` (the default), the host's save is the one that counts:
 
-1. Host: set `ShareSave=1`, load your game and quicksave.
-2. Guest: set `GuestSaveGuard=1` and start the game. Once connected, the co-op
-   menu (F8) shows the download progress (a few seconds for about 7 MB on a LAN).
-3. Guest: when it says **Host save ready**, press **Continue** on the main menu
-   (if you are already in the game, quit to the main menu first). You load the
-   host's last save and are moved next to the host.
+1. The host loads their game. Their newest save is sent to whoever joins.
+2. The joining player connects from the title or pause menu. From that moment
+   every save write on their PC goes to a throw-away sandbox
+   (`TheysGone-guest-saves`, wiped at each join), so their own saves are never
+   touched.
+3. The host's save is downloaded (a few seconds for about 7 MB on a LAN) and
+   loaded. If the joining player is already in the game, it reloads in place.
+   They spawn next to the host.
+4. Each time the host saves, the host's story state (jobs and missions) is
+   compared. If the joining player's story differs, they download the new save
+   and are reloaded onto it.
 
-The guard redirects save writes from startup. Before the host bundle is
-adopted, reads can still fall back to the guest's own saves; afterwards the real
-save folder is hidden. **Nothing the guest does in that session is kept**. Missions still run
-separately in each game after loading; only the starting point is shared.
-Verified on one PC against the simulated partner; not yet tested between two
-real players.
+**Nothing the joining player does in that session is kept.** They are there to
+help the host progress. Set `HostSave=0` on both PCs to have everybody play
+their own save instead.
 
 ### Steam sessions (experimental)
 
@@ -186,8 +194,7 @@ Visibility=friends
 
 Only traffic from the other lobby member is accepted. `Port` and `PeerHost`
 do not control Steam connections. Epic Online Services is not implemented.
-The host remains the intended campaign authority, but shared mission
-progression is **not implemented yet**; a lobby does not change that.
+The lobby owner is the host: their save, story and enemies are authoritative.
 
 ## Controls
 
@@ -216,7 +223,7 @@ template under *Controller Settings → Current Layout → Templates*.
 | Sync motorcycles | Show your partner's bike and send yours |
 | Allow a passenger | Let your partner ride on your bike |
 | Friendly fire | Real, lethal damage. Both players must turn it on, and it needs a second confirmation |
-| Sync host's enemies | Host: send nearby enemies. Joining player: show them |
+| Sync host's enemies | Host: send nearby enemies and take the joining player's hits. Joining player: replace your own enemies with the host's |
 | Join / leave partner's bike | Same as F9 |
 | Teleport to partner | Same as F7 |
 | Steam lobby | Steam mode only: host a lobby, or leave the current one |
@@ -230,10 +237,12 @@ fire starts off in every session and is never saved.
 
 Both players need *Sync motorcycles* on, and the driver needs *Allow a
 passenger*. The driver gets on their bike and stops. The passenger walks up
-and presses F9. The passenger is attached to the bike as a visual rider, and
-it isn't the game's own two-seat vehicle code. The passenger can't attack, and
-saving is blocked while riding. Press F9 again to get off. An exit is refused
-when there is no safe ground to stand on.
+to it and holds the game's own interact button on the **Ride with
+&lt;partner&gt;** prompt (F9 also works). The passenger is attached to the bike
+as a visual rider, and it isn't the game's own two-seat vehicle code. The
+passenger can't attack, and saving is blocked while riding. Hold **Get off**
+(or press F9) to dismount. An exit is refused when there is no safe ground to
+stand on.
 
 ## Configuration reference
 
@@ -254,8 +263,7 @@ All keys are in the `[Coop]` section of `TheysGone.ini`.
 | `Discovery` | `0` | Developers: log engine details; F6 dumps the local pawn |
 | `MissionDiscovery` | `0` | Developers: trace mission/save function names and parameter layouts only; see [DEVELOPMENT.md](docs/DEVELOPMENT.md) |
 | `MenuDiscovery` | `0` | Developers: F6 dumps native menu classes/widget references and enables UI event tracing |
-| `GuestSaveGuard` | `0` | Experimental, guest only: redirect all save writes to a throw-away sandbox and download the host's save into it; nothing from that session is kept (see [Playing on the host's save](#playing-on-the-hosts-save-experimental)) |
-| `ShareSave` | `0` | Experimental, host only: send a copy of your newest saves to a `GuestSaveGuard=1` partner |
+| `HostSave` | `1` | Host-first progress: the host shares their save; the joining player's save writes go to a throw-away sandbox and the host's save is loaded (see [Playing on the host's save](#playing-on-the-hosts-save)). `0`: everybody plays their own save |
 | `DebugTools` | `0` | Developers: enable test tools (see [DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
 | `AnimIdle`, `AnimWalk`, `AnimRun`, `AnimSprint` | Deacon clips | Fallback animations used when no pose stream arrives |
 | `PoseRate` | `20` | Player and bike pose updates per second (10-30). Lower saves bandwidth |

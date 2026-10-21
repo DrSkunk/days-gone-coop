@@ -329,9 +329,9 @@ def main():
     ap.add_argument('--follow', action='store_true',
                     help='walk after the player instead of circling (--speed is the maximum, e.g. 700)')
     ap.add_argument('--serve-save', metavar='DIR',
-                    help='act as the host and share the *.sav files in DIR with a GuestSaveGuard=1 game')
+                    help='act as the host and share the *.sav files in DIR with a joining HostSave=1 game')
     ap.add_argument('--fetch-save', metavar='DIR',
-                    help='act as the guest and download a ShareSave=1 game host\'s saves into DIR')
+                    help='act as the guest and download a HostSave=1 game host\'s saves into DIR')
     args = ap.parse_args()
     if args.serve_save and args.fetch_save:
         ap.error('--serve-save and --fetch-save are exclusive')

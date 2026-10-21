@@ -542,6 +542,39 @@ void TestGear() {
     std::puts("gear ok");
 }
 
+void TestEnemyHit() {
+    static_assert(sizeof(coop::EnemyHitPacket) == 24, "enemy hit wire size");
+    auto hit = coop::EncodeEnemyHit(7, 3, 11, false, 42.5f);
+    coop::EnemyHitPacket decoded{};
+    assert(coop::DecodeEnemyHit(reinterpret_cast<const char*>(&hit), sizeof hit, decoded));
+    assert(decoded.kind == 2 && decoded.entity == 3 && decoded.sequence == 11 && decoded.damage == 42.5f);
+    auto bad = hit;
+    bad.damage = 5000;
+    assert(!coop::DecodeEnemyHit(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    bad = hit;
+    bad.entity = 0;
+    assert(!coop::DecodeEnemyHit(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    bad = hit;
+    bad.kind = 3;
+    assert(!coop::DecodeEnemyHit(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    assert(!coop::DecodeEnemyHit(reinterpret_cast<const char*>(&hit), sizeof hit - 1, decoded));
+
+    coop::EnemyHitDedupe dedupe;
+    assert(dedupe.Accept(1, 5) && !dedupe.Accept(1, 5) && dedupe.Accept(1, 6));
+    assert(dedupe.Accept(2, 5)); // a new session forgets old sequence numbers
+    for (uint32_t i = 100; i < 200; ++i) assert(dedupe.Accept(2, i));
+    assert(dedupe.Accept(2, 5)); // outside the 64-entry window
+
+    float start[3]{0, 0, 160}, forward[3]{1, 0, 0}, feet[3]{1000, 20, 0};
+    assert(std::fabs(coop::AimDistanceToBody(start, forward, feet) - 1000) < 0.01f);
+    float wide[3]{1000, 80, 0}, behind[3]{-1000, 0, 0}, low[3]{1000, 0, 400};
+    assert(coop::AimDistanceToBody(start, forward, wide) < 0);
+    assert(coop::AimDistanceToBody(start, forward, behind) < 0);
+    assert(coop::AimDistanceToBody(start, forward, low) < 0); // aim passes under the body's feet
+    float up[3]{0, 0, 1};
+    assert(coop::AimDistanceToBody(start, up, feet) < 0);
+}
+
 void TestStory() {
     static_assert(sizeof(coop::StoryPacket) == 28, "story wire size");
     coop::StoryHasher a, b, c;
@@ -860,6 +893,7 @@ int main() {
     TestEnemy();
     TestGear();
     TestStory();
+    TestEnemyHit();
     using coop::DebugCommand;
     for (auto text : {"", "God", "god", "god-on extra", "spawn", "DestroyAll", "begin\n", "spawn-pack; end"})
         assert(coop::ParseDebugCommand(text) == DebugCommand::unknown);
@@ -884,6 +918,7 @@ int main() {
     assert(coop::ParseDebugCommand("reload-save") == DebugCommand::reloadSave);
     assert(coop::ParseDebugCommand("story-probe") == DebugCommand::storyProbe);
     assert(coop::ParseDebugCommand("story-diverge") == DebugCommand::storyDiverge);
+    assert(coop::ParseDebugCommand("hit-enemy") == DebugCommand::hitEnemy);
     coop::DebugRequestGate gate;
     gate.Initialize(42);
     assert(!gate.Accept(0) && !gate.Accept(42));

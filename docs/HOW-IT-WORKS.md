@@ -262,7 +262,7 @@ Steamworks SDK code is bundled or linked:
   current partner are dropped and released. Session requests are accepted
   only from lobby members. Steam authenticates the sender and encrypts the
   traffic, and its relays avoid exposing IP addresses or forwarding ports.
-- **Roles.** The lobby owner is the host for world time, weather and enemies.
+- **Roles.** The lobby owner is the host for the save, story, world time, weather and enemies.
   If the original owner leaves, the session ends instead of adopting Steam's
   replacement owner. In LAN mode, the player who chose Host is the host.
 
@@ -293,14 +293,17 @@ once, so a version mismatch is visible in the log.
 
 ### 4.3 Additional datagrams
 
-The same socket carries four more types, each identified by its own magic:
+The same socket carries more types, each identified by its own magic:
 
 | Magic | Content | Rate |
 |---|---|---|
 | `DPOS` | Compressed skeleton pose: body, bike or enemy | body and bike 20 Hz (`PoseRate`); enemies 15 Hz |
 | `DMGR` | Held item: mesh asset path, socket and offset | on change and every 0.5 s |
 | `DMEN` | Enemy appearance: up to four mesh asset paths | every 1 s per enemy |
-| `DGSV` | Experimental save transfer: request, offer, chunk pull, 1 KB chunk | only while a guest downloads the host's save |
+| `DGSV` | Save transfer: request, offer, chunk pull, 1 KB chunk | only while a guest downloads the host's save |
+| `DMST` | Story signature: host's live and last-saved job and mission progress | every 1 s from the host |
+| `DMEH` | Guest hit on a host enemy: entity, damage, shot or melee | per hit, sent twice |
+| `DMPX` | Host enemy strike on the guest: damage | per hit, sent twice |
 
 A pose datagram (version 2) carries up to 64 bones, so it never exceeds
 1,132 bytes. Each bone has a 32-bit hash of its name (bones are matched by
@@ -389,7 +392,11 @@ Passenger mode reads the socket of the first non-driver seat from the bike's
 body's hips/pelvis bone with that socket and moves the hidden local character
 with it, for the camera and health systems. On the driver's machine the
 passenger body is anchored to the driver's own bike socket, to avoid a second
-network delay. Boarding
+network delay. The passenger boards through a native interact prompt: a
+`BP_BasicInteractBase_C` actor, the same class the game uses for its own
+"hold to interact" prompts, kept at the partner's bike and labelled **Ride with
+&lt;partner&gt;** (or **Get off**). Its completion event is caught in the
+ProcessEvent hook. Boarding
 captures movement mode, visibility, collision and the save-block flag, and
 restores each of them on exit, dismount, permission removal or disconnect. A
 manual exit is checked with ground and capsule traces.
@@ -446,14 +453,59 @@ and cinematics, and sends them. The joining player:
 
 None of this writes save data.
 
-### 5.8 Host enemies
+### 5.8 Host-first save and story
 
-The host scans the object array in time-sliced batches for live `BendAIPawn`s
-within 80 m of either player, at most 16. It streams their skeletons and
-appearance. The joining player builds a posed, non-colliding replica for each
-one and removes it after 1.5 s of silence or when its health reaches 0.
-Replicas have no AI and can't be damaged. Real shared combat would need an
-authoritative enemy model, which doesn't exist yet.
+The host's save is authoritative. With `HostSave=1`, the save guard (§6) is
+installed at startup in passthrough mode and switches to a sandbox the moment
+this player joins someone else's session. The joining player downloads the
+host's newest saves (`DGSV`) and loads them, reloading in place with
+`BendGameMission.ReloadBecauseOfJobFailure` when already in gameplay.
+
+For story progress, each side hashes `BendJobManager`'s jobs and missions into
+a signature. The host sends its live signature and the one at its last save
+(`DMST`). A joining player whose signature differs from the host's saved one
+for 6 s downloads the new save and reloads. Missions are not mirrored live: the
+joining player's game only catches up at the host's saves.
+
+### 5.9 Shared enemies and combat
+
+The host scans the object array in time-sliced batches for live, hostile
+`BendAIPawn`s (freakers, animals, and AI whose controller `IsEnemy` with the
+player) within 80 m of either player, at most 16. It streams their skeletons
+and appearance. The joining player builds a posed, non-colliding replica for
+each one and removes it after 1.5 s of silence or when its health reaches 0.
+
+The joining player's own hostile AI is switched off: ambient generators,
+spawn areas and crowd generators are paused, and live hostile pawns are handed
+back to their pools with the generator's own `DespawnUnit`. Destroying pooled
+pawns directly did not work; the pool respawned them.
+
+Combat crosses over in both directions:
+
+- **Joining player to host.** Shots are tested along the camera ray against
+  each replica's body, melee by distance and facing, both with a world trace.
+  The hit (`DMEH`) is applied on the host with `ApplyDamage` to the real enemy.
+- **Host enemies to joining player.** Host AI only fights pawns. The host
+  spawns an invisible, AI-less swarmer with the player's faction that follows
+  the joining player's avatar, and makes nearby enemies aware of it. Freaker
+  hit tests only damage the real player, so the host watches each enemy's
+  `MeleeArmed` animation notify: a swing at the stand-in within reach becomes
+  a strike (`DMPX`) applied on the joining player's PC. The damage per enemy
+  type is an estimate.
+
+This is a custom replication layer inside the ASI, not Unreal's built-in
+multiplayer networking. A swing notification plus target/range checks is an
+approximation, not a confirmed collision hit. Native damage to the stand-in
+is also forwarded after its initial health has settled, but that route has
+not established working ranged combat. Both combat packet types are sent
+twice, without acknowledgements, and duplicate sequences are suppressed
+within a 64-entry window.
+
+The [development notes](DEVELOPMENT.md#reverse-engineering-findings-and-failed-approaches)
+record the inspection method, failed approaches, packet checks and a
+[validation matrix](DEVELOPMENT.md#current-validation-and-remaining-work).
+In particular, the debug guest-hit test does not verify real aimed shooting,
+and the story-divergence test does not establish complete campaign co-op.
 
 ## 6. Safety measures
 
@@ -466,19 +518,20 @@ authoritative enemy model, which doesn't exist yet.
   running.
 - Debug tools are off by default, local only, and limited to an allowlist of
   commands (see [DEVELOPMENT.md](DEVELOPMENT.md#debug-tools)).
-- The experimental guest save sandbox (`GuestSaveGuard=1`) hooks the game's
-  file imports so no write can reach the real `SaveGames` folder. Saves received
+- The guest save sandbox (`HostSave=1`) hooks the game's file imports so that,
+  while joined, no write can reach the real `SaveGames` folder. Saves received
   from the host are checked with SHA-256 and strict file-name rules before the
   game can see them (see
-  [DEVELOPMENT.md](DEVELOPMENT.md#host-to-guest-save-transfer-sharesave--guestsaveguard-experimental)).
+  [DEVELOPMENT.md](DEVELOPMENT.md#host-to-guest-save-transfer-hostsave)).
 
 ## 7. Limitations
 
-- Each player runs their own single-player world. Missions, saves, inventory
-  and loot are not shared. The experimental save transfer only lets the guest
-  start from a copy of the host's last save.
-- Enemy replicas are visual. The joining player can't fight the host's enemies
-  and still has their own.
+- Each player runs their own copy of the world. The joining player plays on the
+  host's save and is resynced at the host's saves, but live mission state,
+  inventory and loot are not mirrored.
+- Enemy damage to the joining player is estimated per enemy type, and only
+  melee swings are forwarded; ranged enemies can't hurt the joining player
+  yet. Enemy AI only runs on the host.
 - No projectile or muzzle-flash replication. Friendly-fire damage is an
   approximation.
 - Motorcycle physics, fuel, damage and upgrades are not shared.
