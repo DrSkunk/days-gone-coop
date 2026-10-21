@@ -858,6 +858,9 @@ UObject* g_hudLogOwner = nullptr;
 std::shared_ptr<UObject> g_hudLogText, g_hudLogBackground;
 double g_hudLogUntil = 0;
 std::vector<std::string> g_hudLogLines;
+UObject* g_hintOwner = nullptr;
+std::shared_ptr<UObject> g_hintText, g_hintBackground;
+std::string g_hint;
 
 UObject* FindHud() {
     if (IsLive(g_hudSeen) && !IsDefaultOrArchetype(g_hudSeen)) return g_hudSeen;
@@ -975,6 +978,32 @@ bool Notify(const std::string& title, const std::string& body) {
     }
     g_hudLogUntil = g_now + 6;
     return true;
+}
+
+void Hint(const std::string& text) {
+    if (text == g_hint && (text.empty() || IsLive(g_hintText.get()))) return;
+    auto hud = text.empty() ? nullptr : FindHud();
+    if (!hud) {
+        SetVisibility(g_hintText.get(), kCollapsed);
+        SetVisibility(g_hintBackground.get(), kCollapsed);
+        g_hint.clear();
+        return;
+    }
+    if (hud != g_hintOwner) {
+        g_hintText.reset();
+        g_hintBackground.reset();
+        g_hintOwner = hud;
+    }
+    bool created = !IsLive(g_hintText.get());
+    auto font = created ? HudFontSource(hud) : nullptr;
+    // Centred just above the game's own interact button prompt.
+    ShowLogPanel(true, ObjectField(hud, "CanvasWrapper"), ObjectField(hud, "WidgetTree"),
+                 font ? font : ObjectField(g_main.widget, "TextEntry0"), {0, 0, 0, 0, 0.3f, 0.75f, 0.7f, 0.8f, 0, 0},
+                 g_hintText, g_hintBackground);
+    SetVisibility(g_hintBackground.get(), kCollapsed);
+    if (!IsLive(g_hintText.get())) return;
+    if (created) Call(g_hintText.get(), "SetJustification").set("InJustification", static_cast<uint8_t>(1)).invoke();
+    if (SetText(g_hintText.get(), text)) g_hint = text;
 }
 
 } // namespace coop::ui

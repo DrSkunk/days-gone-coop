@@ -7,6 +7,7 @@
 #include "../src/coop/pose.hpp"
 #include "../src/coop/enemy.hpp"
 #include "../src/coop/gear.hpp"
+#include "../src/coop/story.hpp"
 #include "../src/coop/steam_abi.hpp"
 #include "../src/coop/save_policy.hpp"
 #include "../src/coop/savesync.hpp"
@@ -541,6 +542,47 @@ void TestGear() {
     std::puts("gear ok");
 }
 
+void TestStory() {
+    static_assert(sizeof(coop::StoryPacket) == 28, "story wire size");
+    coop::StoryHasher a, b, c;
+    a.Add("Mission_A", true);
+    a.Add("Mission_B", false);
+    b.Add("Mission_A", true);
+    b.Add("Mission_B", false);
+    c.Add("Mission_A", true);
+    c.Add("Mission_B", true);
+    auto sa = a.Finish(2), sb = b.Finish(2), sc = c.Finish(2);
+    assert(sa.valid && sa.hash == sb.hash && sa.hash != sc.hash);
+    assert(sa.completed == 1 && sa.unlocked == 2 && sc.completed == 2);
+    coop::StoryHasher d;
+    d.Add("Mission_A", true);
+    d.Add("Mission_B", false);
+    assert(d.Finish(3).hash != sa.hash); // the episode counts too
+
+    auto packet = coop::EncodeStory(77, sc, sa.hash, 4);
+    coop::StoryPacket decoded;
+    assert(coop::DecodeStory(reinterpret_cast<const char*>(&packet), sizeof packet, decoded));
+    assert(decoded.session == 77 && decoded.savedSignature == sa.hash && decoded.liveSignature == sc.hash);
+    assert(decoded.saveSerial == 4 && decoded.completed == 2 && decoded.unlocked == 2 && decoded.episode == 2);
+    assert(!coop::DecodeStory(reinterpret_cast<const char*>(&packet), sizeof packet - 1, decoded));
+    auto bad = packet;
+    bad.session = 0;
+    assert(!coop::DecodeStory(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+    bad = packet;
+    bad.completed = 3;
+    assert(!coop::DecodeStory(reinterpret_cast<const char*>(&bad), sizeof bad, decoded));
+
+    // The guest reloads only for host progress it does not already have, once per host progress.
+    assert(!coop::StoryNeedsResync(decoded, sa, 0));          // host saved what we play
+    auto unsaved = coop::EncodeStory(77, sc, 0, 0);
+    assert(!coop::StoryNeedsResync(unsaved, sc, 0));          // host has not saved this session
+    auto ahead = coop::EncodeStory(77, sc, sc.hash, 5);
+    assert(coop::StoryNeedsResync(ahead, sa, 0));
+    assert(!coop::StoryNeedsResync(ahead, sa, sc.hash));      // already reloaded for it
+    assert(!coop::StoryNeedsResync(ahead, coop::StorySignature{}, 0)); // our progress unknown
+    std::puts("story ok");
+}
+
 void TestSteamAbi() {
     using coop::steam::ParseConnectLobby;
     // Layout checks live in steam_abi.hpp as static_asserts; this exercises the invite parser.
@@ -817,6 +859,7 @@ int main() {
     TestSteamAbi();
     TestEnemy();
     TestGear();
+    TestStory();
     using coop::DebugCommand;
     for (auto text : {"", "God", "god", "god-on extra", "spawn", "DestroyAll", "begin\n", "spawn-pack; end"})
         assert(coop::ParseDebugCommand(text) == DebugCommand::unknown);
@@ -833,6 +876,14 @@ int main() {
     assert(coop::ParseDebugCommand("weather-next") == DebugCommand::weatherNext);
     assert(coop::ParseDebugCommand("inspect") == DebugCommand::inspect);
     assert(coop::ParseDebugCommand("status") == DebugCommand::status);
+    assert(coop::ParseDebugCommand("dump-reflection") == DebugCommand::dumpReflection);
+    assert(coop::ParseDebugCommand("dump-objects") == DebugCommand::dumpObjects);
+    assert(coop::ParseDebugCommand("trace-on") == DebugCommand::traceOn);
+    assert(coop::ParseDebugCommand("trace-off") == DebugCommand::traceOff);
+    assert(coop::ParseDebugCommand("ride-test") == DebugCommand::rideTest);
+    assert(coop::ParseDebugCommand("reload-save") == DebugCommand::reloadSave);
+    assert(coop::ParseDebugCommand("story-probe") == DebugCommand::storyProbe);
+    assert(coop::ParseDebugCommand("story-diverge") == DebugCommand::storyDiverge);
     coop::DebugRequestGate gate;
     gate.Initialize(42);
     assert(!gate.Accept(0) && !gate.Accept(42));

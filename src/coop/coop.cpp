@@ -5,6 +5,7 @@
 #include "steam.hpp"
 #include "save_guard.hpp"
 #include "save_transfer.hpp"
+#include "story.hpp"
 #include "menu.hpp"
 #include "native_ui.hpp"
 #include "session.hpp"
@@ -15,6 +16,8 @@
 #include "overlay.hpp"
 #include "combat.hpp"
 #include "debug_commands.hpp"
+#include "research.hpp"
+#include "ride_prompt.hpp"
 
 #ifndef COOP_VERSION
 #define COOP_VERSION "dev"
@@ -81,6 +84,12 @@ bool IsHost() {
     case session::Kind::LanJoin: return false;
     default: return true;
     }
+}
+
+// Playing in someone else's session: their save is authoritative and ours must stay untouched.
+bool IsGuest() {
+    return g_kind == session::Kind::LanJoin ||
+           (g_kind == session::Kind::Steam && g_steam.InLobby() && !g_steam.IsOwner());
 }
 
 // The name shown to the partner: PlayerName from the INI, else the Steam persona name.
@@ -254,6 +263,7 @@ void DestroyEnemyReplicas();
 void ReceiveEnemyPose(const PosePacket& packet, double now);
 void ReceiveEnemyInfo(const char* data, int len, double now);
 void ReceiveGear(const char* data, int len, double now);
+void ReceiveStory(const char* data, int len);
 void SendGear(UObject* pawn, double now);
 void DestroyGear();
 void ReceiveDamage(const StatePacket& packet);
@@ -1280,6 +1290,10 @@ void ReceivePose(const char* data, int len, double now) {
         ReceiveGear(data, len, now);
         return;
     }
+    if (magic == kStoryMagic) {
+        ReceiveStory(data, len);
+        return;
+    }
     PosePacket packet;
     if (!DecodePose(data, len, packet) || packet.header.session != g_peer.session || !g_peer.session) {
         ++g_poseStats.rejected;
@@ -1905,6 +1919,39 @@ void DebugReply(uint32_t request, const std::string& command, bool success) {
     if (!written) DebugError("Could not write debug command acknowledgement; inspect the runtime log");
 }
 
+bool g_rideTest = false;
+void ProbeStory();
+bool DivergeStory();
+
+UObject* FindLive(const char* className) {
+    static std::unordered_map<std::string, std::pair<UObject*, UObject*>> cache; // class name -> (class, instance)
+    auto& [cls, instance] = cache[className];
+    if (!cls) cls = FindClass(className);
+    if (!cls) return nullptr;
+    if (IsLive(instance) && IsA(instance, cls)) return instance;
+    instance = nullptr;
+    for (int32_t i = 0, n = ObjectCount(); i < n; ++i) {
+        auto object = ObjectAt(i);
+        if (IsLive(object) && !IsDefaultOrArchetype(object) && IsA(object, cls)) return instance = object;
+    }
+    return nullptr;
+}
+
+// Reloads the newest save in place, the way the game does after a mission failure. For a guest that
+// has adopted the host's save, that newest save is the host's.
+bool ReloadNewestSave() {
+    Call reload(FindLive("BendGameMission"), "ReloadBecauseOfJobFailure");
+    if (!reload.ok()) return false;
+    reload.set<uint8_t>("Subject", 0);
+    reload.set<uint8_t>("Reason", 0);
+    reload.setBool("DisplayFailReason", false);
+    bool invoked = reload.invoke();
+    Log("save reload: ReloadBecauseOfJobFailure invoked=%d returned=%d", invoked, invoked && reload.get<bool>("ReturnValue"));
+    return invoked;
+}
+std::string PartnerName();
+void TogglePassenger(double now);
+
 void UpdateDebugTools(double now) {
     if (!g_cfg.debugTools) return;
     static double pollAt = -10;
@@ -1946,7 +1993,27 @@ void UpdateDebugTools(double now) {
         if (IsLive(g_pawn)) success = DiscoverDebug(g_pawn);
         else success = DebugError("Debug inspection requires a gameplay pawn");
     } else if (command == DebugCommand::status) DebugStatus();
-    else if (command == DebugCommand::begin) success = DebugBegin(now);
+    else if (command == DebugCommand::storyProbe) ProbeStory();
+    else if (command == DebugCommand::storyDiverge) {
+        if (!DivergeStory()) success = DebugError("story-diverge needs a guest with the save sandbox active");
+    }
+    else if (command == DebugCommand::reloadSave) {
+        if (!ReloadNewestSave()) success = DebugError("No mission manager to reload with");
+    } else if (command == DebugCommand::rideTest) {
+        g_rideTest = !g_rideTest;
+        Log("ride prompt: test prompt %s", g_rideTest ? "on" : "off");
+    } else if (command == DebugCommand::dumpReflection || command == DebugCommand::dumpObjects ||
+             command == DebugCommand::traceOn || command == DebugCommand::traceOff) {
+        std::string summary = "trace running";
+        if (command == DebugCommand::dumpReflection)
+            success = research::DumpReflection(g_basePath + L"-reflection.txt", summary);
+        else if (command == DebugCommand::dumpObjects)
+            success = research::DumpObjects(g_basePath + L"-objects.txt", summary);
+        else if (command == DebugCommand::traceOn) research::TraceStart();
+        else success = research::TraceStop(g_basePath + L"-trace.txt", summary);
+        Log("research: %s: %s", text.c_str(), summary.c_str());
+        if (!success) DebugError(summary.c_str());
+    } else if (command == DebugCommand::begin) success = DebugBegin(now);
     else if (command == DebugCommand::end || command == DebugCommand::cleanup) {
         if (command == DebugCommand::cleanup && !g_debug.pawn)
             success = DebugError("Send begin before using test tools");
@@ -2039,6 +2106,53 @@ bool EndPassenger(bool forced) {
         Log("passenger: dismounted, but native state restoration was incomplete");
     } else Log("passenger: dismounted; native body, movement, collision, and saving restored");
     return restored;
+}
+
+
+// Offers the native "hold to interact" prompt on the partner's motorcycle.
+void UpdateRidePrompt(double now) {
+    bool visible = false;
+    FVector at{};
+    std::string label;
+    bool riding = false;
+    if (IsLive(g_pawn)) {
+        Call inVehicle(g_pawn, "IsInVehicle");
+        riding = inVehicle.invoke() && inVehicle.get<bool>("ReturnValue");
+    }
+    if (g_rideTest && IsLive(g_pawn) && !riding) {
+        Call where(g_pawn, "K2_GetActorLocation"), forward(g_pawn, "GetActorForwardVector");
+        if (where.invoke() && forward.invoke()) {
+            auto p = where.get<FVector>("ReturnValue");
+            auto f = forward.get<FVector>("ReturnValue");
+            static FVector anchor{};
+            static bool anchored = false;
+            if (!anchored) anchor = {p.x + f.x * 300, p.y + f.y * 300, p.z}, anchored = true;
+            at = anchor;
+            visible = true;
+            label = "Ride with " + PartnerName();
+        }
+    } else if (g_passenger.pawn) {
+        Call where(g_bike.component, "K2_GetComponentLocation");
+        if (IsLive(g_bike.component) && where.invoke()) {
+            at = where.get<FVector>("ReturnValue");
+            visible = true;
+            label = "Get off";
+        }
+    } else if (IsLive(g_pawn) && !riding && !g_debug.pawn && g_settings.motorcycles && IsLive(g_bike.component) &&
+               now - g_lastRecv < kPeerTimeout && (g_peer.flags & kAlive) && (g_peer.flags & kAcceptPassengers) &&
+               (g_peer.flags & kInVehicle) && !(g_peer.flags & kPassenger) && now >= g_localSettledAt &&
+               g_motion.BikeSpeed() <= 200) {
+        Call where(g_bike.component, "K2_GetComponentLocation");
+        if (where.invoke()) {
+            at = where.get<FVector>("ReturnValue");
+            visible = true;
+            label = "Ride with " + PartnerName();
+        }
+    }
+    if (ride::Update(g_pawn, visible, at, label)) {
+        if (g_rideTest) Log("ride prompt: test interaction completed");
+        else TogglePassenger(now);
+    }
 }
 
 void TogglePassenger(double now) {
@@ -3554,8 +3668,215 @@ void TraceMissionEvent(UObject* obj, UObject* fn) {
 
 bool g_teleportAfterLoad = false;
 
+// A guest in gameplay switches to the host's save as soon as it is installed: the newest save in the
+// sandbox is the host's, so an in-place reload loads it. Retried while the pins say it has not loaded.
+void LoadAdoptedSave(double now) {
+    static double nextAttempt = 0;
+    if (!SaveGuardPinned() || !IsLive(g_pawn) || g_saveLoading || now < nextAttempt) return;
+    if (auto manager = FindWorldManager()) {
+        Call cinematic(manager, "GetIsCinematicActive");
+        if (cinematic.invoke() && cinematic.get<bool>("ReturnValue")) return;
+    }
+    nextAttempt = now + 30;
+    ui::Notify("Theys Gone", "Loading the host's save");
+    if (!ReloadNewestSave()) Log("save transfer: cannot reload in place; quit to the main menu and Continue");
+}
+
+bool CinematicActive() {
+    auto manager = FindWorldManager();
+    if (!manager) return false;
+    Call cinematic(manager, "GetIsCinematicActive");
+    return cinematic.invoke() && cinematic.get<bool>("ReturnValue");
+}
+
+// Story progress: every job the job manager knows (story and side jobs, in the game's order) with its
+// completion, activity and state, plus active or unlocked story missions and the episode. Job states
+// change when a job starts, ends or is unlocked, not at each objective, so mid-mission checkpoints of the
+// host do not reload the guest.
+StorySignature ReadStory() {
+    struct Array { UObject** data; int32_t count, capacity; };
+    auto jobs = FindLive("BendJobManager");
+    auto mission = FindLive("BendGameMission");
+    if (!IsLive(jobs) || !IsLive(mission)) return {};
+    Array refs{};
+    if (!GetProp(jobs, "JobRefsInOrder", refs) || refs.count <= 0 || refs.count > 4096 || !refs.data) return {};
+    StoryHasher hasher;
+    for (int32_t i = 0; i < refs.count; ++i) {
+        UObject* job = refs.data[i];
+        if (!IsLive(job)) continue;
+        Call done(jobs, "GetIsJobComplete"), active(jobs, "GetIsJobActive");
+        done.set("JobID", job);
+        active.set("JobID", job);
+        uint8_t state = 0;
+        GetProp(job, "JobCurrentState", state);
+        bool isActive = active.invoke() && active.get<bool>("ReturnValue");
+        hasher.Add(Name(job), done.invoke() && done.get<bool>("ReturnValue"), static_cast<uint8_t>(state | (isActive ? 0x80 : 0)));
+    }
+    Call episode(mission, "GetCurrentEpisode"), datas(mission, "GetAllActiveOrUnlockedMissionDatas");
+    if (!episode.invoke()) return {};
+    if (datas.invoke()) {
+        auto list = datas.get<Array>("ReturnValue");
+        std::vector<std::pair<std::string, bool>> missions;
+        for (int32_t i = 0; i < list.count && list.count < 4096 && list.data; ++i) {
+            UObject* data = list.data[i];
+            if (!IsLive(data)) continue;
+            Call completed(mission, "GetIsMissionCompleted");
+            completed.set("MissionData", data);
+            missions.emplace_back(Name(data), completed.invoke() && completed.get<bool>("ReturnValue"));
+        }
+        std::sort(missions.begin(), missions.end());
+        for (const auto& [name, done] : missions) hasher.Add(name, done);
+    }
+    return hasher.Finish(episode.get<uint8_t>("ReturnValue"));
+}
+
+// Research: what the job manager exposes about story progress.
+void ProbeStory() {
+    struct Array { UObject** data; int32_t count, capacity; };
+    auto jobs = FindLive("BendJobManager");
+    Log("story probe: job manager %s", jobs ? FullName(jobs).c_str() : "(none)");
+    if (!jobs) return;
+    auto describe = [&](const char* label, const Array& list) {
+        int live = 0, complete = 0, active = 0;
+        std::string sample;
+        for (int32_t i = 0; i < list.count && list.count < 4096; ++i) {
+            UObject* job = list.data[i];
+            if (!IsLive(job)) continue;
+            ++live;
+            Call done(jobs, "GetIsJobComplete"), on(jobs, "GetIsJobActive");
+            done.set("JobID", job);
+            on.set("JobID", job);
+            bool isDone = done.invoke() && done.get<bool>("ReturnValue");
+            bool isOn = on.invoke() && on.get<bool>("ReturnValue");
+            complete += isDone;
+            active += isOn;
+            if (live <= 12) sample += " " + Name(job) + (isDone ? "+" : "") + (isOn ? "*" : "");
+        }
+        Log("story probe: %s count=%d live=%d complete=%d active=%d:%s", label, list.count, live, complete, active,
+            sample.c_str());
+    };
+    for (const char* name : {"JobRefsInOrder", "ActiveJobRefsInOrder", "PausedJobRefsInOrder", "WaitingOnTimeJobRefs"}) {
+        Array list{};
+        if (GetProp(jobs, name, list)) describe(name, list);
+    }
+    Call datas(jobs, "GetAllActiveJobDatas");
+    if (datas.invoke()) describe("GetAllActiveJobDatas", datas.get<Array>("ReturnValue"));
+    UObject* tracked = nullptr;
+    GetProp(jobs, "CurrentTrackedJob", tracked);
+    Log("story probe: tracked job %s", IsLive(tracked) ? FullName(tracked).c_str() : "(none)");
+    if (auto mission = FindLive("BendGameMission")) {
+        Call current(mission, "GetCurrentTrackedMissionOrJob"), story(mission, "GetStoryLineData");
+        if (current.invoke()) {
+            auto object = current.get<UObject*>("ReturnValue");
+            Log("story probe: tracked mission or job %s", IsLive(object) ? FullName(object).c_str() : "(none)");
+        }
+        if (story.invoke()) {
+            auto object = story.get<UObject*>("ReturnValue");
+            Log("story probe: storyline data %s", IsLive(object) ? FullName(object).c_str() : "(none)");
+        }
+    }
+    auto signature = ReadStory();
+    Log("story probe: mission signature %08x (%u of %u, episode %u)", signature.hash, signature.completed,
+        signature.unlocked, signature.episode);
+}
+
+// Test aid, guest only (its saves are sandboxed): unlock one locked job so this world's progress no
+// longer matches the host's and the story resync has to restore it.
+bool DivergeStory() {
+    struct Array { UObject** data; int32_t count, capacity; };
+    auto jobs = FindLive("BendJobManager");
+    Array refs{};
+    if (!SaveGuardActive() || !IsGuest() || !IsLive(jobs) || !GetProp(jobs, "JobRefsInOrder", refs) || !refs.data) return false;
+    for (int32_t i = refs.count - 1; i >= 0 && refs.count < 4096; --i) {
+        UObject* job = refs.data[i];
+        if (!IsLive(job)) continue;
+        Call active(jobs, "GetIsJobActive");
+        active.set("JobID", job);
+        if (!active.invoke() || active.get<bool>("ReturnValue")) continue;
+        Call unlock(jobs, "UnlockJobAtID");
+        unlock.set("JobID", job);
+        bool ok = unlock.invoke() && unlock.get<bool>("ReturnValue");
+        Log("story diverge: UnlockJobAtID %s -> %d", Name(job).c_str(), ok);
+        auto signature = ReadStory();
+        Log("story diverge: our signature is now %08x", signature.hash);
+        if (ok) return true;
+    }
+    return false;
+}
+
+struct StoryState {
+    StorySignature mine;
+    double sampledAt = -1e9, sentAt = -1e9, mismatchSince = -1;
+    uint32_t savedSignature = 0, saveSerial = 0, lastResynced = 0, loggedHost = 0;
+    bool savePending = false, haveHost = false;
+    StoryPacket host{};
+} g_story;
+
+void ReceiveStory(const char* data, int len) {
+    StoryPacket packet;
+    if (!DecodeStory(data, len, packet) || packet.session != g_peer.session || !g_peer.session) return;
+    g_story.host = packet;
+    g_story.haveHost = true;
+}
+
+void SampleStory(double now) {
+    if (now - g_story.sampledAt < kStorySampleInterval) return;
+    g_story.sampledAt = now;
+    g_story.mine = ReadStory();
+}
+
+// Host: publish the progress of its last save. Guest: once that differs from the progress it is
+// playing, download the host's newer save and reload into it at the next quiet moment.
+void UpdateStory(double now) {
+    bool connected = now - g_lastRecv < kPeerTimeout;
+    if (g_story.savePending && IsLive(g_pawn) && !g_saveLoading) {
+        g_story.savePending = false;
+        g_story.sampledAt = -1e9;
+        SampleStory(now);
+        if (g_story.mine.valid) {
+            g_story.savedSignature = g_story.mine.hash;
+            ++g_story.saveSerial;
+            Log("story: saved progress %08x (%u of %u jobs and missions complete, episode %u)", g_story.mine.hash,
+                g_story.mine.completed, g_story.mine.unlocked, g_story.mine.episode);
+        }
+        SaveTransferInvalidate();
+    }
+    if (!connected || !g_net || !IsLive(g_pawn)) {
+        g_story.mismatchSince = -1;
+        return;
+    }
+    if (!IsGuest()) {
+        if (!g_cfg.hostSave || now - g_story.sentAt < kStoryInterval) return;
+        SampleStory(now);
+        if (!g_story.mine.valid) return;
+        g_story.sentAt = now;
+        auto packet = EncodeStory(g_session, g_story.mine, g_story.savedSignature, g_story.saveSerial);
+        g_net->SendRaw(&packet, sizeof packet);
+        return;
+    }
+    if (!g_story.haveHost || !SaveGuardAdopted() || SaveGuardPinned() || g_saveLoading) return;
+    SampleStory(now);
+    if (g_story.host.savedSignature != g_story.loggedHost) {
+        g_story.loggedHost = g_story.host.savedSignature;
+        Log("story: host saved progress %08x (%u of %u complete); ours %08x (%u of %u)", g_story.host.savedSignature,
+            g_story.host.completed, g_story.host.unlocked, g_story.mine.hash, g_story.mine.completed, g_story.mine.unlocked);
+    }
+    if (!StoryNeedsResync(g_story.host, g_story.mine, g_story.lastResynced)) {
+        g_story.mismatchSince = -1;
+        return;
+    }
+    if (g_story.mismatchSince < 0) g_story.mismatchSince = now;
+    if (now - g_story.mismatchSince < kStoryResyncDelay || CinematicActive()) return;
+    if (!SaveTransferResync()) return;
+    g_story.lastResynced = g_story.host.savedSignature;
+    g_story.mismatchSince = -1;
+    Log("story: host progress %08x differs from ours %08x; fetching the host's save", g_story.host.savedSignature,
+        g_story.mine.hash);
+    ui::Notify("Theys Gone", "Host made progress: syncing to their save");
+}
+
 void ObserveSaveEvent(UObject* obj, UObject* fn, void* parms) {
-    if (!g_cfg.guestSaveGuard || !IsLive(obj) || !IsLive(fn)) return;
+    if (!IsLive(obj) || !IsLive(fn)) return;
     enum Kind : uint8_t { kIgnored, kSaveEvent, kLoadStarted, kLoaded };
     static std::unordered_map<int32_t, Kind> saveNames;
     auto found = saveNames.find(fn->name.index);
@@ -3568,6 +3889,11 @@ void ObserveSaveEvent(UObject* obj, UObject* fn, void* parms) {
         found = saveNames.emplace(fn->name.index, kind).first;
     }
     if (found->second == kIgnored) return;
+    if (!SaveGuardActive()) {
+        // Host or solo: our own save is authoritative; remember what it now contains.
+        if (found->second == kSaveEvent) g_story.savePending = true;
+        return;
+    }
     // Both are broadcast to every actor around an in-place load. Only a load that started after the host
     // save was adopted has read it, so only that one may release the pins.
     if (found->second == kLoadStarted) {
@@ -3671,7 +3997,10 @@ void Tick(bool hudFrame) {
         if (down && !held) DiscoverMenus();
         held = down;
     }
+    if (g_cfg.hostSave && IsGuest() && !SaveGuardActive()) SaveGuardEnable();
     SaveTransferTick(TransferContext(now));
+    LoadAdoptedSave(now);
+    UpdateStory(now);
     static double teleportAt = -1;
     if (g_teleportAfterLoad) {
         g_teleportAfterLoad = false;
@@ -3727,6 +4056,7 @@ void Tick(bool hudFrame) {
     if (actions.passenger || actions.teleport || actions.invite) g_menu.Close(g_controller);
     if (actions.passenger) TogglePassenger(now);
     if (actions.teleport) TeleportToPartner(g_pawn, now);
+    UpdateRidePrompt(now);
     if (g_menu.IsOpen()) {
         Call viewport(g_controller, "GetViewportSize");
         if (viewport.invoke()) {
@@ -3842,6 +4172,9 @@ void HookedProcessEvent(UObject* obj, UObject* fn, void* parms) {
     }
     if (g_ready && g_cfg.missionDiscovery && GetCurrentThreadId() == g_gameThread)
         TraceMissionEvent(obj, fn);
+    if (g_ready && GetCurrentThreadId() == g_gameThread) ride::OnEvent(obj, fn);
+    if (g_ready && research::Tracing() && GetCurrentThreadId() == g_gameThread && !g_inTick)
+        research::TraceEvent(obj, fn, parms);
     bool ownUi = g_ready && !g_inTick && GetCurrentThreadId() == g_gameThread && IsLive(obj) && IsLive(fn);
     if (ownUi) {
         g_inTick = true;
@@ -3861,7 +4194,7 @@ void HookedProcessEvent(UObject* obj, UObject* fn, void* parms) {
             Log("menu discovery: %s cursor=%d page=%d position=%d", name.c_str(), cursor, page, position);
         }
     }
-    if (g_ready && g_cfg.guestSaveGuard && GetCurrentThreadId() == g_gameThread)
+    if (g_ready && g_cfg.hostSave && GetCurrentThreadId() == g_gameThread)
         ObserveSaveEvent(obj, fn, parms);
     g.processEvent(obj, fn, parms);
     if (ownUi && IsLive(obj)) {
@@ -3914,8 +4247,7 @@ Config LoadConfig(const std::wstring& ini) {
     c.discovery = GetPrivateProfileIntW(L"Coop", L"Discovery", 0, ini.c_str()) != 0;
     c.missionDiscovery = GetPrivateProfileIntW(L"Coop", L"MissionDiscovery", 0, ini.c_str()) != 0;
     c.menuDiscovery = GetPrivateProfileIntW(L"Coop", L"MenuDiscovery", 0, ini.c_str()) != 0;
-    c.guestSaveGuard = GetPrivateProfileIntW(L"Coop", L"GuestSaveGuard", 0, ini.c_str()) != 0;
-    c.shareSave = GetPrivateProfileIntW(L"Coop", L"ShareSave", 0, ini.c_str()) != 0;
+    c.hostSave = GetPrivateProfileIntW(L"Coop", L"HostSave", 1, ini.c_str()) != 0;
     c.debugTools = GetPrivateProfileIntW(L"Coop", L"DebugTools", 0, ini.c_str()) != 0;
     c.animIdle = IniString(ini, L"AnimIdle", c.animIdle.c_str());
     c.animWalk = IniString(ini, L"AnimWalk", c.animWalk.c_str());
@@ -3985,8 +4317,8 @@ bool Install(const std::wstring& basePath) {
             nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
         return false;
     }
-    if (g_cfg.guestSaveGuard) InstallSaveGuard(g_basePath + L"-guest-saves");
-    SaveTransferConfigure(g_cfg.shareSave, g_cfg.guestSaveGuard);
+    if (g_cfg.hostSave) InstallSaveGuard(g_basePath + L"-guest-saves");
+    SaveTransferConfigure(g_cfg.hostSave, g_cfg.hostSave);
     g.objectArray = reinterpret_cast<uint8_t*>(g.imageBase + kObjectArrayRva);
     if (!InstallHook(reinterpret_cast<uint8_t*>(g.imageBase + kProcessEventRva))) return false;
     Log("ProcessEvent hook installed");

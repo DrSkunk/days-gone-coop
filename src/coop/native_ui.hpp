@@ -27,5 +27,7 @@ session::Page CurrentPage();
 bool MenuOpen();
 // Shows a native HUD notification; false when no HUD is available (title menu, loading).
 bool Notify(const std::string& title, const std::string& body);
+// A centred HUD caption above the native interact prompt; empty hides it.
+void Hint(const std::string& text);
 
 } // namespace coop::ui

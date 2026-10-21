@@ -48,7 +48,7 @@ std::wstring g_root, g_discard;
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::set<std::wstring> g_deleted; // lower-case relative paths deleted during this session
 std::set<std::wstring> g_pinned;  // lower-case adopted names protected until the next load completes
-std::atomic<bool> g_active{false}, g_exclusive{false};
+std::atomic<bool> g_installed{false}, g_active{false}, g_exclusive{false};
 std::atomic<int> g_notes{0};
 
 struct Mapped {
@@ -57,6 +57,12 @@ struct Mapped {
     std::wstring path;
     std::wstring relative;
 };
+
+// Until SaveGuardEnable() the hooks are pure passthrough.
+std::optional<std::wstring> Guarded(const std::wstring& path) {
+    if (!g_active.load()) return std::nullopt;
+    return SaveGamesRelative(path);
+}
 
 bool Exists(const std::wstring& path) { return real.getFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
@@ -104,7 +110,7 @@ void Note(const char* operation, const std::wstring& relative, const char* detai
 Mapped Map(const wchar_t* path, bool write, bool copyOnWrite) {
     Mapped mapped;
     mapped.path = path;
-    auto relative = SaveGamesRelative(path);
+    auto relative = Guarded(path);
     if (!relative) return mapped;
     mapped.guarded = true;
     mapped.relative = *relative;
@@ -154,7 +160,7 @@ HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY
         if (length > 0) {
             std::wstring wide(static_cast<size_t>(length), L'\0');
             MultiByteToWideChar(CP_ACP, 0, name, -1, wide.data(), length);
-            if (SaveGamesRelative(wide.c_str()))
+            if (Guarded(wide.c_str()))
                 return HookCreateFileW(wide.c_str(), access, share, security, disposition, flags, templateFile);
         }
     }
@@ -162,7 +168,7 @@ HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY
 }
 
 BOOL WINAPI HookDeleteFileW(LPCWSTR name) {
-    auto relative = name ? SaveGamesRelative(name) : std::nullopt;
+    auto relative = name ? Guarded(name) : std::nullopt;
     if (!relative) return real.deleteFileW(name);
     if (!SafeRelative(*relative)) {
         SetLastError(ERROR_ACCESS_DENIED);
@@ -185,8 +191,8 @@ BOOL WINAPI HookDeleteFileW(LPCWSTR name) {
 }
 
 BOOL WINAPI HookMoveFileW(LPCWSTR from, LPCWSTR to) {
-    auto fromRelative = from ? SaveGamesRelative(from) : std::nullopt;
-    auto toRelative = to ? SaveGamesRelative(to) : std::nullopt;
+    auto fromRelative = from ? Guarded(from) : std::nullopt;
+    auto toRelative = to ? Guarded(to) : std::nullopt;
     if (!fromRelative && !toRelative) return real.moveFileW(from, to);
     if ((fromRelative && !SafeRelative(*fromRelative)) || (toRelative && !SafeRelative(*toRelative))) {
         SetLastError(ERROR_ACCESS_DENIED);
@@ -238,7 +244,7 @@ BOOL WINAPI HookCreateDirectoryW(LPCWSTR name, LPSECURITY_ATTRIBUTES security) {
 }
 
 BOOL WINAPI HookRemoveDirectoryW(LPCWSTR name) {
-    auto relative = name ? SaveGamesRelative(name) : std::nullopt;
+    auto relative = name ? Guarded(name) : std::nullopt;
     if (!relative) return real.removeDirectoryW(name);
     if (!SafeRelative(*relative)) {
         SetLastError(ERROR_ACCESS_DENIED);
@@ -267,7 +273,7 @@ BOOL WINAPI HookSetFileInformationByHandle(HANDLE file, FILE_INFO_BY_HANDLE_CLAS
     if (offsetof(FILE_RENAME_INFO, FileName) + rename->FileNameLength > size)
         return real.setFileInformationByHandle(file, type, info, size);
     std::wstring target(rename->FileName, chars);
-    auto relative = SaveGamesRelative(target);
+    auto relative = Guarded(target);
     if (!relative) return real.setFileInformationByHandle(file, type, info, size);
     auto mapped = Map(target.c_str(), true, false);
     if (mapped.refused) {
@@ -327,22 +333,13 @@ bool Patch(HMODULE module, const char* function, Fn hook, Fn& original) {
 bool InstallSaveGuard(const std::wstring& sandboxRoot) {
     g_root = Normalize(sandboxRoot);
     g_discard = g_root + L"-discard";
-    std::error_code error;
-    std::filesystem::remove_all(g_discard, error);
-    std::filesystem::remove_all(g_root, error);
-    std::filesystem::create_directories(g_discard, error);
-    if (!error) std::filesystem::create_directories(g_root, error);
-    if (error) {
-        Log("save guard: cannot prepare sandbox %s (%s); guard disabled", Narrow(g_root).c_str(), error.message().c_str());
-        return false;
-    }
     HMODULE exe = GetModuleHandleW(nullptr);
     // Write paths are mandatory; without them the real saves would not be protected.
     bool ok = Patch(exe, "CreateFileW", HookCreateFileW, real.createFileW) &&
               Patch(exe, "DeleteFileW", HookDeleteFileW, real.deleteFileW) &&
               Patch(exe, "MoveFileW", HookMoveFileW, real.moveFileW);
     if (!ok) {
-        Log("save guard: FAILED to install write hooks; real saves are NOT protected");
+        Log("save guard: FAILED to install write hooks; joining a host will not protect your saves");
         return false;
     }
     Patch(exe, "CreateFileA", HookCreateFileA, real.createFileA);
@@ -353,8 +350,25 @@ bool InstallSaveGuard(const std::wstring& sandboxRoot) {
     Patch(exe, "RemoveDirectoryW", HookRemoveDirectoryW, real.removeDirectoryW);
     Patch(exe, "FindFirstFileW", HookFindFirstFileW, real.findFirstFileW);
     Patch(exe, "SetFileInformationByHandle", HookSetFileInformationByHandle, real.setFileInformationByHandle);
+    g_installed = true;
+    Log("save guard: hooks ready (passthrough until you join a host)");
+    return true;
+}
+
+bool SaveGuardEnable() {
+    if (g_active) return true;
+    if (!g_installed) return false;
+    std::error_code error;
+    std::filesystem::remove_all(g_discard, error);
+    std::filesystem::remove_all(g_root, error);
+    std::filesystem::create_directories(g_discard, error);
+    if (!error) std::filesystem::create_directories(g_root, error);
+    if (error) {
+        Log("save guard: cannot prepare sandbox %s (%s)", Narrow(g_root).c_str(), error.message().c_str());
+        return false;
+    }
     g_active = true;
-    Log("save guard: EXPERIMENTAL save sandbox active; SaveGames writes go to %s", Narrow(g_root).c_str());
+    Log("save guard: guest save sandbox active until restart; SaveGames writes go to %s", Narrow(g_root).c_str());
     return true;
 }
 

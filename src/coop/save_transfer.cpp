@@ -164,7 +164,7 @@ void SendOffer(const SaveTransferContext& context) {
 void HostHandle(const Header& header, const char* data, int size, const SaveTransferContext& context) {
     if (header.type == kRequest) {
         if (!g_share) {
-            if (!g_host.askedWithoutShare) Log("save transfer: partner asked for your save; set ShareSave=1 to share it");
+            if (!g_host.askedWithoutShare) Log("save transfer: partner asked for your save; HostSave=0 so it is not shared");
             g_host.askedWithoutShare = true;
             return;
         }
@@ -256,6 +256,14 @@ void SaveTransferConfigure(bool share, bool join) {
     g_join = join;
 }
 
+void SaveTransferInvalidate() { g_host.builtAt = -1e9; }
+
+bool SaveTransferResync() {
+    if (g_guest.state == GuestState::requesting || g_guest.state == GuestState::receiving) return false;
+    g_guest = Guest{};
+    return true;
+}
+
 bool SaveTransferHandle(const char* data, int size, const SaveTransferContext& context) {
     Header header;
     if (size < 4) return false;
@@ -325,7 +333,7 @@ void SaveTransferTick(const SaveTransferContext& context) {
 
 std::string SaveTransferStatus(const SaveTransferContext& context) {
     if (context.host) {
-        if (g_host.askedWithoutShare && !g_share) return "Partner wants your save (set ShareSave=1)";
+        if (g_host.askedWithoutShare && !g_share) return "Partner wants your save (HostSave=0)";
         if (g_share && context.now - g_host.lastServed < 3) return "Sending your save to partner";
         return {};
     }
@@ -336,7 +344,7 @@ std::string SaveTransferStatus(const SaveTransferContext& context) {
     case GuestState::idle:
         return {};
     case GuestState::requesting:
-        return context.now - g_guest.firstRequest > 10 ? "Waiting for host save (host needs ShareSave=1)" :
+        return context.now - g_guest.firstRequest > 10 ? "Waiting for host save (host has HostSave=0?)" :
                                                          "Requesting host save...";
     case GuestState::receiving:
         std::snprintf(buffer, sizeof buffer, "Receiving host save %d%%",
@@ -344,7 +352,7 @@ std::string SaveTransferStatus(const SaveTransferContext& context) {
         return buffer;
     case GuestState::adopted:
         if (!SaveGuardPinned()) return "Playing on the host's save";
-        return context.inGameplay ? "Host save ready: quit to main menu, then Continue" : "Host save ready: press Continue";
+        return context.inGameplay ? "Loading the host save..." : "Host save ready: press Continue";
     case GuestState::failed:
         return g_guest.error;
     }

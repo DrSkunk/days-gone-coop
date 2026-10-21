@@ -11,7 +11,11 @@ import time
 COMMANDS = (
     "inspect", "begin", "end", "status", "god-on", "god-off", "spawn-single",
     "spawn-pack", "cleanup", "probe-player", "probe-enemy", "time-shift",
-    "weather-next",
+    "weather-next", "dump-reflection", "dump-objects", "trace-on", "trace-off",
+    "ride-test",
+    "reload-save",
+    "story-probe",
+    "story-diverge",
 )
 
 

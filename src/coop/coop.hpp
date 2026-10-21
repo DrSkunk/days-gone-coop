@@ -19,8 +19,7 @@ struct Config {
     bool discovery = false;
     bool missionDiscovery = false; // log runtime mission/save UFunction signatures; read-only
     bool menuDiscovery = false;    // F6 dumps native menu classes and live widget references
-    bool guestSaveGuard = false;   // experimental: redirect SaveGames writes to a session sandbox
-    bool shareSave = false;        // experimental: host serves its saves to a GuestSaveGuard partner
+    bool hostSave = true; // host shares its save; a guest plays it in a sandbox so its own saves stay untouched
     bool debugTools = false;
     std::string animIdle = "dcn_idle_normal";
     std::string animWalk = "dcn_walk";
