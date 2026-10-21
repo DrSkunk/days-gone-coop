@@ -1,11 +1,11 @@
-![Days Gone Together](./docs/days_gone_together.avif)
+![Theys Gone](./docs/theys_gone.avif)
 
-[![CI](https://github.com/DrSkunk/days-gone-together/actions/workflows/ci.yml/badge.svg)](https://github.com/DrSkunk/days-gone-together/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/DrSkunk/days-gone-together?include_prereleases&sort=semver)](https://github.com/DrSkunk/days-gone-together/releases)
-[![Nexus Mods](https://img.shields.io/badge/Nexus_Mods-Days_Gone_Together-orange)](https://www.nexusmods.com/daysgone/mods/1019)
+[![CI](https://github.com/DrSkunk/theys-gone/actions/workflows/ci.yml/badge.svg)](https://github.com/DrSkunk/theys-gone/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/DrSkunk/theys-gone?include_prereleases&sort=semver)](https://github.com/DrSkunk/theys-gone/releases)
+[![Nexus Mods](https://img.shields.io/badge/Nexus_Mods-Theys_Gone-orange)](https://www.nexusmods.com/daysgone/mods/1019)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Days Gone Together** is an experimental two-player **LAN co-op mod for Days
+**Theys Gone** is an experimental two-player **LAN co-op mod for Days
 Gone (PC)**. It runs as an ASI plugin inside the game and shows your partner,
 their motorcycle and the host's nearby enemies in your world.
 
@@ -63,14 +63,14 @@ their motorcycle and the host's nearby enemies in your world.
 1. **Back up your saves.** They are in `%LOCALAPPDATA%\BendGame\Saved\` on
    Windows. Under Proton they are in
    `steamapps/compatdata/1259420/pfx/drive_c/users/steamuser/AppData/Local/BendGame/Saved/`.
-2. Download `DaysGoneTogether-<version>.zip` from
+2. Download `TheysGone-<version>.zip` from
    [Nexus Mods](https://www.nexusmods.com/daysgone/mods/1019) or
-   [GitHub Releases](https://github.com/DrSkunk/days-gone-together/releases).
+   [GitHub Releases](https://github.com/DrSkunk/theys-gone/releases).
    Use **Manual Download** on Nexus; Vortex installation is not supported.
 3. Install Ultimate ASI Loader x64 as `version.dll` in the game's
    `BendGame/Binaries/Win64/` folder, next to `DaysGone.exe`. Skip this step if
    you already have an ASI loader there, and don't overwrite other mods.
-4. Copy `DaysGoneTogether.asi` and `DaysGoneTogether.ini` from the zip into that same
+4. Copy `TheysGone.asi` and `TheysGone.ini` from the zip into that same
    folder. Both files must stay side by side.
 5. **Linux / Steam Deck only:** Wine must load the proxy `version.dll`. In
    Steam, open the game's *Properties → Launch Options* and set:
@@ -84,7 +84,7 @@ their motorcycle and the host's nearby enemies in your world.
 To verify a download:
 
 ```sh
-gh attestation verify DaysGoneTogether-<version>.zip --repo DrSkunk/days-gone-together
+gh attestation verify TheysGone-<version>.zip --repo DrSkunk/theys-gone
 ```
 
 The release also includes a `.sha256` checksum file.
@@ -157,7 +157,7 @@ real players.
 > [!WARNING]
 > Lobby creation, visibility changes and the invite overlay have been tested
 > in the game. Joining and gameplay between two Steam accounts still need a
-> two-player test. Send your `DaysGoneTogether.log` if it fails.
+> two-player test. Send your `TheysGone.log` if it fails.
 
 Steam mode lets two Steam friends play over the Internet without port
 forwarding. Steam handles the connection, NAT traversal, relaying and
@@ -234,7 +234,7 @@ when there is no safe ground to stand on.
 
 ## Configuration reference
 
-All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
+All keys are in the `[Coop]` section of `TheysGone.ini`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -263,10 +263,10 @@ All keys are in the `[Coop]` section of `DaysGoneTogether.ini`.
 
 ## Troubleshooting
 
-The plugin writes `DaysGoneTogether.log` next to itself. A healthy start looks like this:
+The plugin writes `TheysGone.log` next to itself. A healthy start looks like this:
 
 ```text
-Days Gone Together … starting (protocol v6)
+Theys Gone … starting (protocol v6)
 ProcessEvent hook installed
 GNames via pointer at rva 0x…, … names
 network: listening on UDP 27777, …
@@ -286,9 +286,13 @@ normally.
 
 ## Uninstall
 
-Close the game and delete `DaysGoneTogether.asi`, `DaysGoneTogether.ini` and the
-`DaysGoneTogether*.log`/`.txt` files. Remove `version.dll`, and the launch option,
+Close the game and delete `TheysGone.asi`, `TheysGone.ini` and the
+`TheysGone*.log`/`.txt` files. Remove `version.dll`, and the launch option,
 only if no other mod uses the ASI loader.
+
+Upgrading from the older *Days Gone Together* builds: delete the old
+`DaysGoneTogether.*` files first. Settings are not migrated, and old builds
+cannot connect to Theys Gone.
 
 ## How it was built
 

@@ -14,8 +14,8 @@
 ```sh
 poetry install
 make test     # C++ protocol/motion/combat tests + Python unit tests
-make build    # package/DaysGoneTogether.asi + DaysGoneTogether.ini
-make dist     # dist/DaysGoneTogether-<version>.zip + .sha256
+make build    # package/TheysGone.asi + TheysGone.ini
+make dist     # dist/TheysGone-<version>.zip + .sha256
 ```
 
 The build downloads the pinned Dear ImGui release into `.deps/` and checks its
@@ -76,7 +76,7 @@ test with a single game.
 ```
 
 `start-test.sh` backs up the INI and points it at `127.0.0.1:27778`. It runs
-the simulator as the `dg-together-fakepeer` user service and launches the game.
+the simulator as the `theys-gone-fakepeer` user service and launches the game.
 `DAYS_GONE_DIR` overrides the game folder. Restart the game after stopping.
 
 **By hand,** against a game in host mode:
@@ -124,9 +124,9 @@ poetry run python tools/debug_control.py --game-dir "/path/to/BendGame/Binaries/
 | `end` | Clean up and restore damage and saving state |
 
 Commands go through a file mailbox. The helper atomically writes
-`DaysGoneTogether-debug.ini` (`[Debug] Command=…, Request=<new number>`) next to
+`TheysGone-debug.ini` (`[Debug] Command=…, Request=<new number>`) next to
 the ASI. The plugin polls it every 0.5 s on the game thread and writes
-`DaysGoneTogether-debug-result.ini`. Requests already present at startup are
+`TheysGone-debug-result.ini`. Requests already present at startup are
 ignored. Only the commands above are accepted, and nothing can be sent over
 the network.
 
@@ -141,7 +141,7 @@ use a backed-up or disposable save.
 
 `MenuDiscovery=1` enables a read-only native UI report. Press **F6** while
 the main menu or pause menu is visible to write
-`DaysGoneTogether-menus.txt` beside the plugin. Each capture replaces that
+`TheysGone-menus.txt` beside the plugin. Each capture replaces that
 report. It lists loaded menu/widget classes, their reflected functions and
 parameters, and live widget references. It also logs the main menu's
 confirm, page-selection and mouse-row events. This diagnostic is separate
@@ -173,7 +173,7 @@ must be created before shifting category labels: shallow copies can lose
 their last reference while the engine replaces the preceding entry.
 
 `session.hpp` holds the menu rows, bounded event log, visibility rules and
-versioned `DGTB` discovery beacons, covered by `make test`. `Transport=menu`
+versioned `TGGB` discovery beacons, covered by `make test`. `Transport=menu`
 starts offline and lets CO-OP choose LAN or Steam. `Transport=udp` retains
 automatic LAN startup from `PeerHost`. LAN hosts broadcast their name, port,
 session and open/full state once per second; stale entries expire after 4 s.
@@ -261,7 +261,7 @@ sessions still set the flag, but only to reduce mid-session autosaves.
 `GuestSaveGuard=1` patches the game executable's KERNEL32 imports for file
 creation, deletion, renaming (`MoveFileW` and rename-by-handle), attributes and
 directories (`src/coop/save_guard.cpp`). It redirects every write below a
-`Saved\...\SaveGames` folder into `DaysGoneTogether-guest-saves` next to the
+`Saved\...\SaveGames` folder into `TheysGone-guest-saves` next to the
 plugin. That folder is wiped each time the game starts.
 
 - Writes are copy-on-write: modifying an existing save first copies the
@@ -308,7 +308,7 @@ The guest starts from a copy of the host's save:
 5. Adopted files are **pinned** until a load that started after adoption
    completes (`ReceivePreSaveGameLoaded` ... `ReceivePostSaveGameLoaded`).
    Adoption waits while a load is already running. While pinned, game writes to them go to
-   `DaysGoneTogether-guest-saves-discard` and deletes are ignored, so the menu's
+   `TheysGone-guest-saves-discard` and deletes are ignored, so the menu's
    own `profile.sav`/`checkpoint.sav` writes can't replace the host's files
    before Continue.
 6. After the load the pins are released, the guest's autosaves go to the
@@ -365,7 +365,7 @@ Releases are automated with
 2. Merge the release PR. release-please tags `vX.Y.Z` and creates the GitHub
    release.
 3. The same workflow builds the ASI with that version, packages
-   `DaysGoneTogether-X.Y.Z.zip` with a SHA-256 file, creates a signed build
+   `TheysGone-X.Y.Z.zip` with a SHA-256 file, creates a signed build
    provenance attestation and uploads both files to the release.
 4. After the GitHub assets are uploaded, the reusable **Nexus Mods** workflow
    downloads that exact archive, verifies its checksum and GitHub attestation,

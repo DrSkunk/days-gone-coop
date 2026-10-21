@@ -12,13 +12,13 @@ and play, see the [README](../README.md). To build and test, see
 ## Overview
 
 Days Gone runs on Bend Studio's fork of **Unreal Engine 4.10.1**. The mod is a
-Windows DLL (`DaysGoneTogether.asi`) that runs inside the game process.
+Windows DLL (`TheysGone.asi`) that runs inside the game process.
 
 ```text
 DaysGone.exe
   └─ version.dll (Ultimate ASI Loader proxy)
-       └─ DaysGoneTogether.asi → DllMain / InitializeASI
-            ├─ load DaysGoneTogether.ini next to the .asi
+       └─ TheysGone.asi → DllMain / InitializeASI
+            ├─ load TheysGone.ini next to the .asi
             ├─ check the executable (PE timestamp + image size)
             ├─ check the ProcessEvent prologue bytes
             ├─ install an inline hook on UObject::ProcessEvent
@@ -107,7 +107,7 @@ Structure offsets used by the reflection layer ([`ue.hpp`](../src/coop/ue.hpp)):
 
 Some facts only exist at runtime. With `Discovery=1` the plugin logs the local
 pawn's class chain and components, writes loaded `AnimSequence`s to
-`DaysGoneTogether-anims.txt` and lists classes related to world state, AI and
+`TheysGone-anims.txt` and lists classes related to world state, AI and
 spawning. F6 dumps the current pawn again. The separate `MissionDiscovery=1`
 option logs unique mission/save-related `ProcessEvent` signatures and reflected
 parameter layouts without recording parameter values or changing behavior.
@@ -211,7 +211,7 @@ the first valid sender becomes the partner; in join mode the plugin sends to
 the selected host. Closing/leaving clears the pinned endpoint; a host drops
 a timed-out partner so another can join. `Transport=udp` optionally starts
 hosting/joining from the INI instead of waiting for a menu choice.
-`DGTB` broadcast beacons advertise open LAN hosts. A peer silent for 5 s
+`TGGB` broadcast beacons advertise open LAN hosts. A peer silent for 5 s
 counts as disconnected. A new session ID (from `BCryptGenRandom`) counts as a
 reconnect.
 
@@ -242,14 +242,14 @@ unverified. No Steamworks SDK code is bundled or linked:
   member function through a hidden pointer after `this`. Those calls pass that
   pointer explicitly. Struct layouts are checked with `static_assert`.
 - **Discovery.** The host creates an invite-only, friends-only or public lobby limited to two members
-  and sets lobby data `dgt` to the protocol version. A joiner leaves any lobby
-  whose `dgt` doesn't match. A friend joins in one of three ways:
+  and sets lobby data `tgg` to the protocol version. A joiner leaves any lobby
+  whose `tgg` doesn't match. A friend joins in one of three ways:
   - a Steam overlay invite, through the `GameLobbyJoinRequested_t` callback;
   - the `+connect_lobby <id>` launch argument Steam adds when the game wasn't
     running;
   - the menu, which lists friends playing the same app ID whose
     `FriendGameInfo_t` reports a lobby.
-  Public search filters by the mod's `dgt` metadata and available member slots.
+  Public search filters by the mod's `tgg` metadata and available member slots.
   Hosts can change visibility without leaving the game.
 - **Results without threads.** `CreateLobby` and `JoinLobby` results are
   polled from the game thread with `ISteamUtils::GetAPICallResult`. Callbacks

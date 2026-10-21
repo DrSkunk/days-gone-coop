@@ -60,14 +60,14 @@ jobs:
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
-            dist/DaysGoneTogether-${{ needs.release-please.outputs.version }}.zip
-            dist/DaysGoneTogether-${{ needs.release-please.outputs.version }}/DaysGoneTogether.asi
+            dist/TheysGone-${{ needs.release-please.outputs.version }}.zip
+            dist/TheysGone-${{ needs.release-please.outputs.version }}/TheysGone.asi
       - name: Upload to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            "dist/DaysGoneTogether-$VERSION.zip" "dist/DaysGoneTogether-$VERSION.zip.sha256"
+            "dist/TheysGone-$VERSION.zip" "dist/TheysGone-$VERSION.zip.sha256"
 
   nexus:
     name: Publish to Nexus Mods

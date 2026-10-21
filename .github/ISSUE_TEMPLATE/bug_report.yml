@@ -6,7 +6,7 @@ body:
     id: version
     attributes:
       label: Mod version
-      description: First line of DaysGoneTogether.log, e.g. "Days Gone Together 0.1.0 starting"
+      description: First line of TheysGone.log, e.g. "Theys Gone 0.1.0 starting"
     validations:
       required: true
   - type: dropdown
@@ -29,5 +29,5 @@ body:
   - type: textarea
     id: log
     attributes:
-      label: DaysGoneTogether.log (both players if possible)
+      label: TheysGone.log (both players if possible)
       render: text

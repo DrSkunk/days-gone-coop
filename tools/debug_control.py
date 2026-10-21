@@ -25,13 +25,13 @@ def read_ini(path: Path) -> configparser.ConfigParser:
 def send(game_dir: Path, command: str, timeout: float = 20) -> tuple[bool, str]:
     if command not in COMMANDS:
         raise ValueError(f"Unknown command: {command}")
-    if not (game_dir / "DaysGoneTogether.asi").is_file():
-        raise ValueError("The selected directory does not contain DaysGoneTogether.asi")
+    if not (game_dir / "TheysGone.asi").is_file():
+        raise ValueError("The selected directory does not contain TheysGone.asi")
     if not 0 < timeout <= 120:
         raise ValueError("Timeout must be greater than zero and at most 120 seconds")
-    mailbox = game_dir / "DaysGoneTogether-debug.ini"
-    result = game_dir / "DaysGoneTogether-debug-result.ini"
-    lock = game_dir / "DaysGoneTogether-debug.lock"
+    mailbox = game_dir / "TheysGone-debug.ini"
+    result = game_dir / "TheysGone-debug-result.ini"
+    lock = game_dir / "TheysGone-debug.lock"
     with lock.open("x", encoding="ascii"):
         pass
     temporary: Path | None = None
@@ -44,7 +44,7 @@ def send(game_dir: Path, command: str, timeout: float = 20) -> tuple[bool, str]:
         while request in (previous, acknowledged):
             request = request % 0x7fffffff + 1
         with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=game_dir,
-                                         prefix=".DaysGoneTogether-debug-", delete=False) as stream:
+                                         prefix=".TheysGone-debug-", delete=False) as stream:
             temporary = Path(stream.name)
             stream.write(f"[Debug]\nCommand={command}\nRequest={request}\n")
         os.replace(temporary, mailbox)
@@ -67,7 +67,7 @@ def send(game_dir: Path, command: str, timeout: float = 20) -> tuple[bool, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--game-dir", required=True, type=Path, help="Directory containing DaysGoneTogether.asi")
+    parser.add_argument("--game-dir", required=True, type=Path, help="Directory containing TheysGone.asi")
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("command", choices=COMMANDS)
     args = parser.parse_args()

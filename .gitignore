@@ -6,8 +6,8 @@ package/
 .deps/
 *.exe
 *.log
-DaysGoneTogether-debug.ini
-DaysGoneTogether-debug-result.ini
-DaysGoneTogether-debug.lock
-.DaysGoneTogether-debug-*
+TheysGone-debug.ini
+TheysGone-debug-result.ini
+TheysGone-debug.lock
+.TheysGone-debug-*
 dist/

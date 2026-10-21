@@ -120,7 +120,7 @@ struct View {
     Visibility visibility = Visibility::Friends;
     bool connected = false;
     std::string partner;
-    std::vector<std::string> friends; // friends hosting a Days Gone Together lobby
+    std::vector<std::string> friends; // friends hosting a Theys Gone lobby
     std::vector<std::string> publicLobbies;
     std::vector<std::string> lanHosts;
 };
@@ -218,7 +218,7 @@ inline std::string StatusText(Page page, const View& v, const std::vector<std::s
 
 // ---- LAN discovery ----------------------------------------------------------------------------------
 
-constexpr uint32_t kBeaconMagic = 0x42544744; // "DGTB"
+constexpr uint32_t kBeaconMagic = 0x42474754; // "TGGB"
 
 #pragma pack(push, 1)
 struct Beacon {
@@ -269,7 +269,7 @@ public:
         found->address = address;
         found->port = beacon.port;
         found->session = beacon.session;
-        found->name = beacon.name[0] ? beacon.name : "Days Gone Together";
+        found->name = beacon.name[0] ? beacon.name : "Theys Gone";
         found->seen = now;
     }
     void Prune(double now) {

@@ -122,7 +122,7 @@ HRESULT STDMETHODCALLTYPE Resize(IDXGISwapChain* chain, UINT count, UINT width, 
 }
 
 DWORD WINAPI InstallRenderer(void*) {
-    dummyWindow = CreateWindowExW(0, L"STATIC", L"DaysGoneTogether renderer setup", WS_POPUP, 0, 0, 1, 1,
+    dummyWindow = CreateWindowExW(0, L"STATIC", L"TheysGone renderer setup", WS_POPUP, 0, 0, 1, 1,
                                   nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!dummyWindow) {
         Log("overlay: setup window failed (error %lu)", GetLastError());

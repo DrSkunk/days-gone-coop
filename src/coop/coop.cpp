@@ -1897,7 +1897,7 @@ void DebugReply(uint32_t request, const std::string& command, bool success) {
     Log("debug: request=%u command=%s result=%s", request, command.c_str(), success ? "ok" : "error");
     auto result = g_basePath + L"-debug-result.ini";
     auto id = std::to_wstring(request);
-    auto message = success ? std::wstring(L"See DaysGoneTogether.log for measured details") :
+    auto message = success ? std::wstring(L"See TheysGone.log for measured details") :
         std::wstring(g_settingsError.begin(), g_settingsError.end());
     bool written = WritePrivateProfileStringW(L"Result", L"State", success ? L"ok" : L"error", result.c_str()) &&
         WritePrivateProfileStringW(L"Result", L"Message", message.c_str(), result.c_str()) &&
@@ -3937,7 +3937,7 @@ Config LoadConfig(const std::wstring& ini) {
 bool Install(const std::wstring& basePath) {
     g_basePath = basePath;
     LogOpen(basePath + L".log");
-    Log("Days Gone Together %s starting (protocol v%u)", COOP_VERSION, static_cast<unsigned>(kProtocolVersion));
+    Log("Theys Gone %s starting (protocol v%u)", COOP_VERSION, static_cast<unsigned>(kProtocolVersion));
     g_cfg = LoadConfig(basePath + L".ini");
     g_debugRequests.Initialize(GetPrivateProfileIntW(L"Debug", L"Request", 0, (basePath + L"-debug.ini").c_str()));
     if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&g_session), sizeof g_session,

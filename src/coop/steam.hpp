@@ -34,7 +34,7 @@ public:
     // Applies to the current lobby when this player owns it, and to the next hosted lobby.
     void SetVisibility(session::Visibility visibility);
     session::Visibility Visibility() const { return visibility_; }
-    // Searches public Days Gone Together lobbies of this protocol version.
+    // Searches public Theys Gone lobbies of this protocol version.
     void RequestPublic();
     const std::vector<SteamFriendLobby>& PublicLobbies() const { return public_; }
     bool Searching() const { return listCall_ != 0; }

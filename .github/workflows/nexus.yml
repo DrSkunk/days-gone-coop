@@ -63,7 +63,7 @@ jobs:
         id: release
         run: |
           version="${TAG#v}"
-          archive="DaysGoneTogether-$version.zip"
+          archive="TheysGone-$version.zip"
           release="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,body)"
           if ! jq -e '.isDraft == false and .isPrerelease == false' <<< "$release"; then
             echo "::error::Only published, non-prerelease GitHub releases may be uploaded."
@@ -91,7 +91,7 @@ jobs:
           mod_id: ${{ vars.NEXUSMODS_MOD_ID }}
           filename: ${{ steps.release.outputs.archive }}
           version: ${{ steps.release.outputs.version }}
-          display_name: Days Gone Together ${{ steps.release.outputs.version }}
+          display_name: Theys Gone ${{ steps.release.outputs.version }}
           description: Experimental two-player LAN co-op. Manual installation required; see the mod page.
           category: main
           archive_existing_version: 'false'
@@ -106,7 +106,7 @@ jobs:
           VERSION_ID: ${{ steps.nexus.outputs.version_id }}
         run: |
           {
-            echo "## Days Gone Together $TAG"
+            echo "## Theys Gone $TAG"
             echo "GitHub release archive: checksum and provenance verified."
             if [[ "$PUBLISH" == "true" ]]; then
               echo "Uploaded Nexus file version: $VERSION_ID."

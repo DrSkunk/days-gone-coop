@@ -793,7 +793,7 @@ void TestSession() {
     other.session = 8;
     other.name[0] = 0;
     lanDir.Heard(other, 0x0300007f, 3.0);
-    assert(lanDir.Hosts().size() == 2 && lanDir.Hosts()[1].name == "Days Gone Together");
+    assert(lanDir.Hosts().size() == 2 && lanDir.Hosts()[1].name == "Theys Gone");
     lanDir.Prune(6.5);
     assert(lanDir.Hosts().size() == 1 && lanDir.Hosts()[0].session == 8);
     other.open = 0;

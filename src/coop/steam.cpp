@@ -416,7 +416,7 @@ void SteamPeer::SetVisibility(session::Visibility visibility) {
 void SteamPeer::RequestPublic() {
     if (!ready_ || listCall_ || !api.utils) return;
     std::string version = LobbyVersion();
-    VCall<void>(api.matchmaking, slot::kAddRequestLobbyListStringFilter, "dgt", version.c_str(), kLobbyComparisonEqual);
+    VCall<void>(api.matchmaking, slot::kAddRequestLobbyListStringFilter, "tgg", version.c_str(), kLobbyComparisonEqual);
     VCall<void>(api.matchmaking, slot::kAddRequestLobbyListFilterSlotsAvailable, 1);
     VCall<void>(api.matchmaking, slot::kAddRequestLobbyListDistanceFilter, kLobbyDistanceWorldwide);
     VCall<void>(api.matchmaking, slot::kAddRequestLobbyListResultCountFilter, 20);
@@ -452,7 +452,7 @@ void SteamPeer::PollList(double now) {
         uint64_t lobby = VCallSteamId(api.matchmaking, slot::kGetLobbyByIndex, static_cast<int>(i));
         if (!lobby || lobby == lobby_) continue;
         const char* name = VCall<const char*>(api.matchmaking, slot::kGetLobbyData, lobby, "name");
-        public_.push_back({0, lobby, name && *name ? name : "Days Gone Together"});
+        public_.push_back({0, lobby, name && *name ? name : "Theys Gone"});
     }
     Log("steam: %u public lobbies found", static_cast<unsigned>(public_.size()));
 }
@@ -516,7 +516,7 @@ void SteamPeer::Entered(uint64_t lobby, bool created) {
     std::string version = LobbyVersion();
     if (created) {
         std::string name = name_.empty() ? PersonaName() : name_;
-        VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "dgt", version.c_str());
+        VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "tgg", version.c_str());
         VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "name", name.c_str());
         if (!VCall<bool>(api.matchmaking, slot::kSetLobbyData, lobby, "visibility", session::VisibilityKey(visibility_)))
             Announce("Steam could not publish the lobby visibility description");
@@ -525,11 +525,11 @@ void SteamPeer::Entered(uint64_t lobby, bool created) {
             session::VisibilityName(visibility_), static_cast<unsigned long long>(lobby));
         Announce(std::string("Hosting a Steam lobby (") + session::VisibilityName(visibility_) + ")");
     } else {
-        const char* value = VCall<const char*>(api.matchmaking, slot::kGetLobbyData, lobby, "dgt");
+        const char* value = VCall<const char*>(api.matchmaking, slot::kGetLobbyData, lobby, "tgg");
         if (!value || version != value) {
-            Log("steam: lobby %llu is not a Days Gone Together protocol v%s lobby (it reports '%s'); leaving",
+            Log("steam: lobby %llu is not a Theys Gone protocol v%s lobby (it reports '%s'); leaving",
                 static_cast<unsigned long long>(lobby), version.c_str(), value ? value : "");
-            Announce("That lobby runs a different Days Gone Together version");
+            Announce("That lobby runs a different Theys Gone version");
             Leave();
             return;
         }
@@ -680,7 +680,7 @@ std::string SteamPeer::PeerText() const {
 }
 
 std::string SteamPeer::Status() const {
-    if (!ready_) return "Steam unavailable - see DaysGoneTogether.log";
+    if (!ready_) return "Steam unavailable - see TheysGone.log";
     if (pending_ == Pending::Create) return "Steam: creating a lobby...";
     if (pending_ == Pending::Join) return "Steam: joining a lobby...";
     if (!lobby_) return "Steam: host a lobby or join a friend";
