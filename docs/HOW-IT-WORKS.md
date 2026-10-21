@@ -222,9 +222,10 @@ does not know which one is active.
 ### 4.1.1 Steam transport (experimental)
 
 Choosing a Steam session in CO-OP activates [`steam.cpp`](../src/coop/steam.cpp)
-instead of the UDP transport. Lobby creation, visibility changes and overlay
-invites have been tested in-game; two-account joining/traffic is still
-unverified. No Steamworks SDK code is bundled or linked:
+instead of the UDP transport. Lobby creation, visibility changes, overlay
+invites, two-account joining and gameplay have been tested in-game on separate
+machines. Internet/NAT traversal has not been independently verified. No
+Steamworks SDK code is bundled or linked:
 
 - The game already loads `steam_api64.dll` and initializes Steam. The plugin
   takes the loaded module with `GetModuleHandle` and resolves four exports:
@@ -482,6 +483,7 @@ authoritative enemy model, which doesn't exist yet.
   approximation.
 - Motorcycle physics, fuel, damage and upgrades are not shared.
 - Two players only. LAN mode is for trusted networks only: its protocol is
-  neither encrypted nor authenticated. The Steam transport is encrypted and
-  authenticated by Steam, but two-account traffic has not been tested yet.
+  neither encrypted nor authenticated. Steam transport is encrypted and
+  authenticated by Steam. Two-account play was verified between separate
+  machines, but Internet/NAT traversal has not been independently verified.
 - Only one game build is supported. Native Windows is untested.

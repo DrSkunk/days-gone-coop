@@ -5,14 +5,16 @@
 [![Nexus Mods](https://img.shields.io/badge/Nexus_Mods-Theys_Gone-orange)](https://www.nexusmods.com/daysgone/mods/1019)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Theys Gone** is an experimental two-player **LAN co-op mod for Days
-Gone (PC)**. It runs as an ASI plugin inside the game and shows your partner,
-their motorcycle and the host's nearby enemies in your world.
+**Theys Gone** is an experimental two-player co-op mod for **Days Gone
+(PC)**. It runs as an ASI plugin inside the game and shows your partner,
+their motorcycle and the host's nearby enemies in your world. Host and join
+sessions through Steam or your local network.
 
 > [!IMPORTANT]
 > This is **not** full campaign co-op. Each player still runs their own
 > single-player game, and missions, inventory, loot and saves are not shared.
-> Use it on a trusted LAN only, and back up your saves before you try it.
+> The UDP/LAN transport is unauthenticated and should only be used on a
+> trusted local network. Back up your saves before you try it.
 
 > [!NOTE]
 > **AI-assisted project.** Most of this mod was written with AI coding
@@ -51,12 +53,12 @@ their motorcycle and the host's nearby enemies in your world.
 - Days Gone on **Steam, build 19221447**. The mod checks the executable and
   disables itself on any other build, for example after a game update.
 - Windows, or Linux / Steam Deck with Proton. It has been tested under Proton
-  on a desktop Linux PC and a Steam Deck. Native Windows has not been tested yet.
+  on a desktop Linux PC and a Steam Deck. Native Windows has not been tested.
 - [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
   (x64) to load the plugin.
-- Two PCs on the same LAN, both on the same mod version. The experimental
-  [Steam mode](#online-over-steam-experimental) provides Internet transport;
-  lobby controls have been tested, but two-account joining/gameplay has not.
+- Two PCs with the same mod version. Connect over a trusted LAN or through
+  Steam. Two-account Steam sessions have been tested between separate
+  machines; Internet/NAT traversal has not been independently verified.
 
 ## Install
 
@@ -152,16 +154,17 @@ separately in each game after loading; only the starting point is shared.
 Verified on one PC against the simulated partner; not yet tested between two
 real players.
 
-### Online over Steam (experimental)
+### Steam sessions (experimental)
 
 > [!WARNING]
-> Lobby creation, visibility changes and the invite overlay have been tested
-> in the game. Joining and gameplay between two Steam accounts still need a
-> two-player test. Send your `TheysGone.log` if it fails.
+> Two-account Steam sessions have been tested between separate machines.
+> Internet/NAT traversal has not been independently verified. Send your
+> `TheysGone.log` if connection or gameplay fails.
 
-Steam mode lets two Steam friends play over the Internet without port
-forwarding. Steam handles the connection, NAT traversal, relaying and
-encryption. Leave `Transport=menu` (the default):
+Steam mode uses Steam Networking, so it does not require manual port
+forwarding. Steam provides authenticated, encrypted transport and can use
+NAT traversal or relaying. Actual Internet-path behavior has not been
+independently verified. Leave `Transport=menu` (the default):
 
 ```ini
 [Coop]
