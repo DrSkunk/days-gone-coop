@@ -11,3 +11,4 @@ TheysGone-debug-result.ini
 TheysGone-debug.lock
 .TheysGone-debug-*
 dist/
+.DS_Store
