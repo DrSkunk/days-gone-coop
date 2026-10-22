@@ -1,6 +1,6 @@
 [project]
 name = "theys-gone"
-version = "0.3.0"
+version = "0.4.0"
 description = "Theys Gone: LAN co-op ASI mod for Days Gone (build and research tooling)"
 requires-python = ">=3.11,<4"
 dependencies = ["capstone>=5.0.6,<6"]
